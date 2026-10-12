@@ -1976,3 +1976,358 @@ button:disabled {
     transition-duration: .01ms !important;
   }
 }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  clip-path: inset(50%);
+}
+
+.files-section {
+  padding-bottom: 24px;
+}
+
+.files-toolbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin: 8px 0 18px;
+}
+
+.files-toolbar h2,
+.files-empty h2 {
+  margin: 0;
+  color: #435149;
+  font-family: Georgia, "Iowan Old Style", serif;
+  font-size: 20px;
+  font-weight: 400;
+  letter-spacing: -.025em;
+}
+
+.files-toolbar p,
+.files-empty p {
+  margin: 6px 0 0;
+  color: #7c877e;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.files-toolbar-actions,
+.file-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.button-small {
+  min-height: 34px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+
+.files-list {
+  display: grid;
+  gap: 10px;
+}
+
+.file-card {
+  padding: 15px 16px 13px;
+  border: 1px solid #e9e8df;
+  border-radius: 11px;
+  background: var(--paper);
+  box-shadow: 0 2px 5px rgb(37 52 42 / 2%);
+  scroll-margin: 30px;
+  transition: border-color .18s ease, box-shadow .18s ease;
+}
+
+.file-card-focused {
+  border-color: #81977b;
+  box-shadow: 0 0 0 3px rgb(129 151 123 / 15%);
+}
+
+.file-card-main {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+}
+
+.file-type-icon {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  flex: none;
+  place-items: center;
+  border-radius: 10px;
+  background: #edf1e9;
+  color: #71856e;
+  font-size: 21px;
+}
+
+.file-type-link {
+  background: #fbf0df;
+  color: #a37b49;
+}
+
+.file-card-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.file-card-copy h3 {
+  margin: 0;
+  color: #334139;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.file-card-copy p {
+  margin: 4px 0 0;
+  color: #8a9287;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.file-card-actions .icon-button {
+  width: 31px;
+  height: 31px;
+  font-size: 20px;
+}
+
+.file-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  margin: 12px 0 0 50px;
+  padding-top: 10px;
+  border-top: 1px solid #eff0e9;
+}
+
+.file-attachments-label,
+.file-unattached {
+  color: #8b948a;
+  font-size: 10px;
+}
+
+.file-attachments-label {
+  margin-right: 2px;
+  font-weight: 650;
+}
+
+.file-attachment {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 5px 3px 8px;
+  border: 1px solid #e4e9df;
+  border-radius: 999px;
+  background: #f8faf5;
+}
+
+.text-link,
+.item-file-link {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #526e55;
+  cursor: pointer;
+  font-size: 10px;
+  text-align: left;
+}
+
+.text-link:hover,
+.item-file-link:hover {
+  color: #344d37;
+  text-decoration: underline;
+}
+
+.attachment-remove {
+  display: inline-grid;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #8b948a;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.attachment-remove:hover:not(:disabled) {
+  background: #f5e9e5;
+  color: #a8564b;
+}
+
+.item-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.item-file-link {
+  padding: 4px 8px;
+  border: 1px solid #e4e9df;
+  border-radius: 999px;
+  background: #f8faf5;
+}
+
+.files-empty {
+  display: grid;
+  min-height: 240px;
+  align-content: center;
+  justify-items: center;
+  padding: 26px;
+  border: 1px dashed #d9dfd3;
+  border-radius: 13px;
+  background: rgb(255 254 250 / 63%);
+  text-align: center;
+}
+
+.files-empty .button {
+  margin-top: 16px;
+}
+
+.file-empty-icon {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  place-items: center;
+  margin-bottom: 15px;
+  border-radius: 14px;
+  background: #edf1e9;
+  color: #71856e;
+  font-size: 26px;
+}
+
+.files-dialog-scrim {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgb(31 42 34 / 34%);
+  backdrop-filter: blur(3px);
+}
+
+.files-dialog {
+  width: min(100%, 500px);
+  padding: 27px;
+  border: 1px solid #e2e4da;
+  border-radius: 15px;
+  background: #fffefa;
+  box-shadow: 0 18px 60px rgb(25 37 29 / 20%);
+}
+
+.files-dialog h2 {
+  margin: 5px 0 12px;
+  color: #334139;
+  font-family: Georgia, "Iowan Old Style", serif;
+  font-size: 23px;
+  font-weight: 400;
+  letter-spacing: -.02em;
+}
+
+.files-dialog > p,
+.files-dialog form > p:not(.eyebrow) {
+  color: #718076;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.files-dialog strong {
+  color: #445249;
+}
+
+.files-dialog input,
+.files-dialog select {
+  width: 100%;
+  min-height: 42px;
+  padding: 0 11px;
+  border: 1px solid #dedfd6;
+  border-radius: 8px;
+  background: #fffefa;
+  color: #334239;
+  font-size: 12px;
+}
+
+.files-dialog input:focus,
+.files-dialog select:focus {
+  border-color: #81977d;
+  box-shadow: 0 0 0 3px rgb(129 151 125 / 13%);
+  outline: none;
+}
+
+.files-dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 22px;
+}
+
+.file-delete-warning {
+  padding: 10px 12px;
+  border-left: 3px solid #c19356;
+  border-radius: 3px 8px 8px 3px;
+  background: #fbf3e7;
+  color: #765e3e !important;
+}
+
+.files-dialog-error {
+  margin: 12px 0 0;
+  color: #a34c42;
+  font-size: 11px;
+}
+
+@media (max-width: 680px) {
+  .files-toolbar {
+    flex-direction: column;
+  }
+
+  .files-toolbar-actions {
+    width: 100%;
+  }
+
+  .files-toolbar-actions .button {
+    flex: 1;
+  }
+
+  .file-card-main {
+    flex-wrap: wrap;
+  }
+
+  .file-card-copy {
+    flex-basis: calc(100% - 54px);
+  }
+
+  .file-card-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .file-attachments {
+    margin-left: 0;
+  }
+
+  .files-dialog {
+    padding: 22px 18px;
+  }
+
+  .files-dialog-actions > .button {
+    flex: 1 1 auto;
+  }
+}

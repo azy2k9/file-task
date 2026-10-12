@@ -23,7 +23,22 @@ data class WorkspaceItem(
     val completed: Boolean?,
     val createdAt: String,
     val updatedAt: String,
+    val files: List<WorkspaceFileSummary> = emptyList(),
 )
+
+data class WorkspaceFileSummary(val id: String, val name: String, val sourceType: String)
+data class FileAttachment(val itemId: String, val itemKind: ItemKind, val itemTitle: String)
+data class WorkspaceFile(
+    val id: String,
+    val name: String,
+    val sourceType: String,
+    val contentType: String?,
+    val sizeBytes: Long?,
+    val externalUrl: String?,
+    val createdAt: String,
+    val attachments: List<FileAttachment>,
+)
+data class OpenFileTarget(val url: String, val name: String, val contentType: String?, val sourceType: String)
 
 enum class ItemKind(val wireValue: String) {
     Task("task"),
@@ -86,6 +101,56 @@ class ApiClient(rawBaseUrl: String) {
         buildList(items.length()) {
             for (index in 0 until items.length()) add(parseItem(items.getJSONObject(index)))
         }
+    }
+
+    suspend fun listFiles(token: String): List<WorkspaceFile> = withContext(Dispatchers.IO) {
+        val files = request("GET", "/api/files", token = token).getJSONArray("files")
+        buildList(files.length()) { for (index in 0 until files.length()) add(parseFile(files.getJSONObject(index))) }
+    }
+
+    suspend fun createLinkFile(token: String, name: String, url: String): WorkspaceFile = withContext(Dispatchers.IO) {
+        parseFile(request("POST", "/api/files", JSONObject().put("name", name).put("url", url), token)
+            .getJSONObject("file"))
+    }
+
+    suspend fun uploadFile(token: String, name: String, contentType: String, bytes: ByteArray): WorkspaceFile = withContext(Dispatchers.IO) {
+        val target = request("POST", "/api/files/uploads", JSONObject()
+            .put("name", name).put("contentType", contentType).put("sizeBytes", bytes.size), token)
+        val uploadId = target.optString("uploadId")
+        val uploadUrl = target.optString("uploadUrl")
+        val uploadRequest = Request.Builder().url(uploadUrl)
+            .header("Content-Type", contentType)
+            .put(bytes.toRequestBody(contentType.toMediaType()))
+            .build()
+        try {
+            httpClient.newBuilder().followRedirects(true).followSslRedirects(true).build().newCall(uploadRequest).execute().use { response ->
+                if (!response.isSuccessful) throw IOException("The File could not be uploaded (HTTP ${response.code}).")
+            }
+        } catch (error: Exception) {
+            runCatching { request("DELETE", "/api/files/${pathSegment(uploadId)}", token = token) }
+            throw IOException(error.message ?: "The File could not be uploaded.", error)
+        }
+        parseFile(request("POST", "/api/files/${pathSegment(uploadId)}/complete", token = token).getJSONObject("file"))
+    }
+
+    suspend fun attachFile(token: String, file: WorkspaceFile, item: WorkspaceItem) = withContext(Dispatchers.IO) {
+        request("POST", "/api/files/${pathSegment(file.id)}/attachments", JSONObject().put("itemId", item.id), token)
+        Unit
+    }
+
+    suspend fun removeAttachment(token: String, file: WorkspaceFile, attachment: FileAttachment) = withContext(Dispatchers.IO) {
+        request("DELETE", "/api/files/${pathSegment(file.id)}/attachments/${pathSegment(attachment.itemId)}", token = token)
+        Unit
+    }
+
+    suspend fun deleteFile(token: String, file: WorkspaceFile) = withContext(Dispatchers.IO) {
+        request("DELETE", "/api/files/${pathSegment(file.id)}", token = token)
+        Unit
+    }
+
+    suspend fun openFile(token: String, file: WorkspaceFile): OpenFileTarget = withContext(Dispatchers.IO) {
+        val response = request("GET", "/api/files/${pathSegment(file.id)}/open", token = token)
+        OpenFileTarget(response.optString("url"), response.optString("name"), response.nullableString("contentType"), response.optString("sourceType"))
     }
 
     suspend fun createItem(token: String, fields: ItemFields): WorkspaceItem =
@@ -175,6 +240,11 @@ class ApiClient(rawBaseUrl: String) {
             ItemKind.Event.wireValue -> ItemKind.Event
             else -> throw IOException("The server returned an unknown item type.")
         }
+        val fileArray = json.optJSONArray("files")
+        val files = buildList { if (fileArray != null) for (index in 0 until fileArray.length()) {
+            val file = fileArray.getJSONObject(index)
+            add(WorkspaceFileSummary(file.optString("id"), file.optString("name"), file.optString("sourceType")))
+        } }
         return WorkspaceItem(
             id = json.optString("id"),
             kind = kind,
@@ -185,6 +255,21 @@ class ApiClient(rawBaseUrl: String) {
             completed = if (json.isNull("completed")) null else json.optBoolean("completed"),
             createdAt = json.optString("createdAt"),
             updatedAt = json.optString("updatedAt"),
+            files = files,
+        )
+    }
+
+    private fun parseFile(json: JSONObject): WorkspaceFile {
+        val attachmentArray = json.optJSONArray("attachments")
+        val attachments = buildList { if (attachmentArray != null) for (index in 0 until attachmentArray.length()) {
+            val attachment = attachmentArray.getJSONObject(index)
+            val kind = if (attachment.optString("itemKind") == ItemKind.Event.wireValue) ItemKind.Event else ItemKind.Task
+            add(FileAttachment(attachment.optString("itemId"), kind, attachment.optString("itemTitle")))
+        } }
+        return WorkspaceFile(
+            id = json.optString("id"), name = json.optString("name"), sourceType = json.optString("sourceType"),
+            contentType = json.nullableString("contentType"), sizeBytes = if (json.isNull("sizeBytes")) null else json.optLong("sizeBytes"),
+            externalUrl = json.nullableString("externalUrl"), createdAt = json.optString("createdAt"), attachments = attachments,
         )
     }
 

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { WorkspaceItem } from "./items";
+import type { WorkspaceFileSummary, WorkspaceItem } from "./items";
 import { database } from "./database";
 import { HttpError } from "./http";
 
@@ -9,19 +9,42 @@ function fromRow(row: Record<string, unknown>): WorkspaceItem {
     scheduledDate: row.scheduled_date === null ? null : String(row.scheduled_date),
     scheduledTime: row.scheduled_time === null ? null : String(row.scheduled_time),
     completed: row.completed === null ? null : Boolean(row.completed),
+    files: [],
     createdAt: String(row.created_at), updatedAt: String(row.updated_at),
   };
 }
 
 export function listItems(userId: string) {
-  return database().prepare(`SELECT * FROM items WHERE user_id = ?
+  const items = database().prepare(`SELECT * FROM items WHERE user_id = ?
     ORDER BY scheduled_date IS NULL, scheduled_date, scheduled_time, created_at, id`).all(userId).map(fromRow);
+  if (items.length === 0) return items;
+  const filesByItem = new Map<string, WorkspaceFileSummary[]>();
+  const rows = database().prepare(`SELECT a.item_id, f.id, f.name, f.source_type
+    FROM attachments a
+    JOIN items i ON i.id = a.item_id
+    JOIN files f ON f.id = a.file_id AND f.user_id = i.user_id
+    WHERE i.user_id = ? AND f.status = 'ready'
+    ORDER BY f.created_at DESC, f.id`).all(userId);
+  for (const row of rows) {
+    const itemId = String(row.item_id);
+    filesByItem.set(itemId, [...(filesByItem.get(itemId) ?? []), {
+      id: String(row.id), name: String(row.name), sourceType: row.source_type as "upload" | "link",
+    }]);
+  }
+  return items.map((item) => ({ ...item, files: filesByItem.get(item.id) ?? [] }));
 }
 
 export function getItem(userId: string, id: string) {
   const row = database().prepare("SELECT * FROM items WHERE user_id = ? AND id = ?").get(userId, id);
   if (!row) throw new HttpError(404, "This item could not be found.");
-  return fromRow(row);
+  const item = fromRow(row);
+  item.files = database().prepare(`SELECT f.id, f.name, f.source_type
+    FROM attachments a JOIN files f ON f.id = a.file_id
+    WHERE a.item_id = ? AND f.user_id = ? AND f.status = 'ready' ORDER BY f.created_at DESC, f.id`)
+    .all(id, userId).map((file) => ({
+      id: String(file.id), name: String(file.name), sourceType: file.source_type as "upload" | "link",
+    }));
+  return item;
 }
 
 function validate(body: Record<string, unknown>, existing?: WorkspaceItem): WorkspaceItem {
@@ -51,6 +74,7 @@ function validate(body: Record<string, unknown>, existing?: WorkspaceItem): Work
   return {
     id: existing?.id ?? randomUUID(), kind, title: title.trim(), details, scheduledDate, scheduledTime,
     completed: kind === "task" ? (body.completed as boolean | undefined) ?? existing?.completed ?? false : null,
+    files: existing?.files ?? [],
     createdAt: existing?.createdAt ?? now, updatedAt: now,
   };
 }
@@ -66,7 +90,7 @@ export function saveItem(userId: string, body: Record<string, unknown>, id?: str
       VALUES(?,?,?,?,?,?,?,?,?,?)`).run(item.id, userId, item.kind, item.title, item.details, item.scheduledDate,
         item.scheduledTime, item.completed === null ? null : Number(item.completed), item.createdAt, item.updatedAt);
   }
-  return item;
+  return id ? getItem(userId, id) : item;
 }
 
 export function deleteItem(userId: string, id: string) {

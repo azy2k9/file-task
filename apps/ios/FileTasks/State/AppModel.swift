@@ -5,6 +5,7 @@ import Combine
 final class AppModel: ObservableObject {
     @Published private(set) var user: AuthUser?
     @Published private(set) var items: [WorkspaceItem] = []
+    @Published private(set) var files: [WorkspaceFile] = []
     @Published private(set) var isRestoring = true
     @Published private(set) var isAuthenticating = false
     @Published private(set) var isLoadingItems = false
@@ -21,6 +22,7 @@ final class AppModel: ObservableObject {
     private var hasRestoredSession = false
     private var sessionGeneration = 0
     private var itemRevision = 0
+    private var fileRevision = 0
     private var refreshRequestID = 0
     private var authenticationAttemptID: UUID?
 
@@ -171,9 +173,98 @@ final class AppModel: ObservableObject {
             guard isCurrent(context) else { return }
             items.removeAll { $0.id == item.id }
             itemRevision += 1
+            await refreshItems(using: context)
             errorMessage = nil
         } catch {
             handle(error, for: context)
+        }
+    }
+
+    func saveLinkFile(name: String, url: String) async throws {
+        let context = try currentContext()
+        do {
+            let file = try await APIClient(baseURL: context.baseURL).createLinkFile(name: name, url: url, token: context.token)
+            guard isCurrent(context) else { throw APIClientError.sessionChanged }
+            files.insert(file, at: 0)
+            fileRevision += 1
+            errorMessage = nil
+        } catch {
+            handle(error, for: context)
+            throw error
+        }
+    }
+
+    func uploadFile(name: String, contentType: String, data: Data) async throws {
+        let context = try currentContext()
+        do {
+            let file = try await APIClient(baseURL: context.baseURL).uploadFile(
+                name: name, contentType: contentType, data: data, token: context.token
+            )
+            guard isCurrent(context) else { throw APIClientError.sessionChanged }
+            files.insert(file, at: 0)
+            fileRevision += 1
+            errorMessage = nil
+        } catch {
+            handle(error, for: context)
+            throw error
+        }
+    }
+
+    func attachFile(_ file: WorkspaceFile, to item: WorkspaceItem) async throws {
+        let context = try currentContext()
+        do {
+            try await APIClient(baseURL: context.baseURL).attachFile(id: file.id, to: item.id, token: context.token)
+            guard isCurrent(context) else { throw APIClientError.sessionChanged }
+            await refreshItems(using: context)
+        } catch {
+            handle(error, for: context)
+            throw error
+        }
+    }
+
+    func removeAttachment(_ attachment: FileAttachment, from file: WorkspaceFile) async throws {
+        let context = try currentContext()
+        do {
+            try await APIClient(baseURL: context.baseURL).removeAttachment(
+                fileId: file.id, itemId: attachment.itemId, token: context.token
+            )
+            guard isCurrent(context) else { throw APIClientError.sessionChanged }
+            await refreshItems(using: context)
+        } catch {
+            handle(error, for: context)
+            throw error
+        }
+    }
+
+    func deleteFile(_ file: WorkspaceFile) async throws {
+        let context = try currentContext()
+        do {
+            try await APIClient(baseURL: context.baseURL).deleteFile(id: file.id, token: context.token)
+            guard isCurrent(context) else { throw APIClientError.sessionChanged }
+            files.removeAll { $0.id == file.id }
+            items = items.map { item in
+                var updated = item
+                updated.files.removeAll { $0.id == file.id }
+                return updated
+            }
+            fileRevision += 1
+            itemRevision += 1
+            errorMessage = nil
+        } catch {
+            handle(error, for: context)
+            throw error
+        }
+    }
+
+    func openFileURL(id: String) async throws -> URL {
+        let context = try currentContext()
+        do {
+            let target = try await APIClient(baseURL: context.baseURL).openFile(id: id, token: context.token)
+            guard isCurrent(context), let url = URL(string: target.url) else { throw APIClientError.sessionChanged }
+            return url
+        } catch {
+            handle(error, for: context)
+            throw error
         }
     }
 
@@ -215,22 +306,29 @@ final class AppModel: ObservableObject {
         refreshRequestID += 1
         let requestID = refreshRequestID
         let revisionAtStart = itemRevision
+        let fileRevisionAtStart = fileRevision
         isLoadingItems = true
         defer {
             if isCurrent(context), refreshRequestID == requestID { isLoadingItems = false }
         }
 
         do {
-            let refreshedItems = try await APIClient(baseURL: context.baseURL).items(token: context.token)
+            let api = APIClient(baseURL: context.baseURL)
+            async let itemsRequest = api.items(token: context.token)
+            async let filesRequest = api.files(token: context.token)
+            let (refreshedItems, refreshedFiles) = try await (itemsRequest, filesRequest)
             guard isCurrent(context),
                   refreshRequestID == requestID,
-                  itemRevision == revisionAtStart else { return }
+                  itemRevision == revisionAtStart,
+                  fileRevision == fileRevisionAtStart else { return }
             items = refreshedItems
+            files = refreshedFiles
             errorMessage = nil
         } catch {
             guard isCurrent(context),
                   refreshRequestID == requestID,
-                  itemRevision == revisionAtStart else { return }
+                  itemRevision == revisionAtStart,
+                  fileRevision == fileRevisionAtStart else { return }
             handle(error, for: context)
         }
     }
@@ -254,6 +352,7 @@ final class AppModel: ObservableObject {
         sessionGeneration += 1
         self.user = user
         items = []
+        files = []
         isLoadingItems = false
         errorMessage = nil
         return SessionContext(generation: sessionGeneration, token: token, baseURL: baseURL)
@@ -295,6 +394,7 @@ final class AppModel: ObservableObject {
         isLoadingItems = false
         user = nil
         items = []
+        files = []
         errorMessage = nil
     }
 

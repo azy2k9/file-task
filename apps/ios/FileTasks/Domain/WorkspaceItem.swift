@@ -24,6 +24,32 @@ struct WorkspaceItem: Codable, Identifiable, Equatable {
     let completed: Bool?
     let createdAt: String
     let updatedAt: String
+    var files: [WorkspaceFileSummary] = []
+}
+
+struct WorkspaceFileSummary: Codable, Identifiable, Equatable {
+    let id: String
+    let name: String
+    let sourceType: String
+}
+
+struct FileAttachment: Codable, Identifiable, Equatable {
+    let itemId: String
+    let itemKind: WorkspaceItemKind
+    let itemTitle: String
+
+    var id: String { itemId }
+}
+
+struct WorkspaceFile: Codable, Identifiable, Equatable {
+    let id: String
+    let name: String
+    let sourceType: String
+    let contentType: String?
+    let sizeBytes: Int64?
+    let externalUrl: String?
+    let createdAt: String
+    let attachments: [FileAttachment]
 }
 
 struct ItemPayload: Encodable {

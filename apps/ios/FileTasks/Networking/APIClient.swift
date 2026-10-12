@@ -52,6 +52,77 @@ struct APIClient {
         return response.items
     }
 
+    func files(token: String) async throws -> [WorkspaceFile] {
+        let response: FilesResponse = try decode(
+            FilesResponse.self,
+            from: try await perform(path: ["api", "files"], method: "GET", token: token)
+        )
+        return response.files
+    }
+
+    func createLinkFile(name: String, url: String, token: String) async throws -> WorkspaceFile {
+        let response: FileResponse = try decode(
+            FileResponse.self,
+            from: try await perform(
+                path: ["api", "files"], method: "POST", token: token,
+                body: try encoder.encode(LinkFilePayload(name: name, url: url))
+            )
+        )
+        return response.file
+    }
+
+    func uploadFile(name: String, contentType: String, data: Data, token: String) async throws -> WorkspaceFile {
+        let target: UploadTarget = try decode(
+            UploadTarget.self,
+            from: try await perform(
+                path: ["api", "files", "uploads"], method: "POST", token: token,
+                body: try encoder.encode(UploadPayload(name: name, contentType: contentType, sizeBytes: data.count))
+            )
+        )
+        guard let uploadURL = URL(string: target.uploadUrl) else { throw APIClientError.invalidResponse }
+        var request = URLRequest(url: uploadURL)
+        request.httpMethod = "PUT"
+        request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        request.httpBody = data
+        do {
+            let (_, response) = try await session.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else { throw APIClientError.invalidResponse }
+            guard (200..<300).contains(httpResponse.statusCode) else {
+                throw APIClientError.httpStatus(httpResponse.statusCode, "The File could not be uploaded.")
+            }
+        } catch {
+            _ = try? await perform(path: ["api", "files", target.uploadId], method: "DELETE", token: token)
+            throw error
+        }
+        let completed: FileResponse = try decode(
+            FileResponse.self,
+            from: try await perform(path: ["api", "files", target.uploadId, "complete"], method: "POST", token: token)
+        )
+        return completed.file
+    }
+
+    func attachFile(id: String, to itemId: String, token: String) async throws {
+        _ = try await perform(
+            path: ["api", "files", id, "attachments"], method: "POST", token: token,
+            body: try encoder.encode(AttachmentPayload(itemId: itemId))
+        )
+    }
+
+    func removeAttachment(fileId: String, itemId: String, token: String) async throws {
+        _ = try await perform(path: ["api", "files", fileId, "attachments", itemId], method: "DELETE", token: token)
+    }
+
+    func deleteFile(id: String, token: String) async throws {
+        _ = try await perform(path: ["api", "files", id], method: "DELETE", token: token)
+    }
+
+    func openFile(id: String, token: String) async throws -> OpenFileTarget {
+        try decode(
+            OpenFileTarget.self,
+            from: try await perform(path: ["api", "files", id, "open"], method: "GET", token: token)
+        )
+    }
+
     func createItem(_ payload: ItemPayload, token: String) async throws -> WorkspaceItem {
         let response: ItemResponse = try decode(
             ItemResponse.self,
@@ -179,6 +250,14 @@ private struct APIErrorResponse: Decodable {
 private struct CompletionPayload: Encodable {
     let completed: Bool
 }
+
+private struct FilesResponse: Decodable { let files: [WorkspaceFile] }
+private struct FileResponse: Decodable { let file: WorkspaceFile }
+private struct UploadTarget: Decodable { let uploadId: String; let uploadUrl: String }
+struct OpenFileTarget: Decodable { let url: String; let name: String; let contentType: String?; let sourceType: String }
+private struct LinkFilePayload: Encodable { let name: String; let url: String }
+private struct UploadPayload: Encodable { let name: String; let contentType: String; let sizeBytes: Int }
+private struct AttachmentPayload: Encodable { let itemId: String }
 
 enum APIClientError: LocalizedError {
     case transport(String)

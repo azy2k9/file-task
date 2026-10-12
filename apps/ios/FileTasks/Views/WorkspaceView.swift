@@ -1,4 +1,6 @@
 import SwiftUI
+import UniformTypeIdentifiers
+import UIKit
 
 private enum ItemFilter: String, CaseIterable, Identifiable {
     case all = "All"
@@ -14,6 +16,12 @@ private enum ItemFilter: String, CaseIterable, Identifiable {
         case .events: return item.kind == .event
         }
     }
+}
+
+private enum WorkspaceSection: String, CaseIterable, Identifiable {
+    case agenda = "Agenda"
+    case files = "Files"
+    var id: String { rawValue }
 }
 
 private struct AgendaGroup: Identifiable {
@@ -33,6 +41,14 @@ struct WorkspaceView: View {
     @State private var newItemKind: WorkspaceItemKind = .task
     @State private var itemPendingDeletion: WorkspaceItem?
     @State private var showingLogoutConfirmation = false
+    @State private var section: WorkspaceSection = .agenda
+    @State private var showingLinkForm = false
+    @State private var linkName = ""
+    @State private var linkURL = ""
+    @State private var showingFileImporter = false
+    @State private var fileToAttach: WorkspaceFile?
+    @State private var fileToDelete: WorkspaceFile?
+    @State private var attachmentToRemove: (file: WorkspaceFile, attachment: FileAttachment)?
 
     private var filteredItems: [WorkspaceItem] {
         model.items.filter { filter.includes($0) }
@@ -61,6 +77,17 @@ struct WorkspaceView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section {
+                    Picker("Section", selection: $section) {
+                        ForEach(WorkspaceSection.allCases) { option in Text(option.rawValue).tag(option) }
+                    }
+                    .pickerStyle(.segmented)
+                    .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+                }
+
+                if section == .files {
+                    filesContent
+                } else {
                 if let error = model.errorMessage {
                     Section {
                         ErrorBanner(message: error, dismiss: model.dismissError)
@@ -118,10 +145,11 @@ struct WorkspaceView: View {
                         }
                     }
                 }
+                }
             }
             .listStyle(.insetGrouped)
             .refreshable { await model.refreshItems() }
-            .navigationTitle("Workspace")
+            .navigationTitle(section == .files ? "Files" : "Workspace")
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Menu {
@@ -140,16 +168,17 @@ struct WorkspaceView: View {
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Menu {
-                        Button { beginCreating(.task) } label: {
-                            Label("New Task", systemImage: "checkmark.circle")
-                        }
-                        Button { beginCreating(.event) } label: {
-                            Label("New Event", systemImage: "calendar.badge.plus")
+                        if section == .agenda {
+                            Button { beginCreating(.task) } label: { Label("New Task", systemImage: "checkmark.circle") }
+                            Button { beginCreating(.event) } label: { Label("New Event", systemImage: "calendar.badge.plus") }
+                        } else {
+                            Button { showingFileImporter = true } label: { Label("Upload File", systemImage: "square.and.arrow.up") }
+                            Button { showingLinkForm = true } label: { Label("Add external link", systemImage: "link") }
                         }
                     } label: {
                         Image(systemName: "plus")
                     }
-                    .accessibilityLabel("Create item")
+                    .accessibilityLabel(section == .files ? "Add File" : "Create item")
                 }
             }
             .sheet(isPresented: $showingEditor, onDismiss: { editingItem = nil }) {
@@ -177,6 +206,135 @@ struct WorkspaceView: View {
                 }
                 Button("Cancel", role: .cancel) { }
             }
+            .fileImporter(isPresented: $showingFileImporter, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
+                switch result {
+                case let .success(urls):
+                    guard let url = urls.first else { return }
+                    upload(url)
+                case let .failure(error):
+                    model.errorMessage = error.localizedDescription
+                }
+            }
+            .alert("Add an external link", isPresented: $showingLinkForm) {
+                TextField("Name", text: $linkName)
+                TextField("https://…", text: $linkURL)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                Button("Add link") { saveLink() }
+                Button("Cancel", role: .cancel) { }
+            } message: {
+                Text("Save a web link in your Files section.")
+            }
+            .confirmationDialog("Attach \(fileToAttach?.name ?? "File")", isPresented: Binding(
+                get: { fileToAttach != nil }, set: { if !$0 { fileToAttach = nil } }
+            )) {
+                if let file = fileToAttach {
+                    ForEach(model.items.filter { item in !file.attachments.contains(where: { $0.itemId == item.id }) }) { item in
+                        Button("\(item.kind.title): \(item.title)") { Task { await attach(file, to: item) } }
+                    }
+                }
+                Button("Cancel", role: .cancel) { fileToAttach = nil }
+            } message: {
+                Text("Choose a Task or Event for this Attachment.")
+            }
+            .confirmationDialog("Delete this File?", isPresented: Binding(
+                get: { fileToDelete != nil }, set: { if !$0 { fileToDelete = nil } }
+            ), titleVisibility: .visible) {
+                if let file = fileToDelete {
+                    Button("Delete File", role: .destructive) { Task { await deleteFile(file) } }
+                }
+                Button("Cancel", role: .cancel) { fileToDelete = nil }
+            } message: {
+                if let file = fileToDelete, file.attachments.count > 1 {
+                    Text("This File is attached to \(file.attachments.count) Tasks or Events. Deleting it removes all of those Attachments.")
+                } else if let file = fileToDelete, let attachment = file.attachments.first {
+                    Text("Deleting this File also removes its Attachment from “\(attachment.itemTitle)”.")
+                } else { Text("The File will be removed from your Files section.") }
+            }
+            .confirmationDialog("Remove this Attachment?", isPresented: Binding(
+                get: { attachmentToRemove != nil }, set: { if !$0 { attachmentToRemove = nil } }
+            ), titleVisibility: .visible) {
+                if let target = attachmentToRemove {
+                    Button("Remove Attachment") { Task { await removeAttachment(target.attachment, from: target.file) } }
+                    Button("Delete File from Files section", role: .destructive) { Task { await deleteFile(target.file) } }
+                }
+                Button("Cancel", role: .cancel) { attachmentToRemove = nil }
+            } message: {
+                if let target = attachmentToRemove, target.file.attachments.count > 1 {
+                    Text("Remove this Attachment from “\(target.attachment.itemTitle)” only, or delete the File and its Attachments from \(target.file.attachments.count) items.")
+                } else if let target = attachmentToRemove {
+                    Text("Remove this Attachment from “\(target.attachment.itemTitle)” only, or delete the File.")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var filesContent: some View {
+        if let error = model.errorMessage {
+            Section {
+                ErrorBanner(message: error, dismiss: model.dismissError)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
+            }
+        }
+        if model.files.isEmpty {
+            Section {
+                VStack(spacing: 9) {
+                    Image(systemName: "doc.on.doc")
+                        .font(.system(size: 30))
+                        .foregroundStyle(.secondary)
+                    Text("Your Files have a home here.").font(.headline)
+                    Text("Upload a document or add a link, then attach it to a Task or Event.")
+                        .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    Button("Add an external link") { showingLinkForm = true }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 24)
+                .listRowBackground(Color.clear)
+            }
+        } else {
+            ForEach(model.files) { file in
+                Section {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(file.name).font(.body.weight(.medium))
+                            Text(file.sizeBytes.map { "\($0 / 1000) KB · \(file.contentType ?? "")" } ?? "External link")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Open") { openFile(file.id) }
+                    }
+                    HStack {
+                        Button("Attach") { fileToAttach = file }
+                            .disabled(model.items.count == file.attachments.count)
+                        Spacer()
+                        Button("Delete File", role: .destructive) { fileToDelete = file }
+                    }
+                    if file.attachments.isEmpty {
+                        Text("No Tasks or Events yet").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        ForEach(file.attachments) { attachment in
+                            HStack {
+                                Button("\(attachment.itemKind.title): \(attachment.itemTitle)") {
+                                    guard let item = model.items.first(where: { $0.id == attachment.itemId }) else { return }
+                                    section = .agenda
+                                    filter = item.kind == .task ? .tasks : .events
+                                    editingItem = item
+                                    showingEditor = true
+                                }
+                                .buttonStyle(.plain)
+                                Spacer()
+                                Button("Remove") { attachmentToRemove = (file, attachment) }
+                                    .font(.caption)
+                            }
+                        }
+                    }
+                } header: {
+                    Label(file.name, systemImage: file.sourceType == "link" ? "link" : "doc")
+                        .textCase(nil)
+                }
+            }
         }
     }
 
@@ -190,7 +348,8 @@ struct WorkspaceView: View {
 
     @ViewBuilder
     private func itemRow(_ item: WorkspaceItem) -> some View {
-        HStack(alignment: .top, spacing: 12) {
+        VStack(alignment: .leading, spacing: 5) {
+          HStack(alignment: .top, spacing: 12) {
             if item.kind == .task {
                 Button {
                     Task { await model.setCompleted(item, to: item.completed != true) }
@@ -248,8 +407,74 @@ struct WorkspaceView: View {
             }
             .buttonStyle(.plain)
             .accessibilityHint("Opens item details")
+          }
+          ForEach(item.files) { file in
+              Button("▤  \(file.name)") { openFile(file.id) }
+                  .font(.caption)
+                  .buttonStyle(.borderless)
+                  .padding(.leading, 40)
+          }
         }
         .padding(.vertical, 3)
+    }
+
+    private func upload(_ url: URL) {
+        Task {
+            do {
+                let (name, contentType, data) = try await Task.detached(priority: .userInitiated) { () throws -> (String, String, Data) in
+                    let hasAccess = url.startAccessingSecurityScopedResource()
+                    defer { if hasAccess { url.stopAccessingSecurityScopedResource() } }
+                    if let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+                       let size = attributes[.size] as? NSNumber, size.int64Value > 50_000_000 {
+                        throw CocoaError(.fileReadTooLarge, userInfo: [NSLocalizedDescriptionKey: "Files must be smaller than 50 MB."])
+                    }
+                    let data = try Data(contentsOf: url)
+                    guard !data.isEmpty, data.count <= 50_000_000 else {
+                        throw CocoaError(.fileReadTooLarge, userInfo: [NSLocalizedDescriptionKey: "Files must contain data and be smaller than 50 MB."])
+                    }
+                    let contentType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+                    return (url.lastPathComponent, contentType, data)
+                }.value
+                try await model.uploadFile(name: name, contentType: contentType, data: data)
+            } catch {
+                model.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func saveLink() {
+        Task {
+            do {
+                try await model.saveLinkFile(name: linkName, url: linkURL)
+                linkName = ""
+                linkURL = ""
+                showingLinkForm = false
+            } catch { model.errorMessage = error.localizedDescription }
+        }
+    }
+
+    private func attach(_ file: WorkspaceFile, to item: WorkspaceItem) async {
+        do { try await model.attachFile(file, to: item); fileToAttach = nil }
+        catch { model.errorMessage = error.localizedDescription }
+    }
+
+    private func removeAttachment(_ attachment: FileAttachment, from file: WorkspaceFile) async {
+        do { try await model.removeAttachment(attachment, from: file); attachmentToRemove = nil }
+        catch { model.errorMessage = error.localizedDescription }
+    }
+
+    private func deleteFile(_ file: WorkspaceFile) async {
+        do { try await model.deleteFile(file); fileToDelete = nil; attachmentToRemove = nil }
+        catch { model.errorMessage = error.localizedDescription }
+    }
+
+    private func openFile(_ id: String) {
+        Task {
+            do {
+                let url = try await model.openFileURL(id: id)
+                await UIApplication.shared.open(url)
+            } catch { model.errorMessage = error.localizedDescription }
+        }
     }
 
     private func beginCreating(_ kind: WorkspaceItemKind) {

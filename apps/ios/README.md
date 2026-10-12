@@ -19,6 +19,7 @@ For local development, enter the development server URL and turn on **Allow loca
 - Create, edit, and delete Tasks and Events. Tasks can be completed and reopened.
 - Optional local date and time, including undated and all-day items.
 - Pull-to-refresh for changes made from another client.
+- Files section with external links, private R2 uploads, Attachments to multiple Tasks and Events, and separate Attachment/File deletion actions.
 - Bearer-token authentication with the token stored in the iOS Keychain.
 
 Failed saves leave the editor fields in place so the person can retry. A failed refresh leaves the last loaded items visible and displays the error.

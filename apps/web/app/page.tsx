@@ -2,9 +2,10 @@
 
 import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import type { ItemInput, ItemKind, WorkspaceItem } from "@api/items";
+import FilesView from "./files-view";
 
 type Account = { id: string; email: string };
-type View = "agenda" | "task" | "event";
+type View = "agenda" | "task" | "event" | "files";
 type AuthMode = "login" | "register";
 type Draft = {
   title: string;
@@ -108,6 +109,14 @@ function NavIcon({ name }: { name: View }) {
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <rect x="4" y="4" width="16" height="16" rx="4" />
         <path d="m8 12.3 2.4 2.4L16.5 9" />
+      </svg>
+    );
+  }
+  if (name === "files") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 6.5A2.5 2.5 0 0 1 6.5 4H11l2 2h4.5A2.5 2.5 0 0 1 20 8.5v9a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 17.5Z" />
+        <path d="M4.5 9h15" />
       </svg>
     );
   }
@@ -266,12 +275,14 @@ function ItemCard({
   onToggle,
   onEdit,
   onDelete,
+  onViewFile,
 }: {
   item: WorkspaceItem;
   disabled: boolean;
   onToggle: (item: WorkspaceItem) => void;
   onEdit: (item: WorkspaceItem) => void;
   onDelete: (item: WorkspaceItem) => void;
+  onViewFile: (fileId: string) => void;
 }) {
   const isTask = item.kind === "task";
   const isComplete = isTask && item.completed === true;
@@ -304,6 +315,9 @@ function ItemCard({
         </div>
         <h3 className="item-title">{item.title}</h3>
         {item.details && <p className="item-details">{item.details}</p>}
+        {item.files.length > 0 && <div className="item-files" aria-label={`Files attached to ${item.title}`}>
+          {item.files.map((file) => <button className="item-file-link" type="button" key={file.id} onClick={() => onViewFile(file.id)}>▤ {file.name}</button>)}
+        </div>}
       </div>
 
       <div className="item-actions">
@@ -551,6 +565,8 @@ export default function Page() {
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [view, setView] = useState<View>("agenda");
+  const [filesCount, setFilesCount] = useState(0);
+  const [focusFileId, setFocusFileId] = useState<string | null>(null);
   const [items, setItems] = useState<WorkspaceItem[]>([]);
   const [itemsLoading, setItemsLoading] = useState(true);
   const [itemsError, setItemsError] = useState<string | null>(null);
@@ -599,6 +615,7 @@ export default function Page() {
         setAccount(result.user);
         setAuthStatus("signed-in");
         void loadItems(version);
+        void loadFilesCount(version);
       } catch {
         if (!mounted || identityVersion.current !== version) return;
         setAuthError("Could not reach FileTasks. Please check your connection and sign in.");
@@ -646,6 +663,21 @@ export default function Page() {
     }
   }
 
+  async function loadFilesCount(version: number) {
+    if (!signedInRef.current || identityVersion.current !== version || signingOutLock.current) return;
+    try {
+      const response = await fetch("/api/files", { credentials: "same-origin", cache: "no-store" });
+      if (identityVersion.current !== version) return;
+      if (response.status === 401) {
+        expireSession(version, "Your session has expired. Please sign in again.");
+        return;
+      }
+      if (!response.ok) return;
+      const result = await response.json() as { files: unknown[] };
+      if (identityVersion.current === version) setFilesCount(result.files.length);
+    } catch { /* The Files screen reports its own load errors. */ }
+  }
+
   function expireSession(version: number, message: string) {
     if (identityVersion.current !== version) return;
     identityVersion.current += 1;
@@ -653,6 +685,8 @@ export default function Page() {
     signedInRef.current = false;
     setAccount(null);
     setItems([]);
+    setFilesCount(0);
+    setFocusFileId(null);
     setItemsError(null);
     setActionError(null);
     setAuthMode("login");
@@ -667,7 +701,10 @@ export default function Page() {
     if (authStatus !== "signed-in") return;
     const version = identityVersion.current;
     const refresh = () => {
-      if (document.visibilityState === "visible") void loadItems(version);
+      if (document.visibilityState === "visible") {
+        void loadItems(version);
+        void loadFilesCount(version);
+      }
     };
     window.addEventListener("focus", refresh);
     const interval = window.setInterval(refresh, 30_000);
@@ -705,12 +742,15 @@ export default function Page() {
       signedInRef.current = true;
       setAccount(result.user);
       setItems([]);
+      setFilesCount(0);
+      setFocusFileId(null);
       setItemsError(null);
       setActionError(null);
       setAuthError(null);
       setAuthStatus("signed-in");
       setItemsLoading(true);
       void loadItems(version);
+      void loadFilesCount(version);
     } catch {
       setAuthError("Could not reach FileTasks. Check your connection and try again.");
     } finally {
@@ -731,6 +771,7 @@ export default function Page() {
       signedInRef.current = false;
       setAccount(null);
       setItems([]);
+      setFilesCount(0);
       setItemsError(null);
       setLastUpdated(null);
       setAuthMode("login");
@@ -984,9 +1025,9 @@ export default function Page() {
           </div>
           <div className="sidebar-section-label">YOUR SPACE</div>
           <nav className="sidebar-nav" aria-label="Your space">
-            {(["agenda", "task", "event"] as const).map((name) => {
-              const count = name === "agenda" ? items.length : name === "task" ? taskCount : eventCount;
-              const label = name === "agenda" ? "Agenda" : name === "task" ? "Tasks" : "Events";
+            {(["agenda", "task", "event", "files"] as const).map((name) => {
+              const count = name === "agenda" ? items.length : name === "task" ? taskCount : name === "event" ? eventCount : filesCount;
+              const label = name === "agenda" ? "Agenda" : name === "task" ? "Tasks" : name === "event" ? "Events" : "Files";
               return (
                 <button
                   className={`side-link${view === name ? " side-link-active" : ""}`}
@@ -1026,20 +1067,20 @@ export default function Page() {
         </div>
       </aside>
 
-      <section className="main-content" aria-label="Personal agenda">
+      <section className="main-content" aria-label={view === "files" ? "Files section" : "Personal agenda"}>
         <div className="content-inner">
           <header className="page-header">
             <div className="page-heading">
               <p className="eyebrow">{clientReady ? formatToday() : "YOUR PERSONAL SPACE"}</p>
-              <h1>Your agenda<span>.</span></h1>
-              <p className="page-subtitle">
+              <h1>{view === "files" ? "Your Files" : "Your agenda"}<span>.</span></h1>
+              {view === "files" ? <p className="page-subtitle">Documents and links, alongside the Tasks and Events they belong to.</p> : <p className="page-subtitle">
                 {openTaskCount} {openTaskCount === 1 ? "Task" : "Tasks"} to do
                 <span className="subtitle-divider">·</span>
                 {eventCount} {eventCount === 1 ? "Event" : "Events"} to look forward to
                 {completedTaskCount > 0 && <span className="completed-summary"> · {completedTaskCount} completed</span>}
-              </p>
+              </p>}
             </div>
-            <div className="header-actions">
+            {view !== "files" && <div className="header-actions">
               <button
                 className="button button-primary"
                 type="button"
@@ -1053,13 +1094,13 @@ export default function Page() {
               <button className="button button-secondary" type="button" aria-label="New Event" disabled={isMutating} onClick={() => openEditor("event")}>
                 <span className="plus-icon" aria-hidden="true">+</span> New Event
               </button>
-            </div>
+            </div>}
           </header>
 
           <div className="list-toolbar">
             <div className="view-heading">
-              <h2>{view === "agenda" ? "Coming up" : view === "task" ? "Your Tasks" : "Your Events"}</h2>
-              <span className="visible-count">{visibleItems.length}</span>
+              <h2>{view === "files" ? "Files library" : view === "agenda" ? "Coming up" : view === "task" ? "Your Tasks" : "Your Events"}</h2>
+              <span className="visible-count">{view === "files" ? filesCount : visibleItems.length}</span>
             </div>
             <div className="toolbar-right">
               {lastUpdated && <span className="sync-status"><span className="sync-dot" />Synced {lastUpdated.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}</span>}
@@ -1088,7 +1129,19 @@ export default function Page() {
             </div>
           )}
 
-          {itemsLoading && items.length === 0 ? (
+          {view === "files" ? <FilesView
+            items={items}
+            focusFileId={focusFileId}
+            onOpenItem={(itemId) => {
+              const selected = items.find((item) => item.id === itemId);
+              if (selected) {
+                setView(selected.kind);
+                openEditor(selected.kind, selected);
+              }
+            }}
+            onItemsChanged={() => void loadItems(identityVersion.current)}
+            onCountChange={setFilesCount}
+          /> : itemsLoading && items.length === 0 ? (
             <div className="list-loading" role="status"><span className="loading-mark" />Loading your agenda…</div>
           ) : visibleItems.length === 0 ? (
             <EmptyState view={view} onCreate={openEditor} />
@@ -1111,6 +1164,7 @@ export default function Page() {
                         onToggle={toggleTask}
                         onEdit={(selected) => openEditor(selected.kind, selected)}
                         onDelete={openDelete}
+                        onViewFile={(fileId) => { setFocusFileId(fileId); setView("files"); }}
                       />
                     ))}
                   </div>

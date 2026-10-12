@@ -141,6 +141,49 @@ test("invalid item changes preserve the person's saved Task", async () => {
   assert.deepEqual((await saved.json()).item, item);
 });
 
+test("Files can be linked, attached to multiple items, removed separately and deleted account-wide", async () => {
+  const owner = await account();
+  const task = await request("/api/items", { token: owner.token, method: "POST", body: { kind: "task", title: "Submit the form" } });
+  const event = await request("/api/items", { token: owner.token, method: "POST", body: { kind: "event", title: "Appointment" } });
+  const taskItem = (await task.json()).item;
+  const eventItem = (await event.json()).item;
+  const created = await request("/api/files", { token: owner.token, method: "POST", body: {
+    name: "Application form", url: "https://example.com/application.pdf",
+  } });
+  assert.equal(created.status, 201);
+  const file = (await created.json()).file;
+  assert.equal(file.sourceType, "link");
+  assert.equal(file.externalUrl, "https://example.com/application.pdf");
+
+  for (const item of [taskItem, eventItem]) {
+    const response = await request(`/api/files/${file.id}/attachments`, { token: owner.token, method: "POST", body: { itemId: item.id } });
+    assert.equal(response.status, 201);
+  }
+  const listedFiles = (await (await request("/api/files", { token: owner.token })).json()).files;
+  assert.deepEqual(listedFiles[0].attachments.map(({ itemId }) => itemId).sort(), [taskItem.id, eventItem.id].sort());
+  const listedItems = (await (await request("/api/items", { token: owner.token })).json()).items;
+  assert.deepEqual(listedItems.find(({ id }) => id === taskItem.id).files, [{ id: file.id, name: file.name, sourceType: "link" }]);
+  assert.deepEqual(listedItems.find(({ id }) => id === eventItem.id).files, [{ id: file.id, name: file.name, sourceType: "link" }]);
+  assert.equal((await request(`/api/files/${file.id}/open`, { token: owner.token })).status, 200);
+
+  const other = await account();
+  assert.deepEqual((await (await request("/api/files", { token: other.token })).json()).files, []);
+  assert.equal((await request(`/api/files/${file.id}/open`, { token: other.token })).status, 404);
+  assert.equal((await request(`/api/files/${file.id}/attachments`, { token: other.token, method: "POST", body: { itemId: taskItem.id } })).status, 404);
+
+  assert.equal((await request(`/api/files/${file.id}/attachments/${taskItem.id}`, { token: owner.token, method: "DELETE" })).status, 204);
+  assert.deepEqual((await (await request(`/api/items/${taskItem.id}`, { token: owner.token })).json()).item.files, []);
+  assert.equal((await request(`/api/items/${eventItem.id}`, { token: owner.token })).status, 200);
+  assert.equal((await request(`/api/items/${eventItem.id}`, { token: owner.token, method: "DELETE" })).status, 204);
+  assert.deepEqual((await (await request("/api/files", { token: owner.token })).json()).files[0].attachments, []);
+  assert.equal((await request(`/api/files/${file.id}`, { token: owner.token, method: "DELETE" })).status, 204);
+  assert.deepEqual((await (await request("/api/files", { token: owner.token })).json()).files, []);
+  assert.equal((await request("/api/files", { token: owner.token, method: "POST", body: { name: "bad", url: "javascript:alert(1)" } })).status, 400);
+  assert.equal((await request("/api/files/uploads", { token: owner.token, method: "POST", body: {
+    name: "Too large", contentType: "application/pdf", sizeBytes: 50_000_001,
+  } })).status, 400);
+});
+
 test("accounts are private and signing out revokes only the current client", async () => {
   const owner = await account();
   const other = await account();
@@ -217,6 +260,33 @@ test("a person can manage Tasks and Events through the browser and see another c
     await page.getByLabel(/^Details\b/).fill("Book a table");
     await page.getByRole("button", { name: "Save Event", exact: true }).click();
     await expect(page.getByText("Book a table", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Files", exact: true }).click();
+    await page.getByRole("button", { name: "Add a link", exact: true }).click();
+    await page.getByLabel("Name", { exact: true }).fill("Application form");
+    await page.getByLabel("Web link", { exact: true }).fill("https://example.com/application.pdf");
+    await page.getByRole("button", { name: "Add link", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Application form", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Attach", exact: true }).click();
+    await page.getByLabel("Choose a Task or Event", { exact: true }).selectOption({ label: "Task: Compare car insurance" });
+    await page.getByRole("button", { name: "Add Attachment", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Task: Compare car insurance", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Attach", exact: true }).click();
+    await page.getByLabel("Choose a Task or Event", { exact: true }).selectOption({ label: "Event: Birthday dinner" });
+    await page.getByRole("button", { name: "Add Attachment", exact: true }).click();
+    await expect(page.getByText("Event: Birthday dinner", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Remove Attachment from Compare car insurance", exact: true }).click();
+    await expect(page.getByText("Deleting this File removes it from 2 Tasks or Events.", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Cancel", exact: true }).click();
+    await page.getByRole("button", { name: "Event: Birthday dinner", exact: true }).click();
+    await expect(page.getByRole("dialog")).toBeVisible();
+    await page.getByRole("button", { name: "Close dialog", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Events", exact: true })).toHaveAttribute("aria-current", "page");
+    await page.getByRole("button", { name: "Files", exact: true }).click();
+    await page.getByRole("button", { name: "Remove Attachment from Compare car insurance", exact: true }).click();
+    await page.getByRole("button", { name: "Remove Attachment", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Task: Compare car insurance", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Event: Birthday dinner", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Agenda", exact: true }).click();
     await page.getByRole("button", { name: "New Event", exact: true }).click();
     await page.getByLabel("Title", { exact: true }).fill("Remember this moment");
     await page.getByRole("button", { name: "Save Event", exact: true }).click();

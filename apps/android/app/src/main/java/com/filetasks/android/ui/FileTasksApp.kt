@@ -1,6 +1,11 @@
 package com.filetasks.android.ui
 
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.provider.OpenableColumns
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -54,7 +59,10 @@ import com.filetasks.android.data.ApiClient
 import com.filetasks.android.data.ApiException
 import com.filetasks.android.data.ItemFields
 import com.filetasks.android.data.ItemKind
+import com.filetasks.android.data.FileAttachment
 import com.filetasks.android.data.TokenStore
+import com.filetasks.android.data.WorkspaceFile
+import com.filetasks.android.data.WorkspaceFileSummary
 import com.filetasks.android.data.WorkspaceItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -72,6 +80,7 @@ private const val API_URL_KEY = "api_url"
 private data class EditorTarget(val item: WorkspaceItem?)
 
 private enum class ItemFilter { All, Tasks, Events }
+private enum class WorkspaceSection { Agenda, Files }
 
 @Composable
 fun FileTasksApp(context: Context) {
@@ -89,6 +98,7 @@ fun FileTasksApp(context: Context) {
         var token by remember { mutableStateOf<String?>(null) }
         var user by remember { mutableStateOf<AccountUser?>(null) }
         var workspaceItems by remember { mutableStateOf(emptyList<WorkspaceItem>()) }
+        var workspaceFiles by remember { mutableStateOf(emptyList<WorkspaceFile>()) }
         var initialLoading by remember { mutableStateOf(true) }
         var working by remember { mutableStateOf(false) }
         var recoveryAvailable by remember { mutableStateOf(false) }
@@ -98,9 +108,36 @@ fun FileTasksApp(context: Context) {
         var email by rememberSaveable { mutableStateOf("") }
         var password by rememberSaveable { mutableStateOf("") }
         var itemFilter by rememberSaveable { mutableStateOf(ItemFilter.All.name) }
+        var workspaceSection by rememberSaveable { mutableStateOf(WorkspaceSection.Agenda.name) }
         var showSettings by remember { mutableStateOf(false) }
         var editorTarget by remember { mutableStateOf<EditorTarget?>(null) }
         var confirmDelete by remember { mutableStateOf<WorkspaceItem?>(null) }
+        var confirmDeleteFile by remember { mutableStateOf<WorkspaceFile?>(null) }
+        var confirmRemoveAttachment by remember { mutableStateOf<Pair<WorkspaceFile, FileAttachment>?>(null) }
+        var fileToAttach by remember { mutableStateOf<WorkspaceFile?>(null) }
+        var showLinkDialog by remember { mutableStateOf(false) }
+        var linkName by rememberSaveable { mutableStateOf("") }
+        var linkUrl by rememberSaveable { mutableStateOf("") }
+
+        val uploadLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            val currentToken = token
+            if (uri != null && currentToken != null) {
+                runAction {
+                    val metadata = queryFileMetadata(context, uri)
+                    if (metadata.second > 50_000_000) throw IllegalArgumentException("Files must be smaller than 50 MB.")
+                    val bytes = withContext(Dispatchers.IO) {
+                        context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                            ?: throw IllegalArgumentException("The selected File could not be read.")
+                    }
+                    if (bytes.isEmpty()) throw IllegalArgumentException("Choose a File that contains at least one byte.")
+                    if (bytes.size > 50_000_000) throw IllegalArgumentException("Files must be smaller than 50 MB.")
+                    val api = ApiClient(apiBaseUrl)
+                    api.uploadFile(currentToken, metadata.first, metadata.third, bytes)
+                    workspaceFiles = api.listFiles(currentToken)
+                    workspaceItems = api.listItems(currentToken)
+                }
+            }
+        }
 
         LaunchedEffect(Unit) {
             val savedToken = withContext(Dispatchers.IO) { tokenStore.read() }
@@ -110,12 +147,14 @@ fun FileTasksApp(context: Context) {
                     val api = ApiClient(apiBaseUrl)
                     user = api.session(savedToken)
                     workspaceItems = api.listItems(savedToken)
+                    workspaceFiles = api.listFiles(savedToken)
                 } catch (failure: Exception) {
                     if (failure is ApiException && failure.statusCode == 401) {
                         withContext(Dispatchers.IO) { tokenStore.clear() }
                         token = null
                         user = null
                         workspaceItems = emptyList()
+                        workspaceFiles = emptyList()
                     } else {
                         recoveryAvailable = true
                         errorMessage = readableError(failure)
@@ -138,6 +177,7 @@ fun FileTasksApp(context: Context) {
                         token = null
                         user = null
                         workspaceItems = emptyList()
+                        workspaceFiles = emptyList()
                         recoveryAvailable = false
                         editorTarget = null
                         confirmDelete = null
@@ -153,7 +193,9 @@ fun FileTasksApp(context: Context) {
         fun refreshItems() {
             val currentToken = token ?: return
             runAction {
-                workspaceItems = ApiClient(apiBaseUrl).listItems(currentToken)
+                val api = ApiClient(apiBaseUrl)
+                workspaceItems = api.listItems(currentToken)
+                workspaceFiles = api.listFiles(currentToken)
             }
         }
 
@@ -167,6 +209,7 @@ fun FileTasksApp(context: Context) {
                 token = null
                 user = null
                 workspaceItems = emptyList()
+                workspaceFiles = emptyList()
                 recoveryAvailable = false
             }
         }
@@ -200,12 +243,14 @@ fun FileTasksApp(context: Context) {
                     password = ""
                     try {
                         workspaceItems = api.listItems(newToken)
+                        workspaceFiles = api.listFiles(newToken)
                     } catch (failure: Exception) {
                         if (failure is ApiException && failure.statusCode == 401) {
                             withContext(Dispatchers.IO) { tokenStore.clear() }
                             token = null
                             user = null
                             workspaceItems = emptyList()
+                            workspaceFiles = emptyList()
                             authError = readableError(failure)
                         } else {
                             errorMessage = readableError(failure)
@@ -227,6 +272,7 @@ fun FileTasksApp(context: Context) {
                     val api = ApiClient(apiBaseUrl)
                     user = api.session(currentToken)
                     workspaceItems = api.listItems(currentToken)
+                    workspaceFiles = api.listFiles(currentToken)
                     recoveryAvailable = false
                 } catch (failure: ApiException) {
                     if (failure.statusCode == 401) {
@@ -234,10 +280,75 @@ fun FileTasksApp(context: Context) {
                         token = null
                         user = null
                         workspaceItems = emptyList()
+                        workspaceFiles = emptyList()
                         recoveryAvailable = false
                     }
                     throw failure
                 }
+            }
+        }
+
+        fun saveExternalLink() {
+            val currentToken = token ?: return
+            val name = linkName.trim()
+            val url = linkUrl.trim()
+            if (name.isEmpty() || url.isEmpty()) {
+                errorMessage = "Enter a name and web link."
+                return
+            }
+            runAction {
+                val api = ApiClient(apiBaseUrl)
+                api.createLinkFile(currentToken, name, url)
+                workspaceFiles = api.listFiles(currentToken)
+                showLinkDialog = false
+                linkName = ""
+                linkUrl = ""
+            }
+        }
+
+        fun addAttachment(file: WorkspaceFile, item: WorkspaceItem) {
+            val currentToken = token ?: return
+            runAction {
+                val api = ApiClient(apiBaseUrl)
+                api.attachFile(currentToken, file, item)
+                workspaceFiles = api.listFiles(currentToken)
+                workspaceItems = api.listItems(currentToken)
+                fileToAttach = null
+            }
+        }
+
+        fun removeAttachment(file: WorkspaceFile, attachment: FileAttachment) {
+            val currentToken = token ?: return
+            runAction {
+                val api = ApiClient(apiBaseUrl)
+                api.removeAttachment(currentToken, file, attachment)
+                workspaceFiles = api.listFiles(currentToken)
+                workspaceItems = api.listItems(currentToken)
+                confirmRemoveAttachment = null
+            }
+        }
+
+        fun removeFile(file: WorkspaceFile) {
+            val currentToken = token ?: return
+            runAction {
+                val api = ApiClient(apiBaseUrl)
+                api.deleteFile(currentToken, file)
+                workspaceFiles = api.listFiles(currentToken)
+                workspaceItems = api.listItems(currentToken)
+                confirmDeleteFile = null
+                confirmRemoveAttachment = null
+            }
+        }
+
+        fun openFile(file: WorkspaceFile) {
+            val currentToken = token ?: return
+            runAction {
+                val target = ApiClient(apiBaseUrl).openFile(currentToken, file)
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(target.url)).apply {
+                    target.contentType?.let { type = it }
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(intent)
             }
         }
 
@@ -275,16 +386,30 @@ fun FileTasksApp(context: Context) {
             WorkspaceScreen(
                 user = user!!,
                 items = workspaceItems,
+                files = workspaceFiles,
                 filter = itemFilter,
+                section = workspaceSection,
                 isBusy = working,
                 error = errorMessage,
                 onFilterChange = { itemFilter = it.name },
+                onSectionChange = { workspaceSection = it.name },
                 onRefresh = ::refreshItems,
                 onSignOut = ::signOut,
                 onSettings = { showSettings = true },
                 onCreate = { editorTarget = EditorTarget(null) },
                 onEdit = { editorTarget = EditorTarget(it) },
                 onDelete = { confirmDelete = it },
+                onUpload = { uploadLauncher.launch(arrayOf("*/*")) },
+                onAddLink = { showLinkDialog = true },
+                onAttach = { fileToAttach = it },
+                onDeleteFile = { confirmDeleteFile = it },
+                onRemoveAttachment = { file, attachment -> confirmRemoveAttachment = file to attachment },
+                onOpenFile = ::openFile,
+                onOpenItem = { item ->
+                    workspaceSection = WorkspaceSection.Agenda.name
+                    itemFilter = if (item.kind == ItemKind.Task) ItemFilter.Tasks.name else ItemFilter.Events.name
+                    editorTarget = EditorTarget(item)
+                },
                 onToggleTask = { item ->
                     val currentToken = token
                     if (currentToken != null && !working) {
@@ -357,6 +482,7 @@ fun FileTasksApp(context: Context) {
                                 runAction {
                                     ApiClient(apiBaseUrl).deleteItem(currentToken, item)
                                     workspaceItems = workspaceItems.filterNot { it.id == item.id }
+                                    workspaceFiles = ApiClient(apiBaseUrl).listFiles(currentToken)
                                     confirmDelete = null
                                 }
                             }
@@ -368,6 +494,75 @@ fun FileTasksApp(context: Context) {
                         Text("Cancel")
                     }
                 },
+            )
+        }
+
+        if (showLinkDialog) {
+            AlertDialog(
+                onDismissRequest = { if (!working) showLinkDialog = false },
+                title = { Text("Add an external link") },
+                text = {
+                    Column {
+                        OutlinedTextField(value = linkName, onValueChange = { linkName = it }, label = { Text("Name") }, singleLine = true)
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(value = linkUrl, onValueChange = { linkUrl = it }, label = { Text("Web link") }, singleLine = true)
+                    }
+                },
+                confirmButton = { TextButton(enabled = !working, onClick = ::saveExternalLink) { Text("Add link") } },
+                dismissButton = { TextButton(enabled = !working, onClick = { showLinkDialog = false }) { Text("Cancel") } },
+            )
+        }
+
+        fileToAttach?.let { file ->
+            val availableItems = workspaceItems.filter { item -> file.attachments.none { it.itemId == item.id } }
+            AlertDialog(
+                onDismissRequest = { if (!working) fileToAttach = null },
+                title = { Text("Attach ${file.name}") },
+                text = {
+                    Column {
+                        if (availableItems.isEmpty()) Text("Every Task and Event already has this File attached.")
+                        availableItems.forEach { item ->
+                            TextButton(enabled = !working, onClick = { addAttachment(file, item) }) {
+                                Text("${item.kind.displayName}: ${item.title}")
+                            }
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { fileToAttach = null }) { Text("Close") } },
+            )
+        }
+
+        confirmRemoveAttachment?.let { (file, attachment) ->
+            AlertDialog(
+                onDismissRequest = { if (!working) confirmRemoveAttachment = null },
+                title = { Text("Remove this Attachment?") },
+                text = {
+                    Column {
+                        Text("Remove ${file.name} from ${attachment.itemKind.displayName} “${attachment.itemTitle}” only, or delete the File from your Files section.")
+                        if (file.attachments.size > 1) Text("Deleting this File removes it from ${file.attachments.size} Tasks or Events.", color = MaterialTheme.colorScheme.error)
+                    }
+                },
+                confirmButton = { TextButton(enabled = !working, onClick = { removeAttachment(file, attachment) }) { Text("Remove Attachment") } },
+                dismissButton = {
+                    Row {
+                        TextButton(enabled = !working, onClick = { removeFile(file) }) { Text("Delete File", color = MaterialTheme.colorScheme.error) }
+                        TextButton(enabled = !working, onClick = { confirmRemoveAttachment = null }) { Text("Cancel") }
+                    }
+                },
+            )
+        }
+
+        confirmDeleteFile?.let { file ->
+            AlertDialog(
+                onDismissRequest = { if (!working) confirmDeleteFile = null },
+                title = { Text("Delete this File?") },
+                text = {
+                    Text(if (file.attachments.size > 1) "This File is attached to ${file.attachments.size} Tasks or Events. Deleting it removes all of those Attachments."
+                    else if (file.attachments.size == 1) "Deleting this File also removes its Attachment from “${file.attachments[0].itemTitle}”."
+                    else "${file.name} will be deleted from your Files section.")
+                },
+                confirmButton = { Button(enabled = !working, onClick = { removeFile(file) }) { Text("Delete File") } },
+                dismissButton = { TextButton(enabled = !working, onClick = { confirmDeleteFile = null }) { Text("Cancel") } },
             )
         }
 
@@ -394,6 +589,7 @@ fun FileTasksApp(context: Context) {
                                 token = null
                                 user = null
                                 workspaceItems = emptyList()
+                                workspaceFiles = emptyList()
                                 recoveryAvailable = false
                                 errorMessage = "Server changed. Sign in to continue."
                             } finally {
@@ -487,18 +683,30 @@ private fun SignInScreen(
 private fun WorkspaceScreen(
     user: AccountUser,
     items: List<WorkspaceItem>,
+    files: List<WorkspaceFile>,
     filter: String,
+    section: String,
     isBusy: Boolean,
     error: String?,
     onFilterChange: (ItemFilter) -> Unit,
+    onSectionChange: (WorkspaceSection) -> Unit,
     onRefresh: () -> Unit,
     onSignOut: () -> Unit,
     onSettings: () -> Unit,
     onCreate: () -> Unit,
     onEdit: (WorkspaceItem) -> Unit,
     onDelete: (WorkspaceItem) -> Unit,
+    onUpload: () -> Unit,
+    onAddLink: () -> Unit,
+    onAttach: (WorkspaceFile) -> Unit,
+    onDeleteFile: (WorkspaceFile) -> Unit,
+    onRemoveAttachment: (WorkspaceFile, FileAttachment) -> Unit,
+    onOpenFile: (WorkspaceFile) -> Unit,
+    onOpenItem: (WorkspaceItem) -> Unit,
     onToggleTask: (WorkspaceItem) -> Unit,
 ) {
+    val selectedSection = WorkspaceSection.valueOf(section)
+    val showingFiles = selectedSection == WorkspaceSection.Files
     val selectedFilter = ItemFilter.valueOf(filter)
     val visibleItems = when (selectedFilter) {
         ItemFilter.All -> items
@@ -511,13 +719,21 @@ private fun WorkspaceScreen(
 
     Scaffold(
         floatingActionButton = {
-            ExtendedFloatingActionButton(
-                text = { Text("Add item") },
-                icon = { Text("+", style = MaterialTheme.typography.titleLarge) },
-                onClick = { if (!isBusy) onCreate() },
-                containerColor = if (isBusy) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.primary,
-                contentColor = if (isBusy) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onPrimary,
-            )
+            if (showingFiles) {
+                ExtendedFloatingActionButton(
+                    text = { Text("Upload File") }, icon = { Text("+", style = MaterialTheme.typography.titleLarge) },
+                    onClick = { if (!isBusy) onUpload() },
+                    containerColor = if (isBusy) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.primary,
+                    contentColor = if (isBusy) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onPrimary,
+                )
+            } else {
+                ExtendedFloatingActionButton(
+                    text = { Text("Add item") }, icon = { Text("+", style = MaterialTheme.typography.titleLarge) },
+                    onClick = { if (!isBusy) onCreate() },
+                    containerColor = if (isBusy) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.primary,
+                    contentColor = if (isBusy) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onPrimary,
+                )
+            }
         },
     ) { insets ->
         Column(Modifier.fillMaxSize().padding(insets)) {
@@ -533,6 +749,12 @@ private fun WorkspaceScreen(
                 }
                 Spacer(Modifier.height(12.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(selected = !showingFiles, onClick = { onSectionChange(WorkspaceSection.Agenda) }, label = { Text("Agenda · ${items.size}") })
+                    FilterChip(selected = showingFiles, onClick = { onSectionChange(WorkspaceSection.Files) }, label = { Text("Files · ${files.size}") })
+                }
+                if (!showingFiles) {
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     ItemFilter.entries.forEach { option ->
                         FilterChip(
                             selected = selectedFilter == option,
@@ -547,6 +769,7 @@ private fun WorkspaceScreen(
                             },
                         )
                     }
+                    }
                 }
                 if (isBusy) {
                     Spacer(Modifier.height(8.dp))
@@ -558,7 +781,40 @@ private fun WorkspaceScreen(
                 }
             }
 
-            if (visibleItems.isEmpty()) {
+            if (showingFiles) {
+                if (files.isEmpty()) {
+                    Column(
+                        modifier = Modifier.fillMaxSize().padding(32.dp),
+                        verticalArrangement = Arrangement.Center,
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(if (isBusy) "Loading Files…" else "Your Files have a home here.", fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.height(6.dp))
+                        Text("Upload a document or add a link, then attach it to a Task or Event.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        TextButton(onClick = onAddLink, enabled = !isBusy) { Text("Add an external link") }
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 104.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        items(files, key = { it.id }) { file ->
+                            WorkspaceFileCard(
+                                file = file,
+                                items = items,
+                                enabled = !isBusy,
+                                onOpen = { onOpenFile(file) },
+                                onAttach = { onAttach(file) },
+                                onDelete = { onDeleteFile(file) },
+                                onRemoveAttachment = { attachment -> onRemoveAttachment(file, attachment) },
+                                onOpenItem = { attachment -> items.firstOrNull { it.id == attachment.itemId }?.let(onOpenItem) },
+                            )
+                        }
+                        item { TextButton(onClick = onAddLink, enabled = !isBusy, modifier = Modifier.fillMaxWidth()) { Text("Add an external link") } }
+                    }
+                }
+            } else if (visibleItems.isEmpty()) {
                 Column(
                     modifier = Modifier.fillMaxSize().padding(32.dp),
                     verticalArrangement = Arrangement.Center,
@@ -598,6 +854,7 @@ private fun WorkspaceScreen(
                                 onToggleTask = { onToggleTask(item) },
                                 onEdit = { onEdit(item) },
                                 onDelete = { onDelete(item) },
+                                onOpenFile = { summary -> files.firstOrNull { it.id == summary.id }?.let(onOpenFile) },
                             )
                         }
                     }
@@ -618,6 +875,7 @@ private fun WorkspaceScreen(
                                 onToggleTask = { onToggleTask(item) },
                                 onEdit = { onEdit(item) },
                                 onDelete = { onDelete(item) },
+                                onOpenFile = { summary -> files.firstOrNull { it.id == summary.id }?.let(onOpenFile) },
                             )
                         }
                     }
@@ -634,6 +892,7 @@ private fun WorkspaceItemCard(
     onToggleTask: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
+    onOpenFile: (WorkspaceFileSummary) -> Unit,
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Row(Modifier.fillMaxWidth().padding(start = 12.dp, top = 12.dp, end = 8.dp, bottom = 8.dp)) {
@@ -679,6 +938,9 @@ private fun WorkspaceItemCard(
                     Spacer(Modifier.height(3.dp))
                     Text(item.details, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
                 }
+                item.files.forEach { file ->
+                    TextButton(onClick = { onOpenFile(file) }, enabled = enabled) { Text("▤ ${file.name}") }
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.align(Alignment.End)) {
                     TextButton(onClick = onEdit, enabled = enabled) { Text("Edit") }
                     TextButton(onClick = onDelete, enabled = enabled) { Text("Delete", color = MaterialTheme.colorScheme.error) }
@@ -686,6 +948,64 @@ private fun WorkspaceItemCard(
             }
         }
     }
+}
+
+@Composable
+private fun WorkspaceFileCard(
+    file: WorkspaceFile,
+    items: List<WorkspaceItem>,
+    enabled: Boolean,
+    onOpen: () -> Unit,
+    onAttach: () -> Unit,
+    onDelete: () -> Unit,
+    onRemoveAttachment: (FileAttachment) -> Unit,
+    onOpenItem: (FileAttachment) -> Unit,
+) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.fillMaxWidth().padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(file.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (file.sizeBytes == null) "External link" else "${file.sizeBytes / 1000} KB · ${file.contentType.orEmpty()}",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                TextButton(enabled = enabled, onClick = onOpen) { Text("Open") }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                TextButton(enabled = enabled && items.size > file.attachments.size, onClick = onAttach) { Text("Attach") }
+                TextButton(enabled = enabled, onClick = onDelete) { Text("Delete File", color = MaterialTheme.colorScheme.error) }
+            }
+            Text("Attached to", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (file.attachments.isEmpty()) {
+                Text("No Tasks or Events yet", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            file.attachments.forEach { attachment ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(enabled = enabled, onClick = { onOpenItem(attachment) }, modifier = Modifier.weight(1f)) {
+                        Text("${attachment.itemKind.displayName}: ${attachment.itemTitle}")
+                    }
+                    TextButton(enabled = enabled, onClick = { onRemoveAttachment(attachment) }) { Text("Remove") }
+                }
+            }
+        }
+    }
+}
+
+private fun queryFileMetadata(context: Context, uri: Uri): Triple<String, Long, String> {
+    var name = uri.lastPathSegment?.substringAfterLast('/')?.takeIf(String::isNotBlank) ?: "Uploaded File"
+    var size = 0L
+    context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+        if (cursor.moveToFirst()) {
+            val nameColumn = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            val sizeColumn = cursor.getColumnIndex(OpenableColumns.SIZE)
+            if (nameColumn >= 0) name = cursor.getString(nameColumn) ?: name
+            if (sizeColumn >= 0 && !cursor.isNull(sizeColumn)) size = cursor.getLong(sizeColumn)
+        }
+    }
+    return Triple(name, size, context.contentResolver.getType(uri) ?: "application/octet-stream")
 }
 
 @Composable

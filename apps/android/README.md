@@ -20,4 +20,5 @@ The Gradle wrapper pins Gradle 8.14.6 and checks its binary distribution against
 - The token is encrypted with AES-GCM using a non-exportable Android Keystore key before it is saved in private app preferences.
 - Tasks and Events are fetched from `/api/items`; all create, edit, completion, and delete actions are sent to the shared API.
 - An item with no date is shown in the Undated section. A time can be saved only when a date is present.
+- Files section with external links, private R2 uploads, Attachments to multiple Tasks and Events, and separate Attachment/File deletion actions.
 - Changing the API URL clears the saved token and signs the client out, so a token is never silently sent to a different server.

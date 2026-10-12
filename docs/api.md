@@ -38,9 +38,29 @@ PATCH preserves omitted fields. Send explicit nulls to remove date/time; send bo
   "scheduledDate": "2026-11-03",
   "scheduledTime": "16:00",
   "completed": false,
+  "files": [],
   "createdAt": "2026-10-12T12:00:00.000Z",
   "updatedAt": "2026-10-12T12:00:00.000Z"
 }
 ```
 
 Events have `completed: null`; Tasks have a boolean. Lists contain only the authenticated account's items, ordered by date and time, with undated items last. Requests for another person's item return 404. Clients refresh through GET to observe changes saved by other clients.
+
+## Files and Attachments
+
+File metadata and Attachments are private to the authenticated account. A File may be either an uploaded document or an external HTTP(S) link. A File can be attached to multiple Tasks and Events; deleting an item removes its Attachments but leaves the File in the Files section.
+
+| Method | Path | Body | Success |
+| --- | --- | --- | --- |
+| GET | `/api/files` | — | 200 `{files:[WorkspaceFile]}` |
+| POST | `/api/files` | `{name,url}` | 201 `{file:WorkspaceFile}` for an external link |
+| POST | `/api/files/uploads` | `{name,contentType,sizeBytes}` | 201 `{uploadId,uploadUrl,expiresInSeconds}` |
+| POST | `/api/files/{id}/complete` | — | 200 `{file:WorkspaceFile}` after the object is verified in R2 |
+| GET | `/api/files/{id}/open` | — | 200 `{url,name,contentType,sourceType}` |
+| POST | `/api/files/{id}/attachments` | `{itemId}` | 201 `{success:true}` |
+| DELETE | `/api/files/{id}/attachments/{itemId}` | — | 204 |
+| DELETE | `/api/files/{id}` | — | 204; deletes the File and every Attachment |
+
+`WorkspaceFile` contains `id`, `name`, `sourceType` (`upload` or `link`), `contentType`, `sizeBytes`, `externalUrl`, `createdAt`, and `attachments` (`itemId`, `itemKind`, `itemTitle`). Task and Event responses include their attached Files as `{id,name,sourceType}` summaries.
+
+Uploaded bytes move directly between the client and Cloudflare R2. The client first requests an upload URL, PUTs the file with the returned URL and matching `Content-Type`, then calls the completion endpoint. Upload and download URLs expire after five minutes. Uploads are limited to 50 MB. Configure the R2 bucket's CORS policy to allow the web origin to send PUT requests with the `Content-Type` header and read the response. Keep R2 credentials on the server using `FILETASKS_R2_ACCOUNT_ID`, `FILETASKS_R2_ACCESS_KEY_ID`, `FILETASKS_R2_SECRET_ACCESS_KEY`, and `FILETASKS_R2_BUCKET`; `FILETASKS_R2_ENDPOINT` is optional. The API refuses cross-account Attachments and returns 404 for Files that are not owned by the signed-in account.
