@@ -46,6 +46,7 @@ export default function FilesView({
   const [linkName, setLinkName] = useState("");
   const [linkUrl, setLinkUrl] = useState("");
   const [selectedItemId, setSelectedItemId] = useState("");
+  const [selectedScope, setSelectedScope] = useState<"occurrence" | "following" | "series">("occurrence");
   const fileInput = useRef<HTMLInputElement>(null);
 
   async function loadFiles() {
@@ -125,7 +126,7 @@ export default function FilesView({
     await mutateFile(
       () => fetch(`/api/files/${encodeURIComponent(file.id)}/attachments`, {
         method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ itemId }),
+        body: JSON.stringify({ itemId, scope: selectedScope }),
       }),
       "Could not add this Attachment.",
     );
@@ -133,7 +134,7 @@ export default function FilesView({
 
   async function removeAttachment(file: WorkspaceFile, attachment: FileAttachment) {
     await mutateFile(
-      () => fetch(`/api/files/${encodeURIComponent(file.id)}/attachments/${encodeURIComponent(attachment.itemId)}`, {
+      () => fetch(`/api/files/${encodeURIComponent(file.id)}/attachments/${encodeURIComponent(attachment.itemId)}?scope=${attachment.scope}`, {
         method: "DELETE", credentials: "same-origin",
       }),
       "Could not remove this Attachment.",
@@ -182,7 +183,7 @@ export default function FilesView({
   }
 
   const availableItems = dialog?.type === "attach"
-    ? items.filter((item) => !dialog.file.attachments.some((attachment) => attachment.itemId === item.id))
+    ? items.filter((item) => !item.files.some((attached) => attached.id === dialog.file.id))
     : [];
 
   return (
@@ -221,7 +222,7 @@ export default function FilesView({
                 </div>
                 <div className="file-card-actions">
                   <button className="button button-secondary button-small" type="button" disabled={busy} onClick={() => void openFile(file)}>Open</button>
-                  <button className="button button-secondary button-small" type="button" disabled={busy || items.length === file.attachments.length} onClick={() => { setSelectedItemId(""); setDialog({ type: "attach", file }); }}>Attach</button>
+                  <button className="button button-secondary button-small" type="button" disabled={busy || items.every((item) => item.files.some((attached) => attached.id === file.id))} onClick={() => { setSelectedItemId(""); setSelectedScope("occurrence"); setDialog({ type: "attach", file }); }}>Attach</button>
                   <button className="icon-button icon-button-delete" type="button" aria-label={`Delete File ${file.name}`} title="Delete File" disabled={busy} onClick={() => setDialog({ type: "delete", file })}>×</button>
                 </div>
               </div>
@@ -254,13 +255,19 @@ export default function FilesView({
               <label className="field-label" htmlFor="attach-item">Choose a Task or Event</label>
               <select id="attach-item" className="text-input" value={selectedItemId} onChange={(event) => setSelectedItemId(event.target.value)}>
                 <option value="">Choose an item</option>
-                {availableItems.map((item) => <option key={item.id} value={item.id}>{item.kind === "task" ? "Task" : "Event"}: {item.title}</option>)}
+                {availableItems.map((item) => <option key={item.id} value={item.id}>{item.kind === "task" ? "Task" : "Event"}: {item.title}{item.seriesId && item.scheduledDate ? ` · ${item.scheduledDate}` : ""}</option>)}
               </select>
+              {items.find((item) => item.id === selectedItemId)?.seriesId && <>
+                <label className="field-label field-label-spaced" htmlFor="attach-scope">Attach to</label>
+                <select id="attach-scope" className="text-input" value={selectedScope} onChange={(event) => setSelectedScope(event.target.value as "occurrence" | "following" | "series")}>
+                  <option value="occurrence">This Occurrence</option><option value="following">This and following Occurrences</option><option value="series">Whole series</option>
+                </select>
+              </>}
             </>}
             <div className="files-dialog-actions"><button className="button button-secondary" type="button" disabled={busy} onClick={() => setDialog(null)}>Close</button><button className="button button-primary" type="button" disabled={busy || !selectedItemId} onClick={() => void attach(dialog.file, selectedItemId)}>{busy ? "Attaching…" : "Add Attachment"}</button></div>
           </> : dialog.type === "remove" ? <>
             <p className="eyebrow">ATTACHMENT</p><h2 id="files-dialog-title">Remove this Attachment?</h2>
-            <p>Choose whether to remove <strong>{dialog.file.name}</strong> from {dialog.attachment.itemKind === "task" ? "Task" : "Event"} “{dialog.attachment.itemTitle}” only, or delete the File from your Files section.</p>
+            <p>Choose whether to remove <strong>{dialog.file.name}</strong> from {dialog.attachment.scope === "series" ? `the whole ${dialog.attachment.itemKind} series “${dialog.attachment.itemTitle}”` : dialog.attachment.scope === "following" ? `${dialog.attachment.itemKind} Occurrences from “${dialog.attachment.itemTitle}” onward` : `${dialog.attachment.itemKind} “${dialog.attachment.itemTitle}”`}, or delete the File from your Files section.</p>
             {dialog.file.attachments.length > 1 && <p className="file-delete-warning">Deleting this File removes it from {dialog.file.attachments.length} Tasks or Events.</p>}
             <div className="files-dialog-actions"><button className="button button-secondary" type="button" disabled={busy} onClick={() => setDialog(null)}>Cancel</button><button className="button button-secondary" type="button" disabled={busy} onClick={() => void removeAttachment(dialog.file, dialog.attachment)}>Remove Attachment</button><button className="button button-danger" type="button" disabled={busy} onClick={() => void deleteFile(dialog.file)}>{busy ? "Deleting…" : "Delete File"}</button></div>
           </> : <>

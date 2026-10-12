@@ -8,6 +8,7 @@ export interface FileAttachment {
   itemId: string;
   itemKind: "task" | "event";
   itemTitle: string;
+  scope: "occurrence" | "following" | "series";
 }
 export interface WorkspaceFile {
   id: string;
@@ -72,7 +73,7 @@ export function listFiles(userId: string): WorkspaceFile[] {
   const files = database().prepare(`SELECT * FROM files WHERE user_id = ? AND status = 'ready'
     ORDER BY created_at DESC, id`).all(userId).map(fromRow);
   if (files.length === 0) return [];
-  const attachments = database().prepare(`SELECT a.file_id, i.id AS item_id, i.kind, i.title
+  const attachments = database().prepare(`SELECT a.file_id, i.id AS item_id, i.kind, i.title, a.scope
     FROM attachments a JOIN files f ON f.id = a.file_id JOIN items i ON i.id = a.item_id
     WHERE f.user_id = ? AND i.user_id = ? AND f.status = 'ready'
     ORDER BY i.scheduled_date IS NULL, i.scheduled_date, i.scheduled_time, i.title COLLATE NOCASE`)
@@ -82,7 +83,15 @@ export function listFiles(userId: string): WorkspaceFile[] {
     const id = String(row.file_id);
     byFile.set(id, [...(byFile.get(id) ?? []), {
       itemId: String(row.item_id), itemKind: row.kind as "task" | "event", itemTitle: String(row.title),
+      scope: row.scope as "occurrence" | "series",
     }]);
+  }
+  const following = database().prepare(`SELECT a.file_id,i.id AS item_id,i.kind,i.title FROM following_attachments a
+    JOIN files f ON f.id=a.file_id JOIN items i ON i.id=a.item_id
+    WHERE f.user_id=? AND i.user_id=? AND f.status='ready'`).all(userId,userId);
+  for (const row of following) {
+    const id=String(row.file_id);
+    byFile.set(id,[...(byFile.get(id)??[]),{ itemId:String(row.item_id),itemKind:row.kind as "task"|"event",itemTitle:String(row.title),scope:"following" }]);
   }
   return files.map((file) => publicFile({ ...file, attachments: byFile.get(file.id) ?? [] }));
 }
@@ -148,20 +157,42 @@ export async function completeUpload(userId: string, id: string) {
   return publicFile(ownedFile(userId, id));
 }
 
-export function attachFile(userId: string, fileId: string, itemId: unknown) {
+export function attachFile(userId: string, fileId: string, itemId: unknown, scope: unknown = "occurrence") {
   if (typeof itemId !== "string" || !itemId.trim()) throw new HttpError(400, "Choose a Task or Event.");
+  if (scope !== "occurrence" && scope !== "following" && scope !== "series") throw new HttpError(400, "Choose an Attachment scope.");
   ownedFile(userId, fileId);
-  database().prepare("SELECT id FROM items WHERE user_id=? AND id=?").get(userId, itemId)
+  const item = database().prepare("SELECT id,series_root_id,recurrence_json FROM items WHERE user_id=? AND id=?").get(userId, itemId);
+  item
     || (() => { throw new HttpError(404, "This Task or Event could not be found."); })();
-  database().prepare("INSERT OR IGNORE INTO attachments(file_id,item_id,created_at) VALUES(?,?,?)")
-    .run(fileId, itemId, new Date().toISOString());
+  let targetId = itemId;
+  if (scope === "series" || scope === "following") {
+    targetId = String(item.series_root_id ?? item.id);
+    const root = database().prepare("SELECT recurrence_json FROM items WHERE user_id=? AND id=?").get(userId,targetId);
+    if (!root?.recurrence_json) throw new HttpError(400, "Choose an Occurrence in a recurring series for this Attachment scope.");
+  }
+  if (scope === "following") {
+    database().prepare("INSERT OR IGNORE INTO following_attachments(file_id,item_id,created_at) VALUES(?,?,?)").run(fileId,itemId,new Date().toISOString());
+    return;
+  }
+  database().prepare("INSERT INTO attachments(file_id,item_id,created_at,scope) VALUES(?,?,?,?) ON CONFLICT(file_id,item_id) DO UPDATE SET scope=excluded.scope")
+    .run(fileId, targetId, new Date().toISOString(), scope);
 }
 
-export function removeAttachment(userId: string, fileId: string, itemId: string) {
-  const result = database().prepare(`DELETE FROM attachments WHERE file_id=? AND item_id=?
+export function removeAttachment(userId: string, fileId: string, itemId: string, scope: unknown = "occurrence") {
+  if (scope !== "occurrence" && scope !== "following" && scope !== "series") throw new HttpError(400, "Choose an Attachment scope.");
+  if (scope === "following") {
+    const result=database().prepare(`DELETE FROM following_attachments WHERE file_id=? AND item_id=?
+      AND EXISTS(SELECT 1 FROM files WHERE id=? AND user_id=?) AND EXISTS(SELECT 1 FROM items WHERE id=? AND user_id=?)`)
+      .run(fileId,itemId,fileId,userId,itemId,userId);
+    if (!result.changes) throw new HttpError(404,"This Attachment could not be found.");
+    return;
+  }
+  const target = database().prepare("SELECT series_root_id FROM items WHERE user_id=? AND id=?").get(userId,itemId);
+  const targetId = scope === "series" ? String(target?.series_root_id ?? itemId) : itemId;
+  const result = database().prepare(`DELETE FROM attachments WHERE file_id=? AND item_id=? AND scope=?
     AND EXISTS (SELECT 1 FROM files WHERE id=? AND user_id=?)
     AND EXISTS (SELECT 1 FROM items WHERE id=? AND user_id=?)`)
-    .run(fileId, itemId, fileId, userId, itemId, userId);
+    .run(fileId, targetId, scope, fileId, userId, targetId, userId);
   if (!result.changes) throw new HttpError(404, "This Attachment could not be found.");
 }
 

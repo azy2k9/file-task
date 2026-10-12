@@ -213,6 +213,123 @@ test("web session mutations reject other origins and unverifiable origins", asyn
   assert.equal((await request("/api/auth/session", { cookie: owner.cookie })).status, 401);
 });
 
+test("Reminder defaults are separate, prefill new items, and update only items still using the old default", async () => {
+  const owner = await account();
+  const notification = [{ delivery: "notification", amount: 2, unit: "days", time: "09:30" }];
+  const email = [{ delivery: "email", amount: 1, unit: "weeks", time: "16:00" }];
+  const configured = await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: {
+    taskReminders: notification, eventReminders: email, emailEnabled: true, pushEnabled: false, applyToExisting: false,
+  } });
+  assert.equal(configured.status, 200);
+  const taskResponse = await request("/api/items", { token: owner.token, method: "POST", body: { kind: "task", title: "Pay bill" } });
+  const eventResponse = await request("/api/items", { token: owner.token, method: "POST", body: { kind: "event", title: "Birthday", scheduledDate: "2026-11-12" } });
+  const task = (await taskResponse.json()).item;
+  const event = (await eventResponse.json()).item;
+  assert.deepEqual(task.reminders, notification);
+  assert.deepEqual(event.reminders, email);
+  const customized = [{ delivery: "notification", amount: 30, unit: "minutes", time: "08:00" }];
+  await request(`/api/items/${task.id}`, { token: owner.token, method: "PATCH", body: { reminders: customized } });
+  const nextTaskDefault = [{ delivery: "notification", amount: 3, unit: "days", time: "10:15" }];
+  const nextEventDefault = [{ delivery: "notification", amount: 1, unit: "months", time: "09:00" }];
+  const changed = await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: {
+    taskReminders: nextTaskDefault, eventReminders: nextEventDefault, emailEnabled: false, applyToExisting: true,
+  } });
+  assert.equal(changed.status, 200);
+  assert.deepEqual((await (await request(`/api/items/${task.id}`, { token: owner.token })).json()).item.reminders, customized);
+  assert.deepEqual((await (await request(`/api/items/${event.id}`, { token: owner.token })).json()).item.reminders, nextEventDefault);
+  assert.equal((await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: { taskReminders: email } })).status, 400);
+});
+
+test("due Notification Reminders appear in the in-app notification list and can be marked read", async () => {
+  const owner = await account();
+  const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "Reminder due", scheduledDate: "2026-10-12",
+    reminders: [{ delivery: "notification", amount: 0, unit: "days", time: "00:00" }],
+  } });
+  const item = (await created.json()).item;
+  const response = await request("/api/notifications", { token: owner.token });
+  assert.equal(response.status, 200);
+  const notification = (await response.json()).notifications.find(({ itemId }) => itemId === item.id);
+  assert.ok(notification);
+  assert.equal((await request(`/api/notifications/${notification.id}`, { token: owner.token, method: "PATCH" })).status, 200);
+  assert.equal((await (await request("/api/notifications", { token: owner.token })).json()).notifications.some(({ id }) => id === notification.id), false);
+});
+
+test("recurring items create independent Occurrences and honor occurrence and series edit scopes", async () => {
+  const owner = await account();
+  const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "task", title: "Water plants", scheduledDate: "2026-11-02", scheduledTime: "08:00",
+    recurrence: { interval: 1, unit: "weeks", weekdays: [1, 3], end: { type: "count", count: 4 } },
+    reminders: [{ delivery: "notification", amount: 1, unit: "days", time: "09:00" }],
+  } });
+  assert.equal(created.status, 201);
+  const root = (await created.json()).item;
+  assert.equal(root.recurrence.unit, "weeks");
+  let occurrences = (await (await request("/api/items", { token: owner.token })).json()).items;
+  occurrences = occurrences.filter(({ seriesId }) => seriesId === root.id).sort((left, right) => left.scheduledDate.localeCompare(right.scheduledDate));
+  assert.deepEqual(occurrences.map(({ scheduledDate }) => scheduledDate), ["2026-11-02", "2026-11-04", "2026-11-09", "2026-11-11"]);
+  const occurrenceId = occurrences[1].id;
+  await request(`/api/items/${occurrenceId}`, { token: owner.token, method: "PATCH", body: { completed: true } });
+  const changedOccurrence = await request(`/api/items/${occurrenceId}`, { token: owner.token, method: "PATCH", body: { title: "Water the seedlings", scope: "occurrence" } });
+  assert.equal((await changedOccurrence.json()).item.title, "Water the seedlings");
+  occurrences = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === root.id);
+  assert.equal(occurrences.find(({ id }) => id === occurrenceId)?.completed, true);
+  assert.equal(occurrences.filter(({ title }) => title === "Water the seedlings").length, 1);
+  const seriesEdit = await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: { title: "Water all the plants", scope: "series" } });
+  assert.equal(seriesEdit.status, 200);
+  const afterSeriesEdit = (await (await request("/api/items", { token: owner.token })).json()).items;
+  assert.equal(afterSeriesEdit.filter(({ seriesId, title }) => seriesId === root.id && title === "Water all the plants").length, 4);
+  assert.equal(afterSeriesEdit.find(({ id }) => id === occurrenceId)?.completed, true);
+});
+
+test("a series Attachment is available from every Occurrence and can be removed from the whole series", async () => {
+  const owner = await account();
+  const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "Monthly review", scheduledDate: "2026-11-01",
+    recurrence: { interval: 1, unit: "months", end: { type: "count", count: 3 } },
+  } });
+  const series = (await created.json()).item;
+  const fileResponse = await request("/api/files", { token: owner.token, method: "POST", body: { name: "Review notes", url: "https://example.com/review" } });
+  const file = (await fileResponse.json()).file;
+  assert.equal((await request(`/api/files/${file.id}/attachments`, { token: owner.token, method: "POST", body: { itemId: series.id, scope: "series" } })).status, 201);
+  const occurrences = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === series.id);
+  assert.equal(occurrences.length, 3);
+  for (const occurrence of occurrences) assert.deepEqual(occurrence.files.map(({ id }) => id), [file.id]);
+  assert.deepEqual((await (await request("/api/files", { token: owner.token })).json()).files[0].attachments.map(({ scope }) => scope), ["series"]);
+  assert.equal((await request(`/api/files/${file.id}/attachments/${series.id}?scope=series`, { token: owner.token, method: "DELETE" })).status, 204);
+  assert.deepEqual((await (await request(`/api/items/${occurrences[1].id}`, { token: owner.token })).json()).item.files, []);
+});
+
+test("a following Attachment and edit apply from the selected Occurrence onward", async () => {
+  const owner = await account();
+  const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "task", title: "Weekly filing", scheduledDate: "2026-11-02",
+    recurrence: { interval: 1, unit: "weeks", weekdays: [1], end: { type: "count", count: 4 } },
+  } });
+  const series = (await created.json()).item;
+  const occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+    .filter(({ seriesId }) => seriesId === series.id).sort((a, b) => a.scheduledDate.localeCompare(b.scheduledDate));
+  const selected = occurrences[1];
+  const file = (await (await request("/api/files", { token: owner.token, method: "POST", body: { name: "New process", url: "https://example.com/process" } })).json()).file;
+  assert.equal((await request(`/api/files/${file.id}/attachments`, { token: owner.token, method: "POST", body: { itemId: selected.id, scope: "following" } })).status, 201);
+  assert.equal((await request(`/api/items/${selected.id}`, { token: owner.token, method: "PATCH", body: { title: "Quarterly filing", scope: "following" } })).status, 200);
+  const after = (await (await request("/api/items", { token: owner.token })).json()).items;
+  const renamed = after.filter(({ title }) => title === "Quarterly filing");
+  assert.equal(renamed.length, 3);
+  assert.equal(after.find(({ id }) => id === occurrences[0].id)?.title, "Weekly filing");
+  assert.equal(renamed.every(({ files }) => files.some(({ id }) => id === file.id)), true);
+  assert.equal(after.find(({ id }) => id === occurrences[0].id)?.files.some(({ id }) => id === file.id), false);
+});
+
+test("Calendar sync is account-scoped and is a safe no-op before a provider is connected", async () => {
+  const owner = await account();
+  assert.deepEqual((await (await request("/api/calendars", { token: owner.token })).json()).calendars, []);
+  const response = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { synced: [], message: "Connect a calendar first." });
+  assert.equal((await request("/api/calendars", { method: "POST", body: { username: "a@example.com", password: "secret" } })).status, 401);
+});
+
 test("a person can manage Tasks and Events through the browser and see another client's changes", async () => {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });

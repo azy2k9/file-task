@@ -7,7 +7,7 @@ type Context = { params: Promise<{ id: string; itemId: string }> };
 export async function DELETE(request: Request, context: Context) {
   const { id, itemId } = await context.params;
   return endpoint(async (request) => {
-    removeAttachment(requireUser(request).id, id, itemId);
+    removeAttachment(requireUser(request).id, id, itemId, new URL(request.url).searchParams.get("scope") ?? "occurrence");
     return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
   })(request);
 }

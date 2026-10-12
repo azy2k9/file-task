@@ -1,10 +1,12 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
-import type { ItemInput, ItemKind, WorkspaceItem } from "@api/items";
+import type { ItemInput, ItemKind, RecurrenceRule, ReminderRule, WorkspaceItem } from "@api/items";
 import FilesView from "./files-view";
 
 type Account = { id: string; email: string };
+type ReminderSettings = { taskReminders: ReminderRule[]; eventReminders: ReminderRule[]; pushEnabled: boolean; emailEnabled: boolean };
+type InAppNotification = { id: string; itemId: string; title: string; scheduledAt: string; readAt: string | null };
 type View = "agenda" | "task" | "event" | "files";
 type AuthMode = "login" | "register";
 type Draft = {
@@ -12,10 +14,13 @@ type Draft = {
   details: string;
   scheduledDate: string;
   scheduledTime: string;
+  recurrence: RecurrenceRule | null;
+  reminders: ReminderRule[];
+  scope: "occurrence" | "following" | "series";
 };
 type Editor = { kind: ItemKind; item: WorkspaceItem | null };
 
-const emptyDraft = (): Draft => ({ title: "", details: "", scheduledDate: "", scheduledTime: "" });
+const emptyDraft = (reminders: ReminderRule[] = []): Draft => ({ title: "", details: "", scheduledDate: "", scheduledTime: "", recurrence: null, reminders, scope: "series" });
 
 async function errorFromResponse(response: Response, fallback: string) {
   try {
@@ -352,6 +357,7 @@ function ItemDialog({
   setDraft,
   error,
   busy,
+  emailEnabled,
   onClose,
   onSubmit,
 }: {
@@ -360,6 +366,7 @@ function ItemDialog({
   setDraft: (update: (current: Draft) => Draft) => void;
   error: string | null;
   busy: boolean;
+  emailEnabled: boolean;
   onClose: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
@@ -423,6 +430,7 @@ function ItemDialog({
           disabled={busy}
           onChange={(event) => setDraft((current) => ({ ...current, details: event.target.value }))}
         />
+        {editor.item?.files.length ? <div className="item-dialog-files"><span className="field-label">Files</span><span>{editor.item.files.map((file) => file.name).join(", ")}</span></div> : null}
 
         <div className="date-time-row">
           <div>
@@ -452,6 +460,32 @@ function ItemDialog({
           </div>
         </div>
 
+        {editor.item?.seriesId && <div className="field-block">
+          <label className="field-label" htmlFor="edit-scope">Apply changes to</label>
+          <select id="edit-scope" value={draft.scope} disabled={busy} onChange={(event) => setDraft((current) => ({ ...current, scope: event.target.value as Draft["scope"] }))}>
+            <option value="occurrence">This Occurrence</option>
+            <option value="following">This and following Occurrences</option>
+            <option value="series">Whole series</option>
+          </select>
+        </div>}
+
+        <section className="item-options" aria-label="Recurrence and Reminders">
+          <div className="option-heading"><h3>Recurrence rule</h3><label><input type="checkbox" checked={draft.recurrence !== null} disabled={busy || !draft.scheduledDate} onChange={(event) => setDraft((current) => ({ ...current, recurrence: event.target.checked ? { interval: 1, unit: "weeks", weekdays: [new Date(`${current.scheduledDate}T12:00:00`).getDay()], end: { type: "never" } } : null }))} /> Repeat</label></div>
+          {!draft.scheduledDate && <p className="field-hint">Choose a date before setting a Recurrence rule.</p>}
+          {draft.recurrence && <div className="recurrence-fields">
+            <label>Every <input aria-label="Repeat interval" type="number" min="1" max="100" value={draft.recurrence.interval} disabled={busy} onChange={(event) => setDraft((current) => current.recurrence ? ({ ...current, recurrence: { ...current.recurrence, interval: Math.max(1, Number(event.target.value) || 1) } }) : current)} /></label>
+            <select aria-label="Repeat unit" value={draft.recurrence.unit} disabled={busy} onChange={(event) => setDraft((current) => current.recurrence ? ({ ...current, recurrence: { ...current.recurrence, unit: event.target.value as RecurrenceRule["unit"], ...(event.target.value === "weeks" ? { weekdays: current.recurrence.weekdays ?? [new Date(`${current.scheduledDate}T12:00:00`).getDay()] } : { weekdays: undefined }) } }) : current)}>
+              <option value="days">days</option><option value="weeks">weeks</option><option value="months">months</option><option value="years">years</option>
+            </select>
+            {draft.recurrence.unit === "weeks" && <div className="weekday-options" role="group" aria-label="Repeat weekdays">{["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day, index) => <label key={day}><input type="checkbox" checked={draft.recurrence?.weekdays?.includes(index) ?? false} disabled={busy} onChange={(event) => setDraft((current) => { if (!current.recurrence) return current; const days = current.recurrence.weekdays ?? []; const weekdays = event.target.checked ? [...days, index] : days.filter((value) => value !== index); return { ...current, recurrence: { ...current.recurrence, weekdays: weekdays.length ? weekdays : [index] } }; })} />{day}</label>)}</div>}
+            <select aria-label="Recurrence ends" value={draft.recurrence.end.type} disabled={busy} onChange={(event) => setDraft((current) => current.recurrence ? ({ ...current, recurrence: { ...current.recurrence, end: event.target.value === "date" ? { type: "date", date: current.scheduledDate } : event.target.value === "count" ? { type: "count", count: 10 } : { type: "never" } } }) : current)}><option value="never">Never ends</option><option value="date">On date</option><option value="count">After occurrences</option></select>
+            {draft.recurrence.end.type === "date" && <input aria-label="Recurrence end date" type="date" min={draft.scheduledDate} value={draft.recurrence.end.date} disabled={busy} onChange={(event) => setDraft((current) => current.recurrence?.end.type === "date" ? ({ ...current, recurrence: { ...current.recurrence, end: { type: "date", date: event.target.value } } }) : current)} />}
+            {draft.recurrence.end.type === "count" && <label>Occurrences <input aria-label="Occurrence count" type="number" min="1" max="10000" value={draft.recurrence.end.count} disabled={busy} onChange={(event) => setDraft((current) => current.recurrence?.end.type === "count" ? ({ ...current, recurrence: { ...current.recurrence, end: { type: "count", count: Math.max(1, Number(event.target.value) || 1) } } }) : current)} /></label>}
+          </div>}
+          <h3>Reminders</h3>
+          <ReminderEditor reminders={draft.reminders} emailEnabled={emailEnabled} disabled={busy} onChange={(reminders) => setDraft((current) => ({ ...current, reminders }))} />
+        </section>
+
         <div className="dialog-actions">
           <button className="button button-quiet" type="button" disabled={busy} onClick={onClose}>Cancel</button>
           <button className="button button-primary" type="submit" disabled={busy}>
@@ -461,6 +495,124 @@ function ItemDialog({
       </form>
     </dialog>
   );
+}
+
+function ReminderEditor({ reminders, emailEnabled, disabled, onChange }: {
+  reminders: ReminderRule[]; emailEnabled: boolean; disabled: boolean; onChange: (reminders: ReminderRule[]) => void;
+}) {
+  const update = (index: number, value: Partial<ReminderRule>) => onChange(reminders.map((row, rowIndex) => rowIndex === index ? { ...row, ...value } : row));
+  return <div className="reminder-editor">
+    {reminders.map((reminder, index) => <div className="reminder-row" key={index}>
+      <select aria-label={`Reminder ${index + 1} delivery`} value={reminder.delivery} disabled={disabled} onChange={(event) => update(index, { delivery: event.target.value as ReminderRule["delivery"] })}>
+        <option value="notification">Notification</option>{emailEnabled && <option value="email">Email</option>}
+      </select>
+      <label><span className="sr-only">Offset amount</span><input aria-label={`Reminder ${index + 1} offset`} type="number" min="0" value={reminder.amount} disabled={disabled} onChange={(event) => update(index, { amount: Math.max(0, Number(event.target.value) || 0) })} /></label>
+      <select aria-label={`Reminder ${index + 1} offset unit`} value={reminder.unit} disabled={disabled} onChange={(event) => update(index, { unit: event.target.value as ReminderRule["unit"] })}>{["minutes", "hours", "days", "weeks", "months"].map((unit) => <option key={unit} value={unit}>{unit}</option>)}</select>
+      <input aria-label={`Reminder ${index + 1} clock time`} type="time" value={reminder.time} disabled={disabled} onChange={(event) => update(index, { time: event.target.value })} />
+      <button className="icon-button icon-button-delete" type="button" aria-label={`Remove Reminder ${index + 1}`} disabled={disabled} onClick={() => onChange(reminders.filter((_, rowIndex) => rowIndex !== index))}>×</button>
+    </div>)}
+    <button className="button button-secondary reminder-add" type="button" disabled={disabled || reminders.length >= 20} onClick={() => onChange([...reminders, { delivery: "notification", amount: 1, unit: "days", time: "09:00" }])}>+ Add Reminder</button>
+  </div>;
+}
+
+function NotificationsDialog({ notifications, onClose, onOpen }: {
+  notifications: InAppNotification[];
+  onClose: () => void;
+  onOpen: (notification: InAppNotification) => void;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.open) dialog.showModal();
+    return () => { if (dialog?.open) dialog.close(); };
+  }, []);
+  return <dialog className="native-dialog notifications-dialog" ref={dialogRef} aria-labelledby="notifications-title" onCancel={onClose}>
+    <div className="dialog-topline"><div><p className="eyebrow">YOUR REMINDERS</p><h2 id="notifications-title">Notifications</h2></div><button className="dialog-close icon-button" type="button" aria-label="Close notifications" onClick={onClose}>×</button></div>
+    {notifications.length === 0 ? <p className="notification-empty">You’re all caught up. In-app Notifications will appear here when a Reminder is due.</p> : <div className="notification-list">{notifications.map((notification) => <button className="notification-row" key={notification.id} type="button" onClick={() => onOpen(notification)}><span><strong>{notification.title}</strong><small>{new Intl.DateTimeFormat("en-GB", { dateStyle: "medium", timeStyle: "short" }).format(new Date(notification.scheduledAt))}</small></span><span aria-hidden="true">→</span></button>)}</div>}
+    <div className="dialog-actions"><button className="button button-quiet" type="button" onClick={onClose}>Close</button></div>
+  </dialog>;
+}
+
+function ReminderSettingsDialog({ initial, onClose, onSave }: {
+  initial: ReminderSettings;
+  onClose: () => void;
+  onSave: (settings: ReminderSettings, applyToExisting: boolean) => Promise<void>;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const [settings, setSettings] = useState(initial);
+  const [kind, setKind] = useState<ItemKind>("task");
+  const [applyToExisting, setApplyToExisting] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [calendarError, setCalendarError] = useState<string | null>(null);
+  const [calendarBusy, setCalendarBusy] = useState(false);
+  const [calendars, setCalendars] = useState<{ provider: "google" | "apple"; account_label: string }[]>([]);
+  const [appleUsername, setAppleUsername] = useState("");
+  const [applePassword, setApplePassword] = useState("");
+  const [appleCalendarUrl, setAppleCalendarUrl] = useState("");
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.open) dialog.showModal();
+    void fetch("/api/calendars", { credentials: "same-origin", cache: "no-store" }).then(async (response) => {
+      if (response.ok) setCalendars(((await response.json()) as { calendars: { provider: "google" | "apple"; account_label: string }[] }).calendars);
+    }).catch(() => undefined);
+    return () => { if (dialog?.open) dialog.close(); };
+  }, []);
+  const reminders = kind === "task" ? settings.taskReminders : settings.eventReminders;
+  function changeReminders(next: ReminderRule[]) {
+    setSettings((current) => kind === "task" ? { ...current, taskReminders: next } : { ...current, eventReminders: next });
+  }
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError(null);
+    try { await onSave(settings, applyToExisting); } catch (failure) { setError(failure instanceof Error ? failure.message : "Could not save Reminder settings."); }
+    finally { setBusy(false); }
+  }
+  async function updateCalendar(path: string, init?: RequestInit) {
+    setCalendarBusy(true); setCalendarError(null);
+    try {
+      const response = await fetch(path, { credentials: "same-origin", ...init });
+      if (!response.ok) throw new Error(await errorFromResponse(response, "Calendar action failed."));
+      if (response.status !== 204) {
+        const result = await response.json() as { calendars?: { provider: "google" | "apple"; account_label: string }[]; synced?: string[]; message?: string };
+        if (result.calendars) setCalendars(result.calendars);
+        else if (result.synced) setCalendarError(`Synced ${result.synced.join(" and ")} Calendar${result.synced.length === 1 ? "" : "s"}.`);
+        else {
+          const refreshed = await fetch("/api/calendars", { credentials: "same-origin", cache: "no-store" });
+          if (refreshed.ok) setCalendars(((await refreshed.json()) as { calendars: { provider: "google" | "apple"; account_label: string }[] }).calendars);
+        }
+      } else {
+        const refreshed = await fetch("/api/calendars", { credentials: "same-origin", cache: "no-store" });
+        if (refreshed.ok) setCalendars(((await refreshed.json()) as { calendars: { provider: "google" | "apple"; account_label: string }[] }).calendars);
+      }
+    } catch (failure) { setCalendarError(failure instanceof Error ? failure.message : "Calendar action failed."); }
+    finally { setCalendarBusy(false); }
+  }
+  return <dialog className="native-dialog settings-dialog" ref={dialogRef} aria-labelledby="settings-dialog-title" onCancel={(event) => { if (busy) event.preventDefault(); else onClose(); }}>
+    <form onSubmit={save}>
+      <div className="dialog-topline"><div><p className="eyebrow">YOUR ACCOUNT</p><h2 id="settings-dialog-title">Reminder settings</h2></div><button className="dialog-close icon-button" type="button" disabled={busy} aria-label="Close settings" onClick={onClose}>×</button></div>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <div className="setting-toggles">
+        <label><input type="checkbox" checked={settings.pushEnabled} disabled={busy} onChange={(event) => setSettings((current) => ({ ...current, pushEnabled: event.target.checked }))} /> Optional push delivery</label>
+        <label><input type="checkbox" checked={settings.emailEnabled} disabled={busy} onChange={(event) => setSettings((current) => ({ ...current, emailEnabled: event.target.checked }))} /> Email delivery</label>
+      </div>
+      <div className="auth-switch setting-tabs" role="group" aria-label="Reminder default type"><button type="button" className={kind === "task" ? "auth-switch-active" : ""} aria-pressed={kind === "task"} onClick={() => setKind("task")}>Task defaults</button><button type="button" className={kind === "event" ? "auth-switch-active" : ""} aria-pressed={kind === "event"} onClick={() => setKind("event")}>Event defaults</button></div>
+      <ReminderEditor reminders={reminders} emailEnabled={settings.emailEnabled} disabled={busy} onChange={changeReminders} />
+      <fieldset className="apply-defaults"><legend>When these defaults change</legend><label><input type="radio" name="apply-existing" checked={!applyToExisting} disabled={busy} onChange={() => setApplyToExisting(false)} /> Only new items</label><label><input type="radio" name="apply-existing" checked={applyToExisting} disabled={busy} onChange={() => setApplyToExisting(true)} /> Apply to existing items still using the old defaults</label></fieldset>
+      <section className="calendar-settings" aria-labelledby="calendar-settings-title">
+        <div className="calendar-settings-title"><div><p className="eyebrow">CONNECTED CALENDARS</p><h3 id="calendar-settings-title">Sync Calendar</h3></div><button className="button button-secondary" type="button" disabled={calendarBusy} onClick={() => void updateCalendar("/api/calendars/sync", { method: "POST" })}>{calendarBusy ? "Syncing…" : "Sync Calendar"}</button></div>
+        {calendars.map((calendar) => <div className="calendar-connection" key={calendar.provider}><span>{calendar.provider === "google" ? "Google Calendar" : "Apple Calendar"} · {calendar.account_label}</span><button className="button button-quiet" type="button" disabled={calendarBusy} onClick={() => void updateCalendar(`/api/calendars/${calendar.provider}`, { method: "DELETE" })}>Disconnect</button></div>)}
+        {!calendars.some((calendar) => calendar.provider === "google") && <button className="button button-secondary" type="button" disabled={calendarBusy} onClick={() => window.location.assign("/api/calendars/google/connect")}>Connect Google Calendar</button>}
+        {!calendars.some((calendar) => calendar.provider === "apple") && <div className="apple-calendar-connect">
+          <label className="field-label" htmlFor="apple-calendar-user">Apple ID</label><input id="apple-calendar-user" type="email" autoComplete="username" value={appleUsername} disabled={calendarBusy} onChange={(event) => setAppleUsername(event.target.value)} />
+          <label className="field-label" htmlFor="apple-calendar-password">App-specific password</label><input id="apple-calendar-password" type="password" autoComplete="new-password" value={applePassword} disabled={calendarBusy} onChange={(event) => setApplePassword(event.target.value)} />
+          <label className="field-label" htmlFor="apple-calendar-url">CalDAV calendar URL <span aria-hidden="true">Optional</span></label><input id="apple-calendar-url" type="url" placeholder="Discover from iCloud when blank" value={appleCalendarUrl} disabled={calendarBusy} onChange={(event) => setAppleCalendarUrl(event.target.value)} />
+          <button className="button button-secondary" type="button" disabled={calendarBusy} onClick={() => void updateCalendar("/api/calendars", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: appleUsername, password: applePassword, ...(appleCalendarUrl ? { calendarUrl: appleCalendarUrl } : {}) }) })}>Connect Apple Calendar</button>
+        </div>}
+        {calendarError && <p className="form-error" role="status">{calendarError}</p>}
+      </section>
+      <div className="dialog-actions"><button className="button button-quiet" type="button" disabled={busy} onClick={onClose}>Cancel</button><button className="button button-primary" type="submit" disabled={busy}>{busy ? "Saving…" : "Save settings"}</button></div>
+    </form>
+  </dialog>;
 }
 
 function DeleteDialog({
@@ -579,12 +731,17 @@ export default function Page() {
   const [deleteTarget, setDeleteTarget] = useState<WorkspaceItem | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [clientReady, setClientReady] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [reminderSettings, setReminderSettings] = useState<ReminderSettings>({ taskReminders: [], eventReminders: [], pushEnabled: false, emailEnabled: false });
+  const [notifications, setNotifications] = useState<InAppNotification[]>([]);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
   const identityVersion = useRef(0);
   const itemRequestVersion = useRef(0);
   const signedInRef = useRef(false);
   const mutationLock = useRef(false);
   const signingOutLock = useRef(false);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const handledEventLink = useRef<string | null>(null);
   const newTaskButtonRef = useRef<HTMLButtonElement>(null);
   const isMutating = mutation !== null;
 
@@ -616,6 +773,8 @@ export default function Page() {
         setAuthStatus("signed-in");
         void loadItems(version);
         void loadFilesCount(version);
+        void loadReminderSettings(version);
+        void loadNotifications(version);
       } catch {
         if (!mounted || identityVersion.current !== version) return;
         setAuthError("Could not reach FileTasks. Please check your connection and sign in.");
@@ -678,6 +837,23 @@ export default function Page() {
     } catch { /* The Files screen reports its own load errors. */ }
   }
 
+  async function loadReminderSettings(version: number) {
+    try {
+      const response = await fetch("/api/settings/reminders", { credentials: "same-origin", cache: "no-store" });
+      if (response.ok && identityVersion.current === version) {
+        const result = await response.json() as { settings: ReminderSettings };
+        setReminderSettings(result.settings);
+      }
+    } catch { /* Account settings can be opened and retried later. */ }
+  }
+
+  async function loadNotifications(version: number) {
+    try {
+      const response = await fetch("/api/notifications", { credentials: "same-origin", cache: "no-store" });
+      if (response.ok && identityVersion.current === version) setNotifications(((await response.json()) as { notifications: InAppNotification[] }).notifications);
+    } catch { /* The agenda remains available when notification lookup is offline. */ }
+  }
+
   function expireSession(version: number, message: string) {
     if (identityVersion.current !== version) return;
     identityVersion.current += 1;
@@ -704,6 +880,7 @@ export default function Page() {
       if (document.visibilityState === "visible") {
         void loadItems(version);
         void loadFilesCount(version);
+        void loadNotifications(version);
       }
     };
     window.addEventListener("focus", refresh);
@@ -744,6 +921,7 @@ export default function Page() {
       setItems([]);
       setFilesCount(0);
       setFocusFileId(null);
+      setNotifications([]);
       setItemsError(null);
       setActionError(null);
       setAuthError(null);
@@ -751,6 +929,8 @@ export default function Page() {
       setItemsLoading(true);
       void loadItems(version);
       void loadFilesCount(version);
+      void loadReminderSettings(version);
+      void loadNotifications(version);
     } catch {
       setAuthError("Could not reach FileTasks. Check your connection and try again.");
     } finally {
@@ -807,9 +987,24 @@ export default function Page() {
       details: item.details,
       scheduledDate: item.scheduledDate ?? "",
       scheduledTime: item.scheduledTime ?? "",
-    } : emptyDraft());
+      recurrence: item.recurrence,
+      reminders: item.reminders,
+      scope: "series",
+    } : emptyDraft(kind === "task" ? reminderSettings.taskReminders : reminderSettings.eventReminders));
     setEditor({ kind, item });
   }
+
+  useEffect(() => {
+    if (authStatus !== "signed-in") return;
+    const eventId = new URLSearchParams(window.location.search).get("event");
+    if (!eventId || handledEventLink.current === eventId) return;
+    const item = items.find((candidate) => candidate.id === eventId && candidate.kind === "event");
+    if (!item) return;
+    handledEventLink.current = eventId;
+    setView("event");
+    openEditor("event", item);
+    window.history.replaceState(null, "", window.location.pathname);
+  }, [authStatus, items]);
 
   function closeEditor() {
     if (mutationLock.current) return;
@@ -867,6 +1062,9 @@ export default function Page() {
       details: draft.details,
       scheduledDate: draft.scheduledDate || null,
       scheduledTime: draft.scheduledDate ? (draft.scheduledTime || null) : null,
+      recurrence: draft.recurrence,
+      reminders: draft.reminders,
+      ...(editor.item?.seriesId ? { scope: draft.scope } : {}),
     };
     try {
       const response = await fetch(editor.item ? `/api/items/${encodeURIComponent(editor.item.id)}` : "/api/items", {
@@ -978,7 +1176,9 @@ export default function Page() {
   const groups = useMemo(() => {
     const grouped = new Map<string, WorkspaceItem[]>();
     for (const item of visibleItems) {
-      const key = item.scheduledDate ?? "__undated__";
+      const today = localDateString(new Date());
+      const key = item.kind === "task" && item.completed !== true && item.scheduledDate !== null && item.scheduledDate < today
+        ? "__overdue__" : item.scheduledDate ?? "__undated__";
       grouped.set(key, [...(grouped.get(key) ?? []), item]);
     }
     return [...grouped.entries()].map(([key, groupedItems]) => ({
@@ -1052,6 +1252,7 @@ export default function Page() {
             <span className="account-label">SIGNED IN AS</span>
             <span className="account-email" title={account?.email}>{account?.email}</span>
           </div>
+          <button className="settings-button" type="button" disabled={isMutating} onClick={() => setSettingsOpen(true)} aria-label="Settings" title="Settings">⚙</button>
           <button
             className="signout-button"
             type="button"
@@ -1103,6 +1304,9 @@ export default function Page() {
               <span className="visible-count">{view === "files" ? filesCount : visibleItems.length}</span>
             </div>
             <div className="toolbar-right">
+              <button className="refresh-button notification-button" type="button" onClick={() => { setNotificationsOpen(true); void loadNotifications(identityVersion.current); }} aria-label={`Notifications${notifications.length ? `, ${notifications.length} unread` : ""}`}>
+                Notifications{notifications.length > 0 && <span className="notification-count">{notifications.length}</span>}
+              </button>
               {lastUpdated && <span className="sync-status"><span className="sync-dot" />Synced {lastUpdated.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}</span>}
               <button
                 className="refresh-button"
@@ -1151,7 +1355,7 @@ export default function Page() {
                 <section className="agenda-group" key={group.key ?? "undated"} aria-labelledby={`group-${group.key ?? "undated"}`}>
                   <div className="group-heading">
                     <h2 id={`group-${group.key ?? "undated"}`}>
-                      {group.key ? groupDateLabel(group.key, clientReady) : "Whenever it fits"}
+                      {group.key === "__overdue__" ? "Overdue" : group.key ? groupDateLabel(group.key, clientReady) : "Whenever it fits"}
                     </h2>
                     <span>{group.items.length} {group.items.length === 1 ? "item" : "items"}</span>
                   </div>
@@ -1187,10 +1391,34 @@ export default function Page() {
           setDraft={setDraft}
           error={editorError}
           busy={mutation === "save" || mutation === "create"}
+          emailEnabled={reminderSettings.emailEnabled}
           onClose={closeEditor}
           onSubmit={saveDraft}
         />
       )}
+      {settingsOpen && <ReminderSettingsDialog
+        initial={reminderSettings}
+        onClose={() => setSettingsOpen(false)}
+        onSave={async (settings, applyToExisting) => {
+          const response = await fetch("/api/settings/reminders", { method: "PATCH", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...settings, applyToExisting }) });
+          if (!response.ok) throw new Error(await errorFromResponse(response, "Could not save Reminder settings."));
+          const result = await response.json() as { settings: ReminderSettings };
+          setReminderSettings(result.settings);
+          setSettingsOpen(false);
+          void loadItems(identityVersion.current);
+        }}
+      />}
+      {notificationsOpen && <NotificationsDialog
+        notifications={notifications}
+        onClose={() => setNotificationsOpen(false)}
+        onOpen={async (notification) => {
+          const item = items.find((candidate) => candidate.id === notification.itemId);
+          await fetch(`/api/notifications/${encodeURIComponent(notification.id)}`, { method: "PATCH", credentials: "same-origin" });
+          setNotifications((current) => current.filter((candidate) => candidate.id !== notification.id));
+          setNotificationsOpen(false);
+          if (item) openEditor(item.kind, item);
+        }}
+      />}
       {deleteTarget && (
         <DeleteDialog
           item={deleteTarget}

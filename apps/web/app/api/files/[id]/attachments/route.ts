@@ -8,7 +8,7 @@ export async function POST(request: Request, context: Context) {
   const { id } = await context.params;
   return endpoint(async (request) => {
     const body = await readBody(request);
-    attachFile(requireUser(request).id, id, body.itemId);
+    attachFile(requireUser(request).id, id, body.itemId, body.scope);
     return json({ success: true }, 201);
   })(request);
 }

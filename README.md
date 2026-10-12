@@ -27,7 +27,7 @@ Configure the same FileTasks server origin in each client and sign in with the s
 
 ## Current API prototype
 
-The current prototype still routes API requests through Next.js route handlers; authentication, persistence, Tasks, Events, Files, Attachments, and the R2 storage adapter live under `services/api`. The long-term server runtime is being evaluated independently, and the route handlers are a temporary adapter.
+The current prototype routes API requests through Next.js route handlers; authentication, persistence, Tasks, Events, Recurrence rules, Reminders, Files, Attachments, Connected calendars, and the R2 storage adapter live under `services/api`. Configure Google OAuth and the calendar credential encryption key from `apps/web/.env.example` before connecting calendars. Apple Calendar uses an Apple ID app-specific password.
 
 ```sh
 npm run build
