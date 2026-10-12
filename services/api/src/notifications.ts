@@ -3,8 +3,11 @@ import { database } from "./database";
 import { listItems } from "./workspace";
 
 function subtractMonths(date: Date, count: number) {
-  const target = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() - count, 1));
-  target.setUTCDate(Math.min(date.getUTCDate(), new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate()));
+  const target = new Date(date);
+  const day = target.getUTCDate();
+  target.setUTCDate(1);
+  target.setUTCMonth(target.getUTCMonth() - count);
+  target.setUTCDate(Math.min(day, new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate()));
   return target;
 }
 

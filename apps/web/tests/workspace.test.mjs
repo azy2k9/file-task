@@ -275,6 +275,20 @@ test("recurring items create independent Occurrences and honor occurrence and se
   occurrences = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === root.id);
   assert.equal(occurrences.find(({ id }) => id === occurrenceId)?.completed, true);
   assert.equal(occurrences.filter(({ title }) => title === "Water the seedlings").length, 1);
+  const moved = await request(`/api/items/${occurrenceId}`, { token: owner.token, method: "PATCH", body: { scheduledDate: "2026-11-07", scope: "occurrence" } });
+  assert.equal(moved.status, 200);
+  occurrences = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === root.id);
+  assert.equal(occurrences.length, 4);
+  assert.equal(occurrences.filter(({ scheduledDate }) => scheduledDate === "2026-11-07").length, 1);
+  assert.equal(occurrences.some(({ scheduledDate }) => scheduledDate === "2026-11-04"), false);
+  const reminderEdit = await request(`/api/items/${occurrenceId}`, { token: owner.token, method: "PATCH", body: {
+    reminders: [{ delivery: "notification", amount: 2, unit: "days", time: "10:00" }], scope: "series",
+  } });
+  assert.equal(reminderEdit.status, 200);
+  occurrences = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === root.id)
+    .sort((left, right) => left.scheduledDate.localeCompare(right.scheduledDate));
+  assert.deepEqual(occurrences.map(({ scheduledDate }) => scheduledDate), ["2026-11-02", "2026-11-04", "2026-11-09", "2026-11-11"]);
+  assert.equal(occurrences.every(({ reminders }) => reminders[0]?.amount === 2), true);
   const seriesEdit = await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: { title: "Water all the plants", scope: "series" } });
   assert.equal(seriesEdit.status, 200);
   const afterSeriesEdit = (await (await request("/api/items", { token: owner.token })).json()).items;
@@ -295,6 +309,9 @@ test("a series Attachment is available from every Occurrence and can be removed 
   const occurrences = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === series.id);
   assert.equal(occurrences.length, 3);
   for (const occurrence of occurrences) assert.deepEqual(occurrence.files.map(({ id }) => id), [file.id]);
+  assert.equal((await request(`/api/files/${file.id}/attachments/${occurrences[1].id}?scope=occurrence`, { token: owner.token, method: "DELETE" })).status, 204);
+  const afterOccurrenceRemoval = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === series.id);
+  assert.deepEqual(afterOccurrenceRemoval.map(({ files }) => files.length), [1, 0, 1]);
   assert.deepEqual((await (await request("/api/files", { token: owner.token })).json()).files[0].attachments.map(({ scope }) => scope), ["series"]);
   assert.equal((await request(`/api/files/${file.id}/attachments/${series.id}?scope=series`, { token: owner.token, method: "DELETE" })).status, 204);
   assert.deepEqual((await (await request(`/api/items/${occurrences[1].id}`, { token: owner.token })).json()).item.files, []);

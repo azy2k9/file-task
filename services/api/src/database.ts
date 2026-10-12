@@ -102,6 +102,12 @@ export function database() {
         created_at TEXT NOT NULL,
         PRIMARY KEY(file_id,item_id)
       );
+      CREATE TABLE IF NOT EXISTS attachment_exclusions (
+        file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+        scope TEXT NOT NULL CHECK(scope IN ('occurrence','following')),
+        PRIMARY KEY(file_id,item_id,scope)
+      );
       CREATE INDEX IF NOT EXISTS attachments_item ON attachments(item_id, file_id);
       CREATE TABLE IF NOT EXISTS login_attempts (
         email TEXT PRIMARY KEY, attempts INTEGER NOT NULL, expires_at INTEGER NOT NULL
@@ -116,6 +122,8 @@ export function database() {
     db.exec("CREATE INDEX IF NOT EXISTS items_series ON items(series_root_id, occurrence_date)");
     const connectionColumns = new Set(db.prepare("PRAGMA table_info(calendar_connections)").all().map((column) => String(column.name)));
     if (!connectionColumns.has("expires_at")) db.exec("ALTER TABLE calendar_connections ADD COLUMN expires_at INTEGER");
+    const copyColumns = new Set(db.prepare("PRAGMA table_info(calendar_copies)").all().map((column) => String(column.name)));
+    if (!copyColumns.has("resource_uid")) db.exec("ALTER TABLE calendar_copies ADD COLUMN resource_uid TEXT");
     const attachmentColumns = new Set(db.prepare("PRAGMA table_info(attachments)").all().map((column) => String(column.name)));
     if (!attachmentColumns.has("scope")) db.exec("ALTER TABLE attachments ADD COLUMN scope TEXT NOT NULL DEFAULT 'occurrence' CHECK(scope IN ('occurrence','series'))");
     globalDatabase.filetasksDatabase = db;

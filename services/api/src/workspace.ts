@@ -18,6 +18,7 @@ function fromRow(row: Record<string, unknown>): WorkspaceItem {
     reminders: json(row.reminders_json, []),
     seriesId: row.series_root_id == null || (row.root_recurrence_json ?? row.recurrence_json) == null ? null : String(row.series_root_id),
     isOccurrence: row.series_root_id != null && String(row.id) !== String(row.series_root_id),
+    occurrenceDate: row.occurrence_date == null ? null : String(row.occurrence_date),
     createdAt: String(row.created_at), updatedAt: String(row.updated_at),
   };
 }
@@ -69,8 +70,11 @@ function parseRecurrence(value: unknown, scheduledDate: string | null): Recurren
 
 function formatDate(date: Date) { return date.toISOString().slice(0, 10); }
 function plusMonths(date: Date, count: number) {
-  const target = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + count, 1));
-  target.setUTCDate(Math.min(date.getUTCDate(), new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate()));
+  const target = new Date(date);
+  const day = target.getUTCDate();
+  target.setUTCDate(1);
+  target.setUTCMonth(target.getUTCMonth() + count);
+  target.setUTCDate(Math.min(day, new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate()));
   return target;
 }
 
@@ -128,13 +132,19 @@ function withFiles(items: WorkspaceItem[], userId: string) {
     JOIN items i ON i.id=a.item_id JOIN items target ON target.user_id=i.user_id AND
       (target.id=i.id OR (a.scope='series' AND target.series_root_id=i.id))
     JOIN files f ON f.id=a.file_id AND f.user_id=i.user_id
-    WHERE i.user_id=? AND f.status='ready'
+    WHERE i.user_id=? AND f.status='ready' AND NOT EXISTS(
+      SELECT 1 FROM attachment_exclusions x JOIN items excluded ON excluded.id=x.item_id
+      WHERE x.file_id=f.id AND ((x.scope='occurrence' AND x.item_id=target.id)
+        OR (x.scope='following' AND excluded.series_root_id=target.series_root_id AND target.occurrence_date>=excluded.occurrence_date)))
     UNION
     SELECT target.id AS item_id, f.id, f.name, f.source_type FROM following_attachments a
     JOIN items anchor ON anchor.id=a.item_id JOIN items target ON target.user_id=anchor.user_id
       AND target.series_root_id=anchor.series_root_id AND target.occurrence_date>=anchor.occurrence_date
     JOIN files f ON f.id=a.file_id AND f.user_id=anchor.user_id
-    WHERE anchor.user_id=? AND f.status='ready'`).all(userId,userId);
+    WHERE anchor.user_id=? AND f.status='ready' AND NOT EXISTS(
+      SELECT 1 FROM attachment_exclusions x JOIN items excluded ON excluded.id=x.item_id
+      WHERE x.file_id=f.id AND ((x.scope='occurrence' AND x.item_id=target.id)
+        OR (x.scope='following' AND excluded.series_root_id=target.series_root_id AND target.occurrence_date>=excluded.occurrence_date)))`).all(userId,userId);
   for (const row of rows) {
     const itemId = String(row.item_id);
     filesByItem.set(itemId, [...(filesByItem.get(itemId) ?? []), { id: String(row.id), name: String(row.name), sourceType: row.source_type as "upload" | "link" }]);
@@ -217,7 +227,10 @@ export function saveItem(userId: string, body: Record<string, unknown>, id?: str
     const params: (string | null)[] = scope === "following" ? [userId, series, existing.scheduledDate] : [userId, series];
     const targets = db.prepare(`SELECT id,occurrence_date FROM items WHERE user_id=? AND series_root_id=?${comparison} ORDER BY occurrence_date,id`).all(...params);
     const wholeSeries = scope === "series" || (scope === "following" && id === series);
-    const dates = wholeSeries && item.recurrence && item.scheduledDate ? occurrenceDates(item.scheduledDate, item.recurrence) : [];
+    const root = db.prepare("SELECT scheduled_date FROM items WHERE user_id=? AND id=?").get(userId,series);
+    const remindersOnly = scope === "series" && body.scheduledDate === undefined && body.scheduledTime === undefined && body.recurrence === undefined;
+    const seriesStart = remindersOnly ? String(root?.scheduled_date ?? item.scheduledDate) : item.scheduledDate;
+    const dates = wholeSeries && item.recurrence && seriesStart ? occurrenceDates(seriesStart, item.recurrence) : [];
     if (dates.length > 0) {
       targets.forEach((target, index) => {
         if (index < dates.length) write(String(target.id), String(target.id) === series, dates[index]);
@@ -252,10 +265,11 @@ export function saveItem(userId: string, body: Record<string, unknown>, id?: str
     if (item.recurrence) ensureOccurrences(userId);
     return getItem(userId, id);
   }
-  write(id, !rootId || id === rootId);
   if (existing?.seriesId && scope === "occurrence" && id !== existing.seriesId) {
-    db.prepare("UPDATE items SET recurrence_json=NULL,series_root_id=?,occurrence_date=? WHERE id=?").run(existing.seriesId, item.scheduledDate, id);
-  }
+    write(id, false, item.scheduledDate);
+    db.prepare("UPDATE items SET recurrence_json=NULL,series_root_id=?,occurrence_date=? WHERE user_id=? AND id=?")
+      .run(existing.seriesId, existing.scheduledDate, userId, id);
+  } else write(id, !rootId || id === rootId);
   if (item.recurrence && !rootId) db.prepare("UPDATE items SET series_root_id=id,occurrence_date=scheduled_date,recurrence_json=? WHERE id=?").run(JSON.stringify(item.recurrence),id);
   if (existing?.recurrence && !item.recurrence) db.prepare("DELETE FROM items WHERE series_root_id=? AND id<>?").run(existing.id,id);
   if (item.recurrence) ensureOccurrences(userId);

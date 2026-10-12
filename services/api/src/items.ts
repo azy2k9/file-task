@@ -16,6 +16,7 @@ export interface WorkspaceItem {
   recurrence: RecurrenceRule | null;
   reminders: ReminderRule[];
   seriesId: string | null;
+  occurrenceDate: string | null;
   isOccurrence: boolean;
   createdAt: string;
   updatedAt: string;
