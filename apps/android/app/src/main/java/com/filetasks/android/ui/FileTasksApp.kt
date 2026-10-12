@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -119,26 +120,6 @@ fun FileTasksApp(context: Context) {
         var linkName by rememberSaveable { mutableStateOf("") }
         var linkUrl by rememberSaveable { mutableStateOf("") }
 
-        val uploadLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-            val currentToken = token
-            if (uri != null && currentToken != null) {
-                runAction {
-                    val metadata = queryFileMetadata(context, uri)
-                    if (metadata.second > 50_000_000) throw IllegalArgumentException("Files must be smaller than 50 MB.")
-                    val bytes = withContext(Dispatchers.IO) {
-                        context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                            ?: throw IllegalArgumentException("The selected File could not be read.")
-                    }
-                    if (bytes.isEmpty()) throw IllegalArgumentException("Choose a File that contains at least one byte.")
-                    if (bytes.size > 50_000_000) throw IllegalArgumentException("Files must be smaller than 50 MB.")
-                    val api = ApiClient(apiBaseUrl)
-                    api.uploadFile(currentToken, metadata.first, metadata.third, bytes)
-                    workspaceFiles = api.listFiles(currentToken)
-                    workspaceItems = api.listItems(currentToken)
-                }
-            }
-        }
-
         LaunchedEffect(Unit) {
             val savedToken = withContext(Dispatchers.IO) { tokenStore.read() }
             token = savedToken
@@ -186,6 +167,26 @@ fun FileTasksApp(context: Context) {
                 } finally {
                     working = false
                     operationMutex.unlock()
+                }
+            }
+        }
+
+        val uploadLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            val currentToken = token
+            if (uri != null && currentToken != null) {
+                runAction {
+                    val metadata = queryFileMetadata(context, uri)
+                    if (metadata.sizeBytes > 50_000_000) throw IllegalArgumentException("Files must be smaller than 50 MB.")
+                    val bytes = withContext(Dispatchers.IO) {
+                        context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                            ?: throw IllegalArgumentException("The selected File could not be read.")
+                    }
+                    if (bytes.isEmpty()) throw IllegalArgumentException("Choose a File that contains at least one byte.")
+                    if (bytes.size > 50_000_000) throw IllegalArgumentException("Files must be smaller than 50 MB.")
+                    val api = ApiClient(apiBaseUrl)
+                    api.uploadFile(currentToken, metadata.name, metadata.contentType, bytes)
+                    workspaceFiles = api.listFiles(currentToken)
+                    workspaceItems = api.listItems(currentToken)
                 }
             }
         }
@@ -344,8 +345,9 @@ fun FileTasksApp(context: Context) {
             val currentToken = token ?: return
             runAction {
                 val target = ApiClient(apiBaseUrl).openFile(currentToken, file)
-                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(target.url)).apply {
-                    target.contentType?.let { type = it }
+                val uri = Uri.parse(target.url)
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    if (target.contentType == null) data = uri else setDataAndType(uri, target.contentType)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 context.startActivity(intent)
@@ -519,7 +521,7 @@ fun FileTasksApp(context: Context) {
                 onDismissRequest = { if (!working) fileToAttach = null },
                 title = { Text("Attach ${file.name}") },
                 text = {
-                    Column {
+                    Column(Modifier.fillMaxWidth().heightIn(max = 400.dp).verticalScroll(rememberScrollState())) {
                         if (availableItems.isEmpty()) Text("Every Task and Event already has this File attached.")
                         availableItems.forEach { item ->
                             TextButton(enabled = !working, onClick = { addAttachment(file, item) }) {
@@ -994,7 +996,9 @@ private fun WorkspaceFileCard(
     }
 }
 
-private fun queryFileMetadata(context: Context, uri: Uri): Triple<String, Long, String> {
+private data class SelectedFileMetadata(val name: String, val sizeBytes: Long, val contentType: String)
+
+private fun queryFileMetadata(context: Context, uri: Uri): SelectedFileMetadata {
     var name = uri.lastPathSegment?.substringAfterLast('/')?.takeIf(String::isNotBlank) ?: "Uploaded File"
     var size = 0L
     context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { cursor ->
@@ -1005,7 +1009,7 @@ private fun queryFileMetadata(context: Context, uri: Uri): Triple<String, Long, 
             if (sizeColumn >= 0 && !cursor.isNull(sizeColumn)) size = cursor.getLong(sizeColumn)
         }
     }
-    return Triple(name, size, context.contentResolver.getType(uri) ?: "application/octet-stream")
+    return SelectedFileMetadata(name, size, context.contentResolver.getType(uri) ?: "application/octet-stream")
 }
 
 @Composable

@@ -1,19 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
+import type { FileAttachment, WorkspaceFile } from "@api/files";
 import type { WorkspaceItem } from "@api/items";
 
-type FileAttachment = { itemId: string; itemKind: "task" | "event"; itemTitle: string };
-type WorkspaceFile = {
-  id: string;
-  name: string;
-  sourceType: "upload" | "link";
-  contentType: string | null;
-  sizeBytes: number | null;
-  externalUrl: string | null;
-  createdAt: string;
-  attachments: FileAttachment[];
-};
 type Dialog =
   | { type: "link" }
   | { type: "attach"; file: WorkspaceFile }
@@ -132,53 +122,42 @@ export default function FilesView({
   }
 
   async function attach(file: WorkspaceFile, itemId: string) {
-    setBusy(true);
-    setError(null);
-    try {
-      const response = await fetch(`/api/files/${encodeURIComponent(file.id)}/attachments`, {
+    await mutateFile(
+      () => fetch(`/api/files/${encodeURIComponent(file.id)}/attachments`, {
         method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ itemId }),
-      });
-      if (!response.ok) throw new Error(await responseError(response, "Could not add this Attachment."));
-      setDialog(null);
-      await loadFiles();
-      onItemsChanged();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Could not add this Attachment.");
-    } finally {
-      setBusy(false);
-    }
+      }),
+      "Could not add this Attachment.",
+    );
   }
 
   async function removeAttachment(file: WorkspaceFile, attachment: FileAttachment) {
-    setBusy(true);
-    setError(null);
-    try {
-      const response = await fetch(`/api/files/${encodeURIComponent(file.id)}/attachments/${encodeURIComponent(attachment.itemId)}`, {
+    await mutateFile(
+      () => fetch(`/api/files/${encodeURIComponent(file.id)}/attachments/${encodeURIComponent(attachment.itemId)}`, {
         method: "DELETE", credentials: "same-origin",
-      });
-      if (!response.ok) throw new Error(await responseError(response, "Could not remove this Attachment."));
-      setDialog(null);
-      await loadFiles();
-      onItemsChanged();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Could not remove this Attachment.");
-    } finally {
-      setBusy(false);
-    }
+      }),
+      "Could not remove this Attachment.",
+    );
   }
 
   async function deleteFile(file: WorkspaceFile) {
+    await mutateFile(
+      () => fetch(`/api/files/${encodeURIComponent(file.id)}`, { method: "DELETE", credentials: "same-origin" }),
+      "Could not delete this File.",
+    );
+  }
+
+  async function mutateFile(request: () => Promise<Response>, fallback: string) {
     setBusy(true);
     setError(null);
     try {
-      const response = await fetch(`/api/files/${encodeURIComponent(file.id)}`, { method: "DELETE", credentials: "same-origin" });
-      if (!response.ok) throw new Error(await responseError(response, "Could not delete this File."));
+      const response = await request();
+      if (!response.ok) throw new Error(await responseError(response, fallback));
       setDialog(null);
       await loadFiles();
       onItemsChanged();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Could not delete this File.");
+      setError(reason instanceof Error ? reason.message : fallback);
     } finally {
       setBusy(false);
     }
