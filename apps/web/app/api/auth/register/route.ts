@@ -1,4 +1,4 @@
-import { authenticate } from "@/lib/server/auth";
-import { endpoint } from "@/lib/server/http";
+import { authenticate } from "@api/auth";
+import { endpoint } from "@api/http";
 export const runtime = "nodejs";
 export const POST = endpoint((request) => authenticate(request, true));

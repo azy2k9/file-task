@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { WorkspaceItem } from "../items";
+import type { WorkspaceItem } from "./items";
 import { database } from "./database";
 import { HttpError } from "./http";
 

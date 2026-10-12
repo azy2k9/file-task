@@ -5,23 +5,14 @@
   "engines": {
     "node": ">=22.13.0"
   },
+  "workspaces": [
+    "apps/web"
+  ],
   "scripts": {
-    "dev": "next dev --hostname 0.0.0.0",
-    "build": "next build",
-    "start": "next start --hostname 0.0.0.0",
-    "typecheck": "tsc --noEmit",
-    "test": "node --test --test-concurrency=1 tests/*.test.mjs"
-  },
-  "dependencies": {
-    "next": "16.4.0",
-    "react": "19.3.0",
-    "react-dom": "19.3.0"
-  },
-  "devDependencies": {
-    "@playwright/test": "1.64.0",
-    "@types/node": "^22.0.0",
-    "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.0.0",
-    "typescript": "^5.9.3"
+    "dev": "npm run dev --workspace=@filetasks/web",
+    "build": "npm run build --workspace=@filetasks/web",
+    "start": "npm run start --workspace=@filetasks/web",
+    "typecheck": "npm run typecheck --workspace=@filetasks/web",
+    "test": "npm run test --workspace=@filetasks/web"
   }
 }

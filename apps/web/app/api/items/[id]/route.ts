@@ -1,6 +1,6 @@
-import { requireUser } from "@/lib/server/auth";
-import { endpoint, json, readBody } from "@/lib/server/http";
-import { deleteItem, getItem, saveItem } from "@/lib/server/workspace";
+import { requireUser } from "@api/auth";
+import { endpoint, json, readBody } from "@api/http";
+import { deleteItem, getItem, saveItem } from "@api/workspace";
 export const runtime = "nodejs";
 type Context = { params: Promise<{ id: string }> };
 export async function GET(request: Request, context: Context) {

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
-import type { ItemInput, ItemKind, WorkspaceItem } from "@/lib/items";
+import type { ItemInput, ItemKind, WorkspaceItem } from "@api/items";
 
 type Account = { id: string; email: string };
 type View = "agenda" | "task" | "event";

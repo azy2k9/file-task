@@ -2,18 +2,23 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import { chromium, expect } from "@playwright/test";
 
 let server;
 let directory;
+const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+const nextBin = createRequire(import.meta.url).resolve("next/dist/bin/next");
 const base = "http://localhost:3107";
 let logs = "";
 
 async function startServer() {
-  server = spawn(process.execPath, ["node_modules/next/dist/bin/next", "dev", "--port", "3107"], {
+  server = spawn(process.execPath, [nextBin, "dev", "--port", "3107"], {
+    cwd: projectRoot,
     env: { ...process.env, FILETASKS_DATABASE_PATH: join(directory, "workspace.sqlite"), FILETASKS_ORIGIN: base },
     stdio: ["ignore", "pipe", "pipe"],
   });

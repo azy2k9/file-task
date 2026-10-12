@@ -1,4 +1,4 @@
-import { logout } from "@/lib/server/auth";
-import { endpoint } from "@/lib/server/http";
+import { logout } from "@api/auth";
+import { endpoint } from "@api/http";
 export const runtime = "nodejs";
 export const POST = endpoint(async (request) => logout(request));

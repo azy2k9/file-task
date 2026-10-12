@@ -8,7 +8,9 @@ playwright-report/
 *.tsbuildinfo
 next-env.d.ts
 .DS_Store
-clients/ios/**/xcuserdata/
-clients/android/.gradle/
-clients/android/**/build/
-clients/android/local.properties
+apps/ios/**/xcuserdata/
+apps/android/.gradle/
+apps/android/**/build/
+apps/android/local.properties
+apps/web/.next/
+!apps/web/.env.example

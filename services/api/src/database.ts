@@ -7,7 +7,9 @@ const globalDatabase = globalThis as typeof globalThis & { filetasksDatabase?: D
 export function database() {
   if (!globalDatabase.filetasksDatabase) {
     // This is a runtime data volume, not a source asset to include in Next's output tracing.
-    const path = resolve(/* turbopackIgnore: true */ process.env.FILETASKS_DATABASE_PATH || "data/filetasks.sqlite");
+    const repositoryRoot = resolve(process.cwd(), "../..");
+    const databasePath = process.env.FILETASKS_DATABASE_PATH || "data/filetasks.sqlite";
+    const path = resolve(/* turbopackIgnore: true */ repositoryRoot, databasePath);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     const db = new DatabaseSync(path);
     db.exec(`
