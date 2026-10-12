@@ -1,0 +1,3 @@
+# FileTasks is the source of truth for calendar events
+
+FileTasks owns the event details and attached-file relationships for events synchronized with connected calendars. Changes made in FileTasks are synchronized outward; external edits do not replace the FileTasks version, and deleting an external copy does not delete the FileTasks event. A user can restore missing external copies with **Sync Calendar**, while deleting an event in FileTasks removes its connected calendar copies. This keeps the complete event and its files available in FileTasks, at the cost of requiring users to make authoritative changes there.
