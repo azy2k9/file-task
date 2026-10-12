@@ -1,0 +1,14 @@
+node_modules/
+.next/
+/data/
+.env*
+!.env.example
+test-results/
+playwright-report/
+*.tsbuildinfo
+next-env.d.ts
+.DS_Store
+clients/ios/**/xcuserdata/
+clients/android/.gradle/
+clients/android/**/build/
+clients/android/local.properties

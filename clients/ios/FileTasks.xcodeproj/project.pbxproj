@@ -1,0 +1,277 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000000000000000000001 /* FileTasksApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000001 /* FileTasksApp.swift */; };
+		A10000000000000000000002 /* WorkspaceItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000002 /* WorkspaceItem.swift */; };
+		A10000000000000000000003 /* APISettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000003 /* APISettings.swift */; };
+		A10000000000000000000004 /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000004 /* APIClient.swift */; };
+		A10000000000000000000005 /* KeychainTokenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000005 /* KeychainTokenStore.swift */; };
+		A10000000000000000000006 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000006 /* AppModel.swift */; };
+		A10000000000000000000007 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000007 /* RootView.swift */; };
+		A10000000000000000000008 /* AuthenticationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000008 /* AuthenticationView.swift */; };
+		A10000000000000000000009 /* ServerSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000009 /* ServerSettingsView.swift */; };
+		A1000000000000000000000A /* WorkspaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000000A /* WorkspaceView.swift */; };
+		A1000000000000000000000B /* ItemEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000000B /* ItemEditorView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		B10000000000000000000001 /* FileTasksApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTasksApp.swift; sourceTree = "<group>"; };
+		B10000000000000000000002 /* WorkspaceItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceItem.swift; sourceTree = "<group>"; };
+		B10000000000000000000003 /* APISettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APISettings.swift; sourceTree = "<group>"; };
+		B10000000000000000000004 /* APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
+		B10000000000000000000005 /* KeychainTokenStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainTokenStore.swift; sourceTree = "<group>"; };
+		B10000000000000000000006 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		B10000000000000000000007 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		B10000000000000000000008 /* AuthenticationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthenticationView.swift; sourceTree = "<group>"; };
+		B10000000000000000000009 /* ServerSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerSettingsView.swift; sourceTree = "<group>"; };
+		B1000000000000000000000A /* WorkspaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceView.swift; sourceTree = "<group>"; };
+		B1000000000000000000000B /* ItemEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ItemEditorView.swift; sourceTree = "<group>"; };
+		B1000000000000000000000C /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B1000000000000000000000D /* FileTasks.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FileTasks.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B1000000000000000000000E /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		C10000000000000000000001 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		D10000000000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				D10000000000000000000002 /* FileTasks */,
+				B1000000000000000000000E /* README.md */,
+				D10000000000000000000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		D10000000000000000000002 /* FileTasks */ = {
+			isa = PBXGroup;
+			path = FileTasks;
+			sourceTree = "<group>";
+			children = (
+				B10000000000000000000001 /* FileTasksApp.swift */,
+				B1000000000000000000000C /* Info.plist */,
+				D10000000000000000000004 /* Domain */,
+				D10000000000000000000005 /* Networking */,
+				D10000000000000000000006 /* Security */,
+				D10000000000000000000007 /* State */,
+				D10000000000000000000008 /* Views */,
+			);
+		};
+		D10000000000000000000003 /* Products */ = {
+			isa = PBXGroup;
+			name = Products;
+			sourceTree = "<group>";
+			children = (
+				B1000000000000000000000D /* FileTasks.app */,
+			);
+		};
+		D10000000000000000000004 /* Domain */ = {
+			isa = PBXGroup;
+			path = Domain;
+			sourceTree = "<group>";
+			children = (
+				B10000000000000000000002 /* WorkspaceItem.swift */,
+			);
+		};
+		D10000000000000000000005 /* Networking */ = {
+			isa = PBXGroup;
+			path = Networking;
+			sourceTree = "<group>";
+			children = (
+				B10000000000000000000003 /* APISettings.swift */,
+				B10000000000000000000004 /* APIClient.swift */,
+			);
+		};
+		D10000000000000000000006 /* Security */ = {
+			isa = PBXGroup;
+			path = Security;
+			sourceTree = "<group>";
+			children = (
+				B10000000000000000000005 /* KeychainTokenStore.swift */,
+			);
+		};
+		D10000000000000000000007 /* State */ = {
+			isa = PBXGroup;
+			path = State;
+			sourceTree = "<group>";
+			children = (
+				B10000000000000000000006 /* AppModel.swift */,
+			);
+		};
+		D10000000000000000000008 /* Views */ = {
+			isa = PBXGroup;
+			path = Views;
+			sourceTree = "<group>";
+			children = (
+				B10000000000000000000007 /* RootView.swift */,
+				B10000000000000000000008 /* AuthenticationView.swift */,
+				B10000000000000000000009 /* ServerSettingsView.swift */,
+				B1000000000000000000000A /* WorkspaceView.swift */,
+				B1000000000000000000000B /* ItemEditorView.swift */,
+			);
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		E10000000000000000000001 /* FileTasks */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F10000000000000000000006 /* Build configuration list for PBXNativeTarget "FileTasks" */;
+			buildPhases = (
+				C10000000000000000000002 /* Sources */,
+				C10000000000000000000001 /* Frameworks */,
+				C10000000000000000000003 /* Resources */,
+			);
+			buildRules = ();
+			dependencies = ();
+			name = FileTasks;
+			productName = FileTasks;
+			productReference = B1000000000000000000000D /* FileTasks.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		E10000000000000000000002 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					E10000000000000000000001 = {CreatedOnToolsVersion = 15.0; };
+				};
+			};
+			buildConfigurationList = F10000000000000000000005 /* Build configuration list for PBXProject "FileTasks" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			mainGroup = D10000000000000000000001;
+			productRefGroup = D10000000000000000000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				E10000000000000000000001 /* FileTasks */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		C10000000000000000000002 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000001 /* FileTasksApp.swift in Sources */,
+				A10000000000000000000002 /* WorkspaceItem.swift in Sources */,
+				A10000000000000000000003 /* APISettings.swift in Sources */,
+				A10000000000000000000004 /* APIClient.swift in Sources */,
+				A10000000000000000000005 /* KeychainTokenStore.swift in Sources */,
+				A10000000000000000000006 /* AppModel.swift in Sources */,
+				A10000000000000000000007 /* RootView.swift in Sources */,
+				A10000000000000000000008 /* AuthenticationView.swift in Sources */,
+				A10000000000000000000009 /* ServerSettingsView.swift in Sources */,
+				A1000000000000000000000A /* WorkspaceView.swift in Sources */,
+				A1000000000000000000000B /* ItemEditorView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXResourcesBuildPhase section */
+		C10000000000000000000003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = ();
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		F10000000000000000000001 /* Project Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		F10000000000000000000002 /* Project Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		F10000000000000000000003 /* Target Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = FileTasks/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.filetasks.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		F10000000000000000000004 /* Target Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = FileTasks/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.filetasks.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		F10000000000000000000005 /* Build configuration list for PBXProject "FileTasks" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F10000000000000000000001 /* Project Debug */,
+				F10000000000000000000002 /* Project Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F10000000000000000000006 /* Build configuration list for PBXNativeTarget "FileTasks" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F10000000000000000000003 /* Target Debug */,
+				F10000000000000000000004 /* Target Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = E10000000000000000000002 /* Project object */;
+}
