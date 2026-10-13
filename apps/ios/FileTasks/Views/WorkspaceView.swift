@@ -41,6 +41,7 @@ struct WorkspaceView: View {
     @State private var newItemKind: WorkspaceItemKind = .task
     @State private var itemPendingDeletion: WorkspaceItem?
     @State private var showingLogoutConfirmation = false
+    @State private var showingReminderSettings = false
     @State private var section: WorkspaceSection = .agenda
     @State private var showingLinkForm = false
     @State private var linkName = ""
@@ -156,6 +157,11 @@ struct WorkspaceView: View {
                         Button(action: openServerSettings) {
                             Label("Server settings", systemImage: "server.rack")
                         }
+                        Button {
+                            showingReminderSettings = true
+                        } label: {
+                            Label("Reminder settings", systemImage: "bell")
+                        }
                         Button(role: .destructive) {
                             showingLogoutConfirmation = true
                         } label: {
@@ -184,6 +190,9 @@ struct WorkspaceView: View {
             .sheet(isPresented: $showingEditor, onDismiss: { editingItem = nil }) {
                 ItemEditorView(item: editingItem, initialKind: newItemKind)
             }
+            .sheet(isPresented: $showingReminderSettings) {
+                ReminderSettingsView()
+            }
             .confirmationDialog(
                 "Delete this \(itemPendingDeletion?.kind.title.lowercased() ?? "item")?",
                 isPresented: Binding(
@@ -193,9 +202,18 @@ struct WorkspaceView: View {
                 titleVisibility: .visible
             ) {
                 if let item = itemPendingDeletion {
-                    Button("Delete", role: .destructive) {
-                        Task { await model.delete(item) }
-                        itemPendingDeletion = nil
+                    if item.seriesId != nil {
+                        ForEach(EditScope.allCases) { scope in
+                            Button(scope.title, role: .destructive) {
+                                Task { await model.delete(item, scope: scope) }
+                                itemPendingDeletion = nil
+                            }
+                        }
+                    } else {
+                        Button("Delete", role: .destructive) {
+                            Task { await model.delete(item) }
+                            itemPendingDeletion = nil
+                        }
                     }
                 }
                 Button("Cancel", role: .cancel) { itemPendingDeletion = nil }
@@ -230,7 +248,13 @@ struct WorkspaceView: View {
             )) {
                 if let file = fileToAttach {
                     ForEach(model.items.filter { item in !file.attachments.contains(where: { $0.itemId == item.id }) }) { item in
-                        Button("\(item.kind.title): \(item.title)") { Task { await attach(file, to: item) } }
+                        if item.seriesId != nil {
+                            Button("This Occurrence · \(item.kind.title): \(item.title)") { Task { await attach(file, to: item, scope: .occurrence) } }
+                            Button("This and following · \(item.title)") { Task { await attach(file, to: item, scope: .following) } }
+                            Button("Whole series · \(item.title)") { Task { await attach(file, to: item, scope: .series) } }
+                        } else {
+                            Button("\(item.kind.title): \(item.title)") { Task { await attach(file, to: item, scope: .occurrence) } }
+                        }
                     }
                 }
                 Button("Cancel", role: .cancel) { fileToAttach = nil }
@@ -255,7 +279,15 @@ struct WorkspaceView: View {
                 get: { attachmentToRemove != nil }, set: { if !$0 { attachmentToRemove = nil } }
             ), titleVisibility: .visible) {
                 if let target = attachmentToRemove {
-                    Button("Remove Attachment") { Task { await removeAttachment(target.attachment, from: target.file) } }
+                    if target.attachment.scope == "series" || target.attachment.scope == "following" {
+                        Button("Remove from this Occurrence") { Task { await removeAttachment(target.attachment, from: target.file, scope: .occurrence) } }
+                        Button("Remove this and following Occurrences") { Task { await removeAttachment(target.attachment, from: target.file, scope: .following) } }
+                    } else {
+                        Button("Remove Attachment") { Task { await removeAttachment(target.attachment, from: target.file, scope: .occurrence) } }
+                    }
+                    if target.attachment.scope == "series" {
+                        Button("Remove from whole series", role: .destructive) { Task { await removeAttachment(target.attachment, from: target.file, scope: .series) } }
+                    }
                     Button("Delete File from Files section", role: .destructive) { Task { await deleteFile(target.file) } }
                 }
                 Button("Cancel", role: .cancel) { attachmentToRemove = nil }
@@ -453,13 +485,13 @@ struct WorkspaceView: View {
         }
     }
 
-    private func attach(_ file: WorkspaceFile, to item: WorkspaceItem) async {
-        do { try await model.attachFile(file, to: item); fileToAttach = nil }
+    private func attach(_ file: WorkspaceFile, to item: WorkspaceItem, scope: EditScope) async {
+        do { try await model.attachFile(file, to: item, scope: scope); fileToAttach = nil }
         catch { model.errorMessage = error.localizedDescription }
     }
 
-    private func removeAttachment(_ attachment: FileAttachment, from file: WorkspaceFile) async {
-        do { try await model.removeAttachment(attachment, from: file); attachmentToRemove = nil }
+    private func removeAttachment(_ attachment: FileAttachment, from file: WorkspaceFile, scope: EditScope) async {
+        do { try await model.removeAttachment(attachment, from: file, scope: scope); attachmentToRemove = nil }
         catch { model.errorMessage = error.localizedDescription }
     }
 

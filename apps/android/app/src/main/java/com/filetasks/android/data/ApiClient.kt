@@ -24,10 +24,27 @@ data class WorkspaceItem(
     val createdAt: String,
     val updatedAt: String,
     val files: List<WorkspaceFileSummary> = emptyList(),
+    val recurrence: RecurrenceRule? = null,
+    val reminders: List<ReminderRule> = emptyList(),
+    val seriesId: String? = null,
+    val occurrenceDate: String? = null,
+    val isOccurrence: Boolean = false,
 )
 
+data class ReminderRule(val delivery: String, val amount: Int, val unit: String, val time: String)
+data class RecurrenceEnd(val type: String, val date: String? = null, val count: Int? = null)
+data class RecurrenceRule(val interval: Int, val unit: String, val weekdays: List<Int>?, val end: RecurrenceEnd)
+data class ReminderSettings(
+    val taskReminders: List<ReminderRule>, val eventReminders: List<ReminderRule>,
+    val pushEnabled: Boolean, val emailEnabled: Boolean, val pushAvailable: Boolean, val emailAvailable: Boolean,
+) {
+    companion object {
+        val Empty = ReminderSettings(emptyList(), emptyList(), false, false, false, false)
+    }
+}
+data class PushDevice(val id: String, val platform: String, val createdAt: String)
 data class WorkspaceFileSummary(val id: String, val name: String, val sourceType: String)
-data class FileAttachment(val itemId: String, val itemKind: ItemKind, val itemTitle: String)
+data class FileAttachment(val itemId: String, val itemKind: ItemKind, val itemTitle: String, val scope: String = "occurrence")
 data class WorkspaceFile(
     val id: String,
     val name: String,
@@ -51,6 +68,9 @@ data class ItemFields(
     val details: String,
     val scheduledDate: String?,
     val scheduledTime: String?,
+    val recurrence: RecurrenceRule? = null,
+    val reminders: List<ReminderRule> = emptyList(),
+    val scope: String? = null,
 )
 
 class ApiException(
@@ -108,6 +128,31 @@ class ApiClient(rawBaseUrl: String) {
         buildList(files.length()) { for (index in 0 until files.length()) add(parseFile(files.getJSONObject(index))) }
     }
 
+    suspend fun reminderSettings(token: String): ReminderSettings = withContext(Dispatchers.IO) {
+        parseReminderSettings(request("GET", "/api/settings/reminders", token = token).getJSONObject("settings"))
+    }
+
+    suspend fun updateReminderSettings(token: String, settings: ReminderSettings, applyToExisting: Boolean): ReminderSettings = withContext(Dispatchers.IO) {
+        val body = JSONObject()
+            .put("taskReminders", reminderArray(settings.taskReminders))
+            .put("eventReminders", reminderArray(settings.eventReminders))
+            .put("pushEnabled", settings.pushEnabled)
+            .put("emailEnabled", settings.emailEnabled)
+            .put("applyToExisting", applyToExisting)
+        parseReminderSettings(request("PATCH", "/api/settings/reminders", body, token).getJSONObject("settings"))
+    }
+
+    suspend fun registerPushDevice(token: String, platform: String, deviceToken: String): PushDevice = withContext(Dispatchers.IO) {
+        val response = request("POST", "/api/devices/push", JSONObject().put("platform", platform).put("token", deviceToken), token)
+        val device = response.getJSONObject("device")
+        PushDevice(device.optString("id"), device.optString("platform"), device.optString("createdAt"))
+    }
+
+    suspend fun revokePushDevice(token: String, device: PushDevice) = withContext(Dispatchers.IO) {
+        request("DELETE", "/api/devices/push/${pathSegment(device.id)}", token = token)
+        Unit
+    }
+
     suspend fun createLinkFile(token: String, name: String, url: String): WorkspaceFile = withContext(Dispatchers.IO) {
         parseFile(request("POST", "/api/files", JSONObject().put("name", name).put("url", url), token)
             .getJSONObject("file"))
@@ -133,13 +178,13 @@ class ApiClient(rawBaseUrl: String) {
         parseFile(request("POST", "/api/files/${pathSegment(uploadId)}/complete", token = token).getJSONObject("file"))
     }
 
-    suspend fun attachFile(token: String, file: WorkspaceFile, item: WorkspaceItem) = withContext(Dispatchers.IO) {
-        request("POST", "/api/files/${pathSegment(file.id)}/attachments", JSONObject().put("itemId", item.id), token)
+    suspend fun attachFile(token: String, file: WorkspaceFile, item: WorkspaceItem, scope: String = "occurrence") = withContext(Dispatchers.IO) {
+        request("POST", "/api/files/${pathSegment(file.id)}/attachments", JSONObject().put("itemId", item.id).put("scope", scope), token)
         Unit
     }
 
-    suspend fun removeAttachment(token: String, file: WorkspaceFile, attachment: FileAttachment) = withContext(Dispatchers.IO) {
-        request("DELETE", "/api/files/${pathSegment(file.id)}/attachments/${pathSegment(attachment.itemId)}", token = token)
+    suspend fun removeAttachment(token: String, file: WorkspaceFile, attachment: FileAttachment, scope: String = "occurrence") = withContext(Dispatchers.IO) {
+        request("DELETE", "/api/files/${pathSegment(file.id)}/attachments/${pathSegment(attachment.itemId)}?scope=${pathSegment(scope)}", token = token)
         Unit
     }
 
@@ -179,8 +224,8 @@ class ApiClient(rawBaseUrl: String) {
             parseItem(response.getJSONObject("item"))
         }
 
-    suspend fun deleteItem(token: String, item: WorkspaceItem) = withContext(Dispatchers.IO) {
-        request("DELETE", "/api/items/${pathSegment(item.id)}", token = token)
+    suspend fun deleteItem(token: String, item: WorkspaceItem, scope: String? = null) = withContext(Dispatchers.IO) {
+        request("DELETE", "/api/items/${pathSegment(item.id)}${scope?.let { "?scope=${pathSegment(it)}" }.orEmpty()}", token = token)
         Unit
     }
 
@@ -256,6 +301,11 @@ class ApiClient(rawBaseUrl: String) {
             createdAt = json.optString("createdAt"),
             updatedAt = json.optString("updatedAt"),
             files = files,
+            recurrence = parseRecurrence(json.optJSONObject("recurrence")),
+            reminders = parseReminders(json.optJSONArray("reminders")),
+            seriesId = json.nullableString("seriesId"),
+            occurrenceDate = json.nullableString("occurrenceDate"),
+            isOccurrence = json.optBoolean("isOccurrence"),
         )
     }
 
@@ -264,7 +314,7 @@ class ApiClient(rawBaseUrl: String) {
         val attachments = buildList { if (attachmentArray != null) for (index in 0 until attachmentArray.length()) {
             val attachment = attachmentArray.getJSONObject(index)
             val kind = if (attachment.optString("itemKind") == ItemKind.Event.wireValue) ItemKind.Event else ItemKind.Task
-            add(FileAttachment(attachment.optString("itemId"), kind, attachment.optString("itemTitle")))
+            add(FileAttachment(attachment.optString("itemId"), kind, attachment.optString("itemTitle"), attachment.optString("scope", "occurrence")))
         } }
         return WorkspaceFile(
             id = json.optString("id"), name = json.optString("name"), sourceType = json.optString("sourceType"),
@@ -279,6 +329,51 @@ class ApiClient(rawBaseUrl: String) {
         .put("details", fields.details)
         .put("scheduledDate", fields.scheduledDate ?: JSONObject.NULL)
         .put("scheduledTime", fields.scheduledTime ?: JSONObject.NULL)
+        .put("recurrence", fields.recurrence?.let(::recurrenceObject) ?: JSONObject.NULL)
+        .put("reminders", reminderArray(fields.reminders))
+        .apply { fields.scope?.let { put("scope", it) } }
+
+    private fun parseReminderSettings(json: JSONObject) = ReminderSettings(
+        taskReminders = parseReminders(json.optJSONArray("taskReminders")),
+        eventReminders = parseReminders(json.optJSONArray("eventReminders")),
+        pushEnabled = json.optBoolean("pushEnabled"), emailEnabled = json.optBoolean("emailEnabled"),
+        pushAvailable = json.optBoolean("pushAvailable"), emailAvailable = json.optBoolean("emailAvailable"),
+    )
+
+    private fun parseReminders(array: org.json.JSONArray?): List<ReminderRule> = buildList {
+        if (array != null) for (index in 0 until array.length()) {
+            val reminder = array.getJSONObject(index)
+            add(ReminderRule(reminder.optString("delivery"), reminder.optInt("amount"), reminder.optString("unit"), reminder.optString("time")))
+        }
+    }
+
+    private fun reminderArray(reminders: List<ReminderRule>) = org.json.JSONArray().apply {
+        reminders.forEach { put(JSONObject().put("delivery", it.delivery).put("amount", it.amount).put("unit", it.unit).put("time", it.time)) }
+    }
+
+    private fun parseRecurrence(json: JSONObject?): RecurrenceRule? {
+        if (json == null) return null
+        val endJson = json.optJSONObject("end") ?: return null
+        val end = when (endJson.optString("type")) {
+            "date" -> RecurrenceEnd("date", date = endJson.optString("date"))
+            "count" -> RecurrenceEnd("count", count = endJson.optInt("count"))
+            else -> RecurrenceEnd("never")
+        }
+        val weekdayArray = json.optJSONArray("weekdays")
+        val weekdays = weekdayArray?.let { array -> buildList { for (index in 0 until array.length()) add(array.getInt(index)) } }
+        return RecurrenceRule(json.optInt("interval", 1), json.optString("unit"), weekdays, end)
+    }
+
+    private fun recurrenceObject(rule: RecurrenceRule) = JSONObject()
+        .put("interval", rule.interval)
+        .put("unit", rule.unit)
+        .apply {
+            rule.weekdays?.let { weekdays -> put("weekdays", org.json.JSONArray().apply { weekdays.forEach { put(it) } }) }
+            put("end", JSONObject().put("type", rule.end.type).apply {
+                rule.end.date?.let { put("date", it) }
+                rule.end.count?.let { put("count", it) }
+            })
+        }
 
     private fun pathSegment(value: String): String = java.net.URLEncoder.encode(value, "UTF-8")
 

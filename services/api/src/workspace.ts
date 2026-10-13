@@ -78,9 +78,20 @@ function plusMonths(date: Date, count: number) {
   return target;
 }
 
-function occurrenceDates(startValue: string, rule: RecurrenceRule) {
+function reminderLeadDays(raw: unknown) {
+  const reminders = json<ReminderRule[]>(raw, []);
+  return reminders.reduce((max, reminder) => {
+    const days = reminder.unit === "minutes" || reminder.unit === "hours" ? 0
+      : reminder.unit === "days" ? reminder.amount
+        : reminder.unit === "weeks" ? reminder.amount * 7
+          : reminder.amount * 31;
+    return Math.max(max, days);
+  }, 0);
+}
+
+function occurrenceDates(startValue: string, rule: RecurrenceRule, leadDays = 0) {
   const start = new Date(`${startValue}T00:00:00Z`);
-  const horizon = new Date(); horizon.setUTCDate(horizon.getUTCDate() + 370);
+  const horizon = new Date(); horizon.setUTCDate(horizon.getUTCDate() + Math.max(370, leadDays) + 2);
   const stop = rule.end.type === "date" ? new Date(`${rule.end.date}T00:00:00Z`) : horizon;
   const maxDate = rule.end.type === "date" && stop < horizon ? stop : horizon;
   const dates = [startValue];
@@ -114,8 +125,9 @@ function ensureOccurrences(userId: string) {
     if (!rule || typeof row.scheduled_date !== "string") continue;
     const exists = db.prepare("SELECT occurrence_date FROM items WHERE series_root_id=?").all(row.id).map((item) => String(item.occurrence_date));
     const known = new Set(exists);
-    for (const date of occurrenceDates(String(row.scheduled_date), rule)) {
-      if (known.has(date)) continue;
+    const excluded = new Set(db.prepare("SELECT occurrence_date FROM occurrence_exclusions WHERE series_root_id=?").all(row.id).map((item) => String(item.occurrence_date)));
+    for (const date of occurrenceDates(String(row.scheduled_date), rule, reminderLeadDays(row.reminders_json))) {
+      if (known.has(date) || excluded.has(date)) continue;
       const id = randomUUID(); const now = new Date().toISOString();
       db.prepare(`INSERT INTO items(id,user_id,kind,title,details,scheduled_date,scheduled_time,completed,created_at,updated_at,
         recurrence_json,reminders_json,series_root_id,occurrence_date)
@@ -155,14 +167,16 @@ function withFiles(items: WorkspaceItem[], userId: string) {
 export function listItems(userId: string) {
   ensureOccurrences(userId);
   const rows = database().prepare(`SELECT i.*, root.recurrence_json AS root_recurrence_json FROM items i
-    LEFT JOIN items root ON root.id=i.series_root_id WHERE i.user_id=?
+    LEFT JOIN items root ON root.id=i.series_root_id WHERE i.user_id=? AND NOT EXISTS(
+      SELECT 1 FROM occurrence_exclusions x WHERE x.user_id=i.user_id AND x.series_root_id=i.series_root_id AND x.occurrence_date=i.occurrence_date)
     ORDER BY i.scheduled_date IS NULL,i.scheduled_date,i.scheduled_time,i.created_at,i.id`).all(userId);
   return withFiles(rows.map(fromRow), userId);
 }
 
 export function getItem(userId: string, id: string) {
   const row = database().prepare(`SELECT i.*, root.recurrence_json AS root_recurrence_json FROM items i
-    LEFT JOIN items root ON root.id=i.series_root_id WHERE i.user_id=? AND i.id=?`).get(userId, id);
+    LEFT JOIN items root ON root.id=i.series_root_id WHERE i.user_id=? AND i.id=? AND NOT EXISTS(
+      SELECT 1 FROM occurrence_exclusions x WHERE x.user_id=i.user_id AND x.series_root_id=i.series_root_id AND x.occurrence_date=i.occurrence_date)`).get(userId, id);
   if (!row) throw new HttpError(404, "This item could not be found.");
   return withFiles([fromRow(row)], userId)[0];
 }
@@ -194,10 +208,16 @@ export function saveItem(userId: string, body: Record<string, unknown>, id?: str
   const db = database();
   const existing = id ? getItem(userId, id) : undefined;
   const item = validate(body, existing);
-  if (item.reminders.some((reminder) => reminder.delivery === "email") && !reminderSettings(userId).emailEnabled) {
+  const unchangedEmailRules = existing !== undefined && JSON.stringify(item.reminders) === JSON.stringify(existing.reminders);
+  if (body.reminders !== undefined && item.reminders.some((reminder) => reminder.delivery === "email")
+    && !reminderSettings(userId).emailEnabled && !unchangedEmailRules) {
     throw new HttpError(400, "Enable email delivery before adding an Email Reminder.");
   }
-  const scope = body.scope ?? "series";
+  const completionOnly = Object.keys(body).every((key) => key === "completed");
+  if (existing?.seriesId && !completionOnly && body.scope === undefined) {
+    throw new HttpError(400, "Choose whether to edit this Occurrence, following Occurrences, or the whole series.");
+  }
+  const scope = body.scope ?? (existing?.seriesId ? "occurrence" : "series");
   if (existing?.seriesId && !["occurrence", "following", "series"].includes(String(scope))) throw new HttpError(400, "Choose whether to edit this Occurrence, following Occurrences, or the whole series.");
   if (!id) {
     const defaults = itemReminderDefaults(userId, item.kind);
@@ -230,7 +250,9 @@ export function saveItem(userId: string, body: Record<string, unknown>, id?: str
     const root = db.prepare("SELECT scheduled_date FROM items WHERE user_id=? AND id=?").get(userId,series);
     const remindersOnly = scope === "series" && body.scheduledDate === undefined && body.scheduledTime === undefined && body.recurrence === undefined;
     const seriesStart = remindersOnly ? String(root?.scheduled_date ?? item.scheduledDate) : item.scheduledDate;
-    const dates = wholeSeries && item.recurrence && seriesStart ? occurrenceDates(seriesStart, item.recurrence) : [];
+    const dates = wholeSeries && item.recurrence && seriesStart
+      ? occurrenceDates(seriesStart, item.recurrence, reminderLeadDays(JSON.stringify(item.reminders)))
+      : [];
     if (dates.length > 0) {
       targets.forEach((target, index) => {
         if (index < dates.length) write(String(target.id), String(target.id) === series, dates[index]);
@@ -245,7 +267,7 @@ export function saveItem(userId: string, body: Record<string, unknown>, id?: str
         const splitRule: RecurrenceRule = item.recurrence.end.type === "count"
           ? { ...item.recurrence,end:{type:"count",count:Math.max(1,item.recurrence.end.count-earlierCount)} }
           : item.recurrence;
-        const followingDates = occurrenceDates(item.scheduledDate ?? existing.scheduledDate,splitRule);
+        const followingDates = occurrenceDates(item.scheduledDate ?? existing.scheduledDate, splitRule, reminderLeadDays(JSON.stringify(item.reminders)));
         targets.forEach((target,index) => {
           if (index < followingDates.length) db.prepare("UPDATE items SET scheduled_date=?,series_root_id=?,occurrence_date=?,recurrence_json=? WHERE id=?")
             .run(followingDates[index],id,followingDates[index],index===0?JSON.stringify(splitRule):null,target.id);
@@ -276,7 +298,44 @@ export function saveItem(userId: string, body: Record<string, unknown>, id?: str
   return getItem(userId, id);
 }
 
-export function deleteItem(userId: string, id: string) {
-  const result = database().prepare("DELETE FROM items WHERE user_id=? AND id=?").run(userId,id);
-  if (!result.changes) throw new HttpError(404, "This item could not be found.");
+export function deleteItem(userId: string, id: string, scope?: unknown) {
+  const db = database();
+  const item = getItem(userId, id);
+  if (!item.seriesId) {
+    db.prepare("DELETE FROM items WHERE user_id=? AND id=?").run(userId, id);
+    return;
+  }
+  if (scope !== "occurrence" && scope !== "following" && scope !== "series") {
+    throw new HttpError(400, "Choose whether to delete this Occurrence, following Occurrences, or the whole series.");
+  }
+  const rootId = item.seriesId;
+  if (scope === "series" || (scope === "following" && id === rootId)) {
+    db.prepare("DELETE FROM items WHERE user_id=? AND id=?").run(userId, rootId);
+    return;
+  }
+  const selectedDate = item.occurrenceDate ?? item.scheduledDate;
+  if (!selectedDate) throw new HttpError(400, "This Occurrence has no scheduled date.");
+  if (scope === "occurrence") {
+    db.prepare("INSERT OR IGNORE INTO occurrence_exclusions(user_id,series_root_id,occurrence_date) VALUES(?,?,?)").run(userId, rootId, selectedDate);
+    if (id !== rootId) db.prepare("DELETE FROM items WHERE user_id=? AND id=?").run(userId, id);
+    else {
+      const root = db.prepare("SELECT recurrence_json FROM items WHERE user_id=? AND id=?").get(userId, rootId);
+      const rule = json<RecurrenceRule | null>(root?.recurrence_json, null);
+      if (rule?.end.type === "count" && rule.end.count <= 1) db.prepare("DELETE FROM items WHERE user_id=? AND id=?").run(userId, rootId);
+    }
+    return;
+  }
+  const previous = db.prepare(`SELECT occurrence_date FROM items WHERE user_id=? AND series_root_id=? AND occurrence_date<?
+    ORDER BY occurrence_date DESC LIMIT 1`).get(userId, rootId, selectedDate);
+  if (!previous) {
+    db.prepare("DELETE FROM items WHERE user_id=? AND id=?").run(userId, rootId);
+    return;
+  }
+  const root = db.prepare("SELECT recurrence_json FROM items WHERE user_id=? AND id=?").get(userId, rootId);
+  const rule = json<RecurrenceRule | null>(root?.recurrence_json, null);
+  if (!rule) throw new HttpError(400, "The Recurrence rule could not be found.");
+  const shortened: RecurrenceRule = { ...rule, end: { type: "date", date: String(previous.occurrence_date) } };
+  db.prepare("UPDATE items SET recurrence_json=?,updated_at=? WHERE user_id=? AND id=?")
+    .run(JSON.stringify(shortened), new Date().toISOString(), userId, rootId);
+  db.prepare("DELETE FROM items WHERE user_id=? AND series_root_id=? AND occurrence_date>=?").run(userId, rootId, selectedDate);
 }

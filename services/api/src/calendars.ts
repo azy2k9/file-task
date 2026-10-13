@@ -9,6 +9,19 @@ type Provider = "google" | "apple";
 type Connection = { user_id: string; provider: Provider; account_label: string; access_token: string | null; refresh_token: string | null; calendar_url: string | null; expires_at: number | null };
 type EventItem = ReturnType<typeof listItems>[number];
 
+function googleApiUrl(path: string) {
+  const origin = (process.env.FILETASKS_GOOGLE_API_ORIGIN || "https://www.googleapis.com").replace(/\/+$/, "");
+  return new URL(path.replace(/^\/+/, ""), `${origin}/`);
+}
+
+function googleTokenUrl() {
+  return process.env.FILETASKS_GOOGLE_TOKEN_URL || "https://oauth2.googleapis.com/token";
+}
+
+function appleCalDavOrigin() {
+  return process.env.FILETASKS_APPLE_CALDAV_ORIGIN || "https://caldav.icloud.com/";
+}
+
 function encryptionKey() {
   const raw = process.env.FILETASKS_CALENDAR_ENCRYPTION_KEY;
   if (!raw) throw new HttpError(503, "Calendar connections need FILETASKS_CALENDAR_ENCRYPTION_KEY configured on the server.");
@@ -18,7 +31,14 @@ function encryptionKey() {
 }
 
 function isAppleCalDavHost(hostname: string) {
-  return hostname === "icloud.com" || hostname.endsWith(".icloud.com") || hostname === "apple.com" || hostname.endsWith(".apple.com");
+  const configuredHost = process.env.FILETASKS_APPLE_CALDAV_ORIGIN ? new URL(process.env.FILETASKS_APPLE_CALDAV_ORIGIN).hostname : null;
+  return hostname === configuredHost || hostname === "icloud.com" || hostname.endsWith(".icloud.com") || hostname === "apple.com" || hostname.endsWith(".apple.com");
+}
+
+function isAllowedAppleUrl(url: URL) {
+  const configured = process.env.FILETASKS_APPLE_CALDAV_ORIGIN ? new URL(process.env.FILETASKS_APPLE_CALDAV_ORIGIN) : null;
+  const configuredOrigin = configured && url.origin === configured.origin;
+  return isAppleCalDavHost(url.hostname) && (url.protocol === "https:" || configuredOrigin);
 }
 
 function encrypt(value: string) {
@@ -46,7 +66,7 @@ export function createGoogleAuthorization(userId: string) {
   const state = randomBytes(32).toString("base64url");
   database().prepare("DELETE FROM calendar_oauth_states WHERE expires_at <= ?").run(Date.now());
   database().prepare("INSERT INTO calendar_oauth_states(state,user_id,expires_at) VALUES(?,?,?)").run(state,userId,Date.now()+10*60_000);
-  const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  const url = new URL(process.env.FILETASKS_GOOGLE_AUTH_URL || "https://accounts.google.com/o/oauth2/v2/auth");
   url.searchParams.set("client_id", clientId); url.searchParams.set("redirect_uri", redirectUri);
   url.searchParams.set("response_type", "code"); url.searchParams.set("scope", "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly");
   url.searchParams.set("access_type", "offline"); url.searchParams.set("prompt", "consent"); url.searchParams.set("state", state);
@@ -61,11 +81,11 @@ export async function finishGoogleAuthorization(state: string, code: string) {
   const clientId = process.env.GOOGLE_CALENDAR_CLIENT_ID!; const clientSecret = process.env.GOOGLE_CALENDAR_CLIENT_SECRET!;
   const redirectUri = process.env.GOOGLE_CALENDAR_REDIRECT_URI!;
   if (!clientSecret) throw new HttpError(503, "Configure Google Calendar OAuth on the server before connecting an account.");
-  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ code, client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri, grant_type: "authorization_code" }) });
+  const tokenResponse = await fetch(googleTokenUrl(), { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ code, client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri, grant_type: "authorization_code" }) });
   if (!tokenResponse.ok) throw new HttpError(502, "Google Calendar could not complete the connection.");
   const tokens = await tokenResponse.json() as { access_token?: string; refresh_token?: string; expires_in?: number };
   if (!tokens.access_token) throw new HttpError(502, "Google did not return an access token.");
-  const calendarResponse = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary", { headers: { Authorization: `Bearer ${tokens.access_token}` } });
+  const calendarResponse = await fetch(googleApiUrl("calendar/v3/calendars/primary"), { headers: { Authorization: `Bearer ${tokens.access_token}` } });
   if (!calendarResponse.ok) throw new HttpError(502, "Could not read the primary Google Calendar.");
   const calendar = await calendarResponse.json() as { id?: string; summary?: string };
   const previous = db.prepare("SELECT refresh_token FROM calendar_connections WHERE user_id=? AND provider='google'").get(stateRow.user_id);
@@ -85,7 +105,7 @@ export async function connectAppleCalendar(userId: string, body: Record<string, 
   let discoveredLabel: string | null = null;
   if (!calendarUrl) {
     const propfind = (properties: string) => `<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop>${properties}</d:prop></d:propfind>`;
-    const discovery = await fetch("https://caldav.icloud.com/",{method:"PROPFIND",headers:{Authorization:authorization,Depth:"0","Content-Type":"application/xml; charset=utf-8"},body:propfind("<d:current-user-principal/>")});
+    const discovery = await fetch(appleCalDavOrigin(),{method:"PROPFIND",headers:{Authorization:authorization,Depth:"0","Content-Type":"application/xml; charset=utf-8"},body:propfind("<d:current-user-principal/>")});
     if (!isAppleCalDavHost(new URL(discovery.url).hostname)) throw new HttpError(502,"Apple CalDAV redirected to an untrusted host.");
     if (discovery.status === 401 || discovery.status === 403) throw new HttpError(400,"Apple Calendar rejected the Apple ID or app-specific password.");
     if (!discovery.ok && discovery.status !== 207) throw new HttpError(502,"Apple CalDAV could not discover the account calendar.");
@@ -115,7 +135,7 @@ export async function connectAppleCalendar(userId: string, body: Record<string, 
   }
   let url: URL;
   try { url = new URL(calendarUrl); } catch { throw new HttpError(400,"Enter a valid CalDAV calendar URL."); }
-  if (url.protocol !== "https:" || !isAppleCalDavHost(url.hostname)) throw new HttpError(400,"Use an HTTPS Apple iCloud CalDAV calendar URL.");
+  if (!isAllowedAppleUrl(url)) throw new HttpError(400,"Use an HTTPS Apple iCloud CalDAV calendar URL.");
   const label = typeof body.accountLabel === "string" && body.accountLabel.trim() ? body.accountLabel.trim().slice(0,120) : discoveredLabel || body.username.trim();
   const validation = await fetch(url, { method: "PROPFIND", headers: { Authorization: authorization, Depth: "0", "Content-Type": "application/xml; charset=utf-8" }, body: `<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>` });
   if (validation.status === 401 || validation.status === 403) throw new HttpError(400, "Apple Calendar rejected the Apple ID or app-specific password.");
@@ -192,7 +212,7 @@ function rruleFor(rule: NonNullable<EventItem["recurrence"]>) {
 async function googleAccess(connection: Connection) {
   if (connection.expires_at && connection.expires_at > Date.now() && connection.access_token) return decrypt(connection.access_token);
   if (!connection.refresh_token) throw new HttpError(503, "Reconnect Google Calendar to continue syncing.");
-  const response = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: process.env.GOOGLE_CALENDAR_CLIENT_ID ?? "", client_secret: process.env.GOOGLE_CALENDAR_CLIENT_SECRET ?? "", refresh_token: decrypt(connection.refresh_token), grant_type: "refresh_token" }) });
+  const response = await fetch(googleTokenUrl(), { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: process.env.GOOGLE_CALENDAR_CLIENT_ID ?? "", client_secret: process.env.GOOGLE_CALENDAR_CLIENT_SECRET ?? "", refresh_token: decrypt(connection.refresh_token), grant_type: "refresh_token" }) });
   if (!response.ok) throw new HttpError(502, "Google Calendar authorization expired. Reconnect the calendar.");
   const tokens = await response.json() as { access_token: string; expires_in: number };
   database().prepare("UPDATE calendar_connections SET access_token=?,expires_at=? WHERE user_id=? AND provider='google'").run(encrypt(tokens.access_token),Date.now()+(tokens.expires_in-60)*1000,connection.user_id);
@@ -236,7 +256,7 @@ async function importGoogleEvents(connection: Connection) {
   const now = new Date(); const timeMin = new Date(now.getTime()-90*86_400_000).toISOString(); const timeMax = new Date(now.getTime()+370*86_400_000).toISOString();
   let pageToken: string | undefined; let imported = 0;
   do {
-    const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events`);
+    const url = googleApiUrl(`calendar/v3/calendars/${calendarId}/events`);
     url.searchParams.set("singleEvents","false"); url.searchParams.set("maxResults","2500"); url.searchParams.set("timeMin",timeMin); url.searchParams.set("timeMax",timeMax);
     if (pageToken) url.searchParams.set("pageToken",pageToken);
     const response = await fetch(url,{ headers: { Authorization: `Bearer ${access}` } });
@@ -302,16 +322,16 @@ async function syncGoogle(connection: Connection, events: EventItem[]) {
   const roots = events.filter((item) => !item.seriesId || item.id === item.seriesId);
   const liveIds = new Set(roots.map((item) => item.id));
   for (const [itemId, eventId] of maps) if (!liveIds.has(itemId)) {
-    await fetch(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(eventId)}`, { method: "DELETE", headers: { Authorization: `Bearer ${access}` } });
+    await fetch(googleApiUrl(`calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(eventId)}`), { method: "DELETE", headers: { Authorization: `Bearer ${access}` } });
     database().prepare("DELETE FROM calendar_copies WHERE user_id=? AND provider='google' AND item_id=?").run(connection.user_id,itemId);
   }
   for (const item of roots) {
-    const mapped = maps.get(item.id); const url = `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events${mapped ? `/${encodeURIComponent(mapped)}` : ""}`;
+    const mapped = maps.get(item.id); const url = googleApiUrl(`calendar/v3/calendars/${calendarId}/events${mapped ? `/${encodeURIComponent(mapped)}` : ""}`);
     const event = { summary: item.title, description: `${item.details}${process.env.FILETASKS_PUBLIC_URL || process.env.FILETASKS_ORIGIN ? `\n\nOpen in FileTasks: ${(process.env.FILETASKS_PUBLIC_URL || process.env.FILETASKS_ORIGIN)!.replace(/\/$/,"")}/?event=${encodeURIComponent(item.id)}` : ""}`,
       ...(item.scheduledDate ? item.scheduledTime ? { start: { dateTime: `${item.scheduledDate}T${item.scheduledTime}:00`, timeZone: process.env.FILETASKS_TIME_ZONE || "UTC" }, end: { dateTime: oneHourLater(item.scheduledDate,item.scheduledTime), timeZone: process.env.FILETASKS_TIME_ZONE || "UTC" } } : { start: { date: item.scheduledDate }, end: { date: plusOneDay(item.scheduledDate) } } : {}),
       ...(item.recurrence ? { recurrence: [`RRULE:${rruleFor(item.recurrence)}`] } : {}), extendedProperties: { private: { filetasksItemId: item.id } } };
     let response = await fetch(url, { method: mapped ? "PUT" : "POST", headers: { Authorization: `Bearer ${access}`, "Content-Type": "application/json" }, body: JSON.stringify(event) });
-    if (mapped && response.status === 404) response = await fetch(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events`, { method: "POST", headers: { Authorization: `Bearer ${access}`, "Content-Type": "application/json" }, body: JSON.stringify(event) });
+    if (mapped && response.status === 404) response = await fetch(googleApiUrl(`calendar/v3/calendars/${calendarId}/events`), { method: "POST", headers: { Authorization: `Bearer ${access}`, "Content-Type": "application/json" }, body: JSON.stringify(event) });
     if (!response.ok) throw new HttpError(502, "An Event could not be synchronized to Google Calendar.");
     const saved = await response.json() as { id: string };
     database().prepare(`INSERT INTO calendar_copies(user_id,provider,item_id,external_id) VALUES(?,'google',?,?)
@@ -326,7 +346,7 @@ async function syncGoogle(connection: Connection, events: EventItem[]) {
     const changed = occurrence.scheduledDate !== occurrence.occurrenceDate || occurrence.scheduledTime !== root.scheduledTime
       || occurrence.title !== root.title || occurrence.details !== root.details;
     if (!changed) continue;
-    const instancesUrl = new URL(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(rootEventId)}/instances`);
+    const instancesUrl = googleApiUrl(`calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(rootEventId)}/instances`);
     instancesUrl.searchParams.set("timeMin",min); instancesUrl.searchParams.set("timeMax",max); instancesUrl.searchParams.set("maxResults","2500");
     const instancesResponse = await fetch(instancesUrl,{headers:{Authorization:`Bearer ${access}`}});
     if (!instancesResponse.ok) throw new HttpError(502,"Could not synchronize a recurring Event Occurrence to Google Calendar.");
@@ -335,7 +355,7 @@ async function syncGoogle(connection: Connection, events: EventItem[]) {
     if (!instance) continue;
     const start = occurrence.scheduledTime ? {dateTime:`${occurrence.scheduledDate}T${occurrence.scheduledTime}:00`,timeZone:process.env.FILETASKS_TIME_ZONE||"UTC"} : {date:occurrence.scheduledDate};
     const end = occurrence.scheduledTime ? {dateTime:oneHourLater(occurrence.scheduledDate,occurrence.scheduledTime),timeZone:process.env.FILETASKS_TIME_ZONE||"UTC"} : {date:plusOneDay(occurrence.scheduledDate)};
-    const response = await fetch(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(instance.id)}`,{method:"PATCH",headers:{Authorization:`Bearer ${access}`,"Content-Type":"application/json"},body:JSON.stringify({summary:occurrence.title,description:occurrence.details,start,end})});
+    const response = await fetch(googleApiUrl(`calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(instance.id)}`),{method:"PATCH",headers:{Authorization:`Bearer ${access}`,"Content-Type":"application/json"},body:JSON.stringify({summary:occurrence.title,description:occurrence.details,start,end})});
     if (!response.ok) throw new HttpError(502,"A recurring Event Occurrence could not be synchronized to Google Calendar.");
   }
 }
@@ -348,7 +368,7 @@ async function syncApple(connection: Connection, events: EventItem[]) {
   const roots = events.filter((item) => !item.seriesId || item.id === item.seriesId);
   const liveIds = new Set(roots.map((item) => item.id));
   const resourceUrl = (value: string) => {
-    const url = value.startsWith("https:") ? new URL(value) : new URL(`${connection.calendar_url!.replace(/\/$/,"")}/${encodeURIComponent(value)}.ics`);
+    const url = /^https?:\/\//i.test(value) ? new URL(value) : new URL(`${connection.calendar_url!.replace(/\/$/,"")}/${encodeURIComponent(value)}.ics`);
     if (!isAppleCalDavHost(url.hostname)) throw new HttpError(502,"Apple Calendar returned an untrusted Event location.");
     return url.toString();
   };

@@ -68,7 +68,29 @@ export function database() {
         scheduled_at TEXT NOT NULL, title TEXT NOT NULL, read_at TEXT,
         UNIQUE(item_id,reminder_index,scheduled_at)
       );
+      CREATE TABLE IF NOT EXISTS push_devices (
+        id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        provider_id TEXT NOT NULL, platform TEXT NOT NULL CHECK(platform IN ('web','ios','android')),
+        created_at TEXT NOT NULL, UNIQUE(user_id,provider_id)
+      );
+      CREATE TABLE IF NOT EXISTS reminder_deliveries (
+        id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+        reminder_index INTEGER NOT NULL, channel TEXT NOT NULL CHECK(channel IN ('email','push')),
+        target_id TEXT NOT NULL DEFAULT '', scheduled_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sent')),
+        attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL,
+        sent_at TEXT, last_error TEXT,
+        UNIQUE(item_id,reminder_index,channel,target_id,scheduled_at)
+      );
+      CREATE TABLE IF NOT EXISTS occurrence_exclusions (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        series_root_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+        occurrence_date TEXT NOT NULL,
+        PRIMARY KEY(series_root_id,occurrence_date)
+      );
       CREATE INDEX IF NOT EXISTS items_owner ON items(user_id);
+      CREATE INDEX IF NOT EXISTS reminder_deliveries_pending ON reminder_deliveries(status,next_attempt_at);
       CREATE TABLE IF NOT EXISTS files (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

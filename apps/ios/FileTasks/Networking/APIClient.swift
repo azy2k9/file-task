@@ -60,6 +60,45 @@ struct APIClient {
         return response.files
     }
 
+    func reminderSettings(token: String) async throws -> ReminderSettings {
+        let response: ReminderSettingsResponse = try decode(
+            ReminderSettingsResponse.self,
+            from: try await perform(path: ["api", "settings", "reminders"], method: "GET", token: token)
+        )
+        return response.settings
+    }
+
+    func updateReminderSettings(_ settings: ReminderSettings, token: String, applyToExisting: Bool) async throws -> ReminderSettings {
+        let payload = ReminderSettingsPayload(
+            taskReminders: settings.taskReminders,
+            eventReminders: settings.eventReminders,
+            pushEnabled: settings.pushEnabled,
+            emailEnabled: settings.emailEnabled,
+            applyToExisting: applyToExisting
+        )
+        let response: ReminderSettingsResponse = try decode(
+            ReminderSettingsResponse.self,
+            from: try await perform(
+                path: ["api", "settings", "reminders"], method: "PATCH", token: token,
+                body: try encoder.encode(payload)
+            )
+        )
+        return response.settings
+    }
+
+    func registerPushDevice(platform: String, pushToken: String, authToken: String) async throws -> PushDevice {
+        let payload = PushDevicePayload(platform: platform, token: pushToken)
+        let response: PushDeviceResponse = try decode(
+            PushDeviceResponse.self,
+            from: try await perform(path: ["api", "devices", "push"], method: "POST", token: authToken, body: try encoder.encode(payload))
+        )
+        return response.device
+    }
+
+    func revokePushDevice(id: String, token: String) async throws {
+        _ = try await perform(path: ["api", "devices", "push", id], method: "DELETE", token: token)
+    }
+
     func createLinkFile(name: String, url: String, token: String) async throws -> WorkspaceFile {
         let response: FileResponse = try decode(
             FileResponse.self,
@@ -101,15 +140,15 @@ struct APIClient {
         return completed.file
     }
 
-    func attachFile(id: String, to itemId: String, token: String) async throws {
+    func attachFile(id: String, to itemId: String, scope: EditScope = .occurrence, token: String) async throws {
         _ = try await perform(
             path: ["api", "files", id, "attachments"], method: "POST", token: token,
-            body: try encoder.encode(AttachmentPayload(itemId: itemId))
+            body: try encoder.encode(AttachmentPayload(itemId: itemId, scope: scope.rawValue))
         )
     }
 
-    func removeAttachment(fileId: String, itemId: String, token: String) async throws {
-        _ = try await perform(path: ["api", "files", fileId, "attachments", itemId], method: "DELETE", token: token)
+    func removeAttachment(fileId: String, itemId: String, scope: EditScope = .occurrence, token: String) async throws {
+        _ = try await perform(path: ["api", "files", fileId, "attachments", itemId], method: "DELETE", token: token, queryItems: [URLQueryItem(name: "scope", value: scope.rawValue)])
     }
 
     func deleteFile(id: String, token: String) async throws {
@@ -162,18 +201,26 @@ struct APIClient {
         return response.item
     }
 
-    func deleteItem(id: String, token: String) async throws {
-        _ = try await perform(path: ["api", "items", id], method: "DELETE", token: token)
+    func deleteItem(id: String, scope: EditScope? = nil, token: String) async throws {
+        _ = try await perform(
+            path: ["api", "items", id], method: "DELETE", token: token,
+            queryItems: scope.map { [URLQueryItem(name: "scope", value: $0.rawValue)] } ?? []
+        )
     }
 
     private func perform(
         path: [String],
         method: String,
         token: String? = nil,
-        body: Data? = nil
+        body: Data? = nil,
+        queryItems: [URLQueryItem] = []
     ) async throws -> Data {
-        let url = path.reduce(baseURL) { partialURL, component in
+        var url = path.reduce(baseURL) { partialURL, component in
             partialURL.appendingPathComponent(component)
+        }
+        if !queryItems.isEmpty, var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            components.queryItems = queryItems
+            if let withQuery = components.url { url = withQuery }
         }
         var request = URLRequest(url: url)
         request.httpMethod = method
@@ -252,12 +299,23 @@ private struct CompletionPayload: Encodable {
 }
 
 private struct FilesResponse: Decodable { let files: [WorkspaceFile] }
+private struct ReminderSettingsResponse: Decodable { let settings: ReminderSettings }
+private struct ReminderSettingsPayload: Encodable {
+    let taskReminders: [ReminderRule]
+    let eventReminders: [ReminderRule]
+    let pushEnabled: Bool
+    let emailEnabled: Bool
+    let applyToExisting: Bool
+}
+struct PushDevice: Decodable, Identifiable { let id: String; let platform: String; let createdAt: String }
+private struct PushDeviceResponse: Decodable { let device: PushDevice }
+private struct PushDevicePayload: Encodable { let platform: String; let token: String }
 private struct FileResponse: Decodable { let file: WorkspaceFile }
 private struct UploadTarget: Decodable { let uploadId: String; let uploadUrl: String }
 struct OpenFileTarget: Decodable { let url: String; let name: String; let contentType: String?; let sourceType: String }
 private struct LinkFilePayload: Encodable { let name: String; let url: String }
 private struct UploadPayload: Encodable { let name: String; let contentType: String; let sizeBytes: Int }
-private struct AttachmentPayload: Encodable { let itemId: String }
+private struct AttachmentPayload: Encodable { let itemId: String; let scope: String }
 
 enum APIClientError: LocalizedError {
     case transport(String)

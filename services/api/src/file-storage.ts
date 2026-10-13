@@ -24,6 +24,7 @@ function storage() {
     region: "auto",
     endpoint: process.env.FILETASKS_R2_ENDPOINT || `https://${accountId}.r2.cloudflarestorage.com`,
     credentials: { accessKeyId, secretAccessKey },
+    forcePathStyle: true,
   });
   return { client, bucket };
 }

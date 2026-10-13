@@ -27,7 +27,7 @@ Web authentication sets a `filetasks_session` HttpOnly cookie. Native clients st
 
 Item input: `kind` (`task` or `event`), `title` (1–200 characters after trimming), optional `details` (up to 10,000 characters, default empty), optional `scheduledDate` (`YYYY-MM-DD` or null), and optional `scheduledTime` (`HH:mm` in 24-hour time or null). A time requires a date. The kind cannot change after creation. Only Tasks accept `completed`.
 
-Item input can also include `reminders`, an array of `{delivery,amount,unit,time}` where `delivery` is `notification` or `email`, `unit` is `minutes`, `hours`, `days`, `weeks`, or `months`, and `time` is `HH:mm`. New items inherit their Task or Event Reminder default if this field is omitted. Recurring items accept `recurrence: {interval,unit,weekdays?,end}` where `unit` is `days`, `weeks`, `months`, or `years`; weekly `weekdays` use Sunday `0` through Saturday `6`; `end` is `{type:"never"}`, `{type:"date",date:"YYYY-MM-DD"}`, or `{type:"count",count}`. Patching a recurring item accepts `scope` of `occurrence`, `following`, or `series`. The API materializes scheduled Occurrences through the next 370 days and preserves separate Task completion state and Attachments per Occurrence.
+Item input can also include `reminders`, an array of `{delivery,amount,unit,time}` where `delivery` is `notification` or `email`, `unit` is `minutes`, `hours`, `days`, `weeks`, or `months`, and `time` is `HH:mm`. New items inherit their Task or Event Reminder default if this field is omitted. Recurring items accept `recurrence: {interval,unit,weekdays?,end}` where `unit` is `days`, `weeks`, `months`, or `years`; weekly `weekdays` use Sunday `0` through Saturday `6`; `end` is `{type:"never"}`, `{type:"date",date:"YYYY-MM-DD"}`, or `{type:"count",count}`. Patching a recurring item accepts `scope` of `occurrence`, `following`, or `series`. The API keeps at least a 370-day rolling Occurrence horizon and extends it to cover configured Reminder leads, then preserves separate Task completion state and Attachments per Occurrence.
 
 PATCH preserves omitted fields. Send explicit nulls to remove date/time; send both nulls when removing a dated item's schedule. Changing completion alone must send only `{completed}` to preserve edits from other clients. Dates use the Gregorian calendar and have no timezone conversion. Concurrent field edits use the last saved value.
 
@@ -81,6 +81,9 @@ Uploaded bytes move directly between the client and Cloudflare R2. The client fi
 | PATCH | `/api/settings/reminders` | `{taskReminders,eventReminders,pushEnabled,emailEnabled,applyToExisting}` | 200 `{settings}` |
 | GET | `/api/notifications` | — | 200 `{notifications}` for due in-app Reminders |
 | PATCH | `/api/notifications/{id}` | — | 200 `{success:true}` marks a Notification read |
+| POST | `/api/devices/push` | `{platform:"web"|"ios"|"android",token}` | 201 `{device:{id,platform,createdAt}}` |
+| DELETE | `/api/devices/push/{id}` | — | 204; revokes this device registration |
+| POST | `/api/internal/reminders/deliver` | — | 200 `{attempted,sent,failed}`; worker-only |
 | GET | `/api/calendars` | — | 200 `{calendars}` |
 | GET | `/api/calendars/google/connect` | — | Redirects to Google OAuth |
 | GET | `/api/calendars/google/callback` | OAuth callback | Redirects back to the app |
@@ -89,3 +92,9 @@ Uploaded bytes move directly between the client and Cloudflare R2. The client fi
 | DELETE | `/api/calendars/{google|apple}` | — | 204 |
 
 Calendar credentials are encrypted at rest. Set `FILETASKS_CALENDAR_ENCRYPTION_KEY` to a private 32-byte base64 or hex key. Google requires OAuth client ID, secret, and callback URL settings. Apple Calendar uses an Apple ID app-specific password; CalDAV discovery runs from iCloud unless a calendar collection URL is supplied. Sync imports Events once, then FileTasks is authoritative: external edits are replaced by FileTasks values and missing Calendar copies are recreated. Configure `FILETASKS_PUBLIC_URL` or `FILETASKS_ORIGIN` for backlinks, and `FILETASKS_TIME_ZONE` for Google timed Event copies.
+
+Reminder delivery runs in the background; reading Notifications does not trigger delivery. Schedule the worker endpoint every minute and send `Authorization: Bearer $FILETASKS_REMINDER_WORKER_SECRET`. Configure `FILETASKS_EMAIL_DELIVERY_URL` and/or `FILETASKS_PUSH_DELIVERY_URL` to enable those methods; settings responses include `emailAvailable` and `pushAvailable`, and unavailable methods cannot be enabled. Optional adapter bearer tokens use `FILETASKS_EMAIL_DELIVERY_TOKEN` and `FILETASKS_PUSH_DELIVERY_TOKEN`. Endpoints must use HTTPS except for localhost development.
+
+The email adapter receives `POST` JSON `{operation:"deliver",recipient:{email},reminder:{itemId,title,scheduledAt,rule}}`. The push adapter receives `operation:"register"` with `{userId,platform,token}` and must return `{registrationId}`, `operation:"revoke"` with `{registrationId}`, and `operation:"deliver"` with `{registrationId,reminder}`. Each request includes an `Idempotency-Key`; adapters must deduplicate repeated keys because failed jobs retry with the same key and exponential backoff. The database stores only the adapter's opaque registration ID. Web clients register a Push API subscription when Push is enabled; iOS and Android clients can register their APNs/FCM tokens through the same endpoint. The push service owns provider credentials and token handling.
+
+For web Push, set `NEXT_PUBLIC_FILETASKS_VAPID_PUBLIC_KEY` at client build time to the public key expected by the push adapter. The matching private key stays with that adapter. The worker at `apps/web/public/filetasks-sw.js` displays the reminder and opens the relevant item when clicked.

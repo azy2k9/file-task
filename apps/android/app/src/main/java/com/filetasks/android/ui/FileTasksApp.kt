@@ -6,6 +6,7 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -33,6 +34,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -61,6 +63,10 @@ import com.filetasks.android.data.ApiException
 import com.filetasks.android.data.ItemFields
 import com.filetasks.android.data.ItemKind
 import com.filetasks.android.data.FileAttachment
+import com.filetasks.android.data.RecurrenceEnd
+import com.filetasks.android.data.RecurrenceRule
+import com.filetasks.android.data.ReminderRule
+import com.filetasks.android.data.ReminderSettings
 import com.filetasks.android.data.TokenStore
 import com.filetasks.android.data.WorkspaceFile
 import com.filetasks.android.data.WorkspaceFileSummary
@@ -100,6 +106,7 @@ fun FileTasksApp(context: Context) {
         var user by remember { mutableStateOf<AccountUser?>(null) }
         var workspaceItems by remember { mutableStateOf(emptyList<WorkspaceItem>()) }
         var workspaceFiles by remember { mutableStateOf(emptyList<WorkspaceFile>()) }
+        var reminderSettings by remember { mutableStateOf(ReminderSettings.Empty) }
         var initialLoading by remember { mutableStateOf(true) }
         var working by remember { mutableStateOf(false) }
         var recoveryAvailable by remember { mutableStateOf(false) }
@@ -111,10 +118,13 @@ fun FileTasksApp(context: Context) {
         var itemFilter by rememberSaveable { mutableStateOf(ItemFilter.All.name) }
         var workspaceSection by rememberSaveable { mutableStateOf(WorkspaceSection.Agenda.name) }
         var showSettings by remember { mutableStateOf(false) }
+        var showReminderSettings by remember { mutableStateOf(false) }
         var editorTarget by remember { mutableStateOf<EditorTarget?>(null) }
         var confirmDelete by remember { mutableStateOf<WorkspaceItem?>(null) }
+        var recurringDeleteScope by rememberSaveable { mutableStateOf("occurrence") }
         var confirmDeleteFile by remember { mutableStateOf<WorkspaceFile?>(null) }
         var confirmRemoveAttachment by remember { mutableStateOf<Pair<WorkspaceFile, FileAttachment>?>(null) }
+        var attachmentRemovalScope by rememberSaveable { mutableStateOf("occurrence") }
         var fileToAttach by remember { mutableStateOf<WorkspaceFile?>(null) }
         var showLinkDialog by remember { mutableStateOf(false) }
         var linkName by rememberSaveable { mutableStateOf("") }
@@ -129,6 +139,7 @@ fun FileTasksApp(context: Context) {
                     user = api.session(savedToken)
                     workspaceItems = api.listItems(savedToken)
                     workspaceFiles = api.listFiles(savedToken)
+                    reminderSettings = api.reminderSettings(savedToken)
                 } catch (failure: Exception) {
                     if (failure is ApiException && failure.statusCode == 401) {
                         withContext(Dispatchers.IO) { tokenStore.clear() }
@@ -136,6 +147,7 @@ fun FileTasksApp(context: Context) {
                         user = null
                         workspaceItems = emptyList()
                         workspaceFiles = emptyList()
+                        reminderSettings = ReminderSettings.Empty
                     } else {
                         recoveryAvailable = true
                         errorMessage = readableError(failure)
@@ -159,6 +171,7 @@ fun FileTasksApp(context: Context) {
                         user = null
                         workspaceItems = emptyList()
                         workspaceFiles = emptyList()
+                        reminderSettings = ReminderSettings.Empty
                         recoveryAvailable = false
                         editorTarget = null
                         confirmDelete = null
@@ -197,6 +210,7 @@ fun FileTasksApp(context: Context) {
                 val api = ApiClient(apiBaseUrl)
                 workspaceItems = api.listItems(currentToken)
                 workspaceFiles = api.listFiles(currentToken)
+                reminderSettings = api.reminderSettings(currentToken)
             }
         }
 
@@ -211,6 +225,7 @@ fun FileTasksApp(context: Context) {
                 user = null
                 workspaceItems = emptyList()
                 workspaceFiles = emptyList()
+                reminderSettings = ReminderSettings.Empty
                 recoveryAvailable = false
             }
         }
@@ -245,6 +260,7 @@ fun FileTasksApp(context: Context) {
                     try {
                         workspaceItems = api.listItems(newToken)
                         workspaceFiles = api.listFiles(newToken)
+                        reminderSettings = api.reminderSettings(newToken)
                     } catch (failure: Exception) {
                         if (failure is ApiException && failure.statusCode == 401) {
                             withContext(Dispatchers.IO) { tokenStore.clear() }
@@ -252,6 +268,7 @@ fun FileTasksApp(context: Context) {
                             user = null
                             workspaceItems = emptyList()
                             workspaceFiles = emptyList()
+                            reminderSettings = ReminderSettings.Empty
                             authError = readableError(failure)
                         } else {
                             errorMessage = readableError(failure)
@@ -274,6 +291,7 @@ fun FileTasksApp(context: Context) {
                     user = api.session(currentToken)
                     workspaceItems = api.listItems(currentToken)
                     workspaceFiles = api.listFiles(currentToken)
+                    reminderSettings = api.reminderSettings(currentToken)
                     recoveryAvailable = false
                 } catch (failure: ApiException) {
                     if (failure.statusCode == 401) {
@@ -282,6 +300,7 @@ fun FileTasksApp(context: Context) {
                         user = null
                         workspaceItems = emptyList()
                         workspaceFiles = emptyList()
+                        reminderSettings = ReminderSettings.Empty
                         recoveryAvailable = false
                     }
                     throw failure
@@ -307,22 +326,22 @@ fun FileTasksApp(context: Context) {
             }
         }
 
-        fun addAttachment(file: WorkspaceFile, item: WorkspaceItem) {
+        fun addAttachment(file: WorkspaceFile, item: WorkspaceItem, attachmentScope: String = "occurrence") {
             val currentToken = token ?: return
             runAction {
                 val api = ApiClient(apiBaseUrl)
-                api.attachFile(currentToken, file, item)
+                api.attachFile(currentToken, file, item, attachmentScope)
                 workspaceFiles = api.listFiles(currentToken)
                 workspaceItems = api.listItems(currentToken)
                 fileToAttach = null
             }
         }
 
-        fun removeAttachment(file: WorkspaceFile, attachment: FileAttachment) {
+        fun removeAttachment(file: WorkspaceFile, attachment: FileAttachment, attachmentScope: String = "occurrence") {
             val currentToken = token ?: return
             runAction {
                 val api = ApiClient(apiBaseUrl)
-                api.removeAttachment(currentToken, file, attachment)
+                api.removeAttachment(currentToken, file, attachment, attachmentScope)
                 workspaceFiles = api.listFiles(currentToken)
                 workspaceItems = api.listItems(currentToken)
                 confirmRemoveAttachment = null
@@ -389,6 +408,7 @@ fun FileTasksApp(context: Context) {
                 user = user!!,
                 items = workspaceItems,
                 files = workspaceFiles,
+                reminderSettings = reminderSettings,
                 filter = itemFilter,
                 section = workspaceSection,
                 isBusy = working,
@@ -398,6 +418,7 @@ fun FileTasksApp(context: Context) {
                 onRefresh = ::refreshItems,
                 onSignOut = ::signOut,
                 onSettings = { showSettings = true },
+                onReminderSettings = { showReminderSettings = true },
                 onCreate = { editorTarget = EditorTarget(null) },
                 onEdit = { editorTarget = EditorTarget(it) },
                 onDelete = { confirmDelete = it },
@@ -431,6 +452,7 @@ fun FileTasksApp(context: Context) {
         editorTarget?.let { target ->
             ItemEditorDialog(
                 item = target.item,
+                reminderSettings = reminderSettings,
                 isBusy = working,
                 onDismiss = { editorTarget = null },
                 onSave = { fields ->
@@ -474,7 +496,19 @@ fun FileTasksApp(context: Context) {
             AlertDialog(
                 onDismissRequest = { if (!working) confirmDelete = null },
                 title = { Text("Delete ${item.kind.displayName.lowercase()}?") },
-                text = { Text("“${item.title}” will be removed from your workspace.") },
+                text = {
+                    Column {
+                        Text("“${item.title}” will be removed from your workspace.")
+                        if (item.seriesId != null) {
+                            listOf("occurrence" to "This Occurrence", "following" to "This and following Occurrences", "series" to "Whole series").forEach { (scope, label) ->
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    RadioButton(selected = recurringDeleteScope == scope, onClick = { recurringDeleteScope = scope }, enabled = !working)
+                                    Text(label, modifier = Modifier.clickable(enabled = !working) { recurringDeleteScope = scope })
+                                }
+                            }
+                        }
+                    }
+                },
                 confirmButton = {
                     Button(
                         enabled = !working,
@@ -482,9 +516,11 @@ fun FileTasksApp(context: Context) {
                             val currentToken = token
                             if (currentToken != null) {
                                 runAction {
-                                    ApiClient(apiBaseUrl).deleteItem(currentToken, item)
-                                    workspaceItems = workspaceItems.filterNot { it.id == item.id }
-                                    workspaceFiles = ApiClient(apiBaseUrl).listFiles(currentToken)
+                                    val api = ApiClient(apiBaseUrl)
+                                    api.deleteItem(currentToken, item, if (item.seriesId == null) null else recurringDeleteScope)
+                                    workspaceItems = api.listItems(currentToken)
+                                    workspaceFiles = api.listFiles(currentToken)
+                                    reminderSettings = api.reminderSettings(currentToken)
                                     confirmDelete = null
                                 }
                             }
@@ -524,8 +560,15 @@ fun FileTasksApp(context: Context) {
                     Column(Modifier.fillMaxWidth().heightIn(max = 400.dp).verticalScroll(rememberScrollState())) {
                         if (availableItems.isEmpty()) Text("Every Task and Event already has this File attached.")
                         availableItems.forEach { item ->
-                            TextButton(enabled = !working, onClick = { addAttachment(file, item) }) {
-                                Text("${item.kind.displayName}: ${item.title}")
+                            if (item.seriesId != null) {
+                                Text("${item.kind.displayName}: ${item.title}", style = MaterialTheme.typography.labelLarge)
+                                TextButton(enabled = !working, onClick = { addAttachment(file, item, "occurrence") }) { Text("This Occurrence") }
+                                TextButton(enabled = !working, onClick = { addAttachment(file, item, "following") }) { Text("This and following Occurrences") }
+                                TextButton(enabled = !working, onClick = { addAttachment(file, item, "series") }) { Text("Whole series") }
+                            } else {
+                                TextButton(enabled = !working, onClick = { addAttachment(file, item) }) {
+                                    Text("${item.kind.displayName}: ${item.title}")
+                                }
                             }
                         }
                     }
@@ -541,10 +584,24 @@ fun FileTasksApp(context: Context) {
                 text = {
                     Column {
                         Text("Remove ${file.name} from ${attachment.itemKind.displayName} “${attachment.itemTitle}” only, or delete the File from your Files section.")
+                        if (attachment.scope == "series" || attachment.scope == "following") {
+                            listOf("occurrence" to "This Occurrence", "following" to "This and following Occurrences").forEach { (scope, label) ->
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    RadioButton(selected = attachmentRemovalScope == scope, onClick = { attachmentRemovalScope = scope }, enabled = !working)
+                                    Text(label, modifier = Modifier.clickable(enabled = !working) { attachmentRemovalScope = scope })
+                                }
+                            }
+                            if (attachment.scope == "series") {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    RadioButton(selected = attachmentRemovalScope == "series", onClick = { attachmentRemovalScope = "series" }, enabled = !working)
+                                    Text("Whole series", modifier = Modifier.clickable(enabled = !working) { attachmentRemovalScope = "series" })
+                                }
+                            }
+                        }
                         if (file.attachments.size > 1) Text("Deleting this File removes it from ${file.attachments.size} Tasks or Events.", color = MaterialTheme.colorScheme.error)
                     }
                 },
-                confirmButton = { TextButton(enabled = !working, onClick = { removeAttachment(file, attachment) }) { Text("Remove Attachment") } },
+                confirmButton = { TextButton(enabled = !working, onClick = { removeAttachment(file, attachment, if (attachment.scope == "series" || attachment.scope == "following") attachmentRemovalScope else "occurrence") }) { Text("Remove Attachment") } },
                 dismissButton = {
                     Row {
                         TextButton(enabled = !working, onClick = { removeFile(file) }) { Text("Delete File", color = MaterialTheme.colorScheme.error) }
@@ -592,6 +649,7 @@ fun FileTasksApp(context: Context) {
                                 user = null
                                 workspaceItems = emptyList()
                                 workspaceFiles = emptyList()
+                                reminderSettings = ReminderSettings.Empty
                                 recoveryAvailable = false
                                 errorMessage = "Server changed. Sign in to continue."
                             } finally {
@@ -599,6 +657,28 @@ fun FileTasksApp(context: Context) {
                                 operationMutex.unlock()
                             }
                         }
+                    }
+                },
+            )
+        }
+
+        if (showReminderSettings) {
+            ReminderSettingsDialog(
+                initial = reminderSettings,
+                isBusy = working,
+                onDismiss = { showReminderSettings = false },
+                onSave = { updated, applyToExisting ->
+                    if (!operationMutex.tryLock()) throw IllegalStateException("Please wait for the current request to finish.")
+                    working = true
+                    try {
+                        val currentToken = token ?: throw IllegalStateException("Sign in to update Reminder settings.")
+                        val api = ApiClient(apiBaseUrl)
+                        reminderSettings = api.updateReminderSettings(currentToken, updated, applyToExisting)
+                        workspaceItems = api.listItems(currentToken)
+                        showReminderSettings = false
+                    } finally {
+                        working = false
+                        operationMutex.unlock()
                     }
                 },
             )
@@ -686,6 +766,7 @@ private fun WorkspaceScreen(
     user: AccountUser,
     items: List<WorkspaceItem>,
     files: List<WorkspaceFile>,
+    reminderSettings: ReminderSettings,
     filter: String,
     section: String,
     isBusy: Boolean,
@@ -695,6 +776,7 @@ private fun WorkspaceScreen(
     onRefresh: () -> Unit,
     onSignOut: () -> Unit,
     onSettings: () -> Unit,
+    onReminderSettings: () -> Unit,
     onCreate: () -> Unit,
     onEdit: (WorkspaceItem) -> Unit,
     onDelete: (WorkspaceItem) -> Unit,
@@ -747,6 +829,7 @@ private fun WorkspaceScreen(
                     }
                     TextButton(onClick = onRefresh, enabled = !isBusy) { Text("Refresh") }
                     TextButton(onClick = onSettings, enabled = !isBusy) { Text("Server") }
+                    TextButton(onClick = onReminderSettings, enabled = !isBusy) { Text("Reminders") }
                     TextButton(onClick = onSignOut, enabled = !isBusy) { Text("Sign out") }
                 }
                 Spacer(Modifier.height(12.dp))
@@ -1015,6 +1098,7 @@ private fun queryFileMetadata(context: Context, uri: Uri): SelectedFileMetadata 
 @Composable
 private fun ItemEditorDialog(
     item: WorkspaceItem?,
+    reminderSettings: ReminderSettings,
     isBusy: Boolean,
     onDismiss: () -> Unit,
     onSave: suspend (ItemFields) -> Unit,
@@ -1025,6 +1109,16 @@ private fun ItemEditorDialog(
     var details by rememberSaveable(item?.id) { mutableStateOf(item?.details.orEmpty()) }
     var date by rememberSaveable(item?.id) { mutableStateOf(item?.scheduledDate.orEmpty()) }
     var time by rememberSaveable(item?.id) { mutableStateOf(item?.scheduledTime.orEmpty()) }
+    var recurrence by remember(item?.id) { mutableStateOf(item?.recurrence) }
+    var recurrenceEndType by rememberSaveable(item?.id) { mutableStateOf(item?.recurrence?.end?.type ?: "never") }
+    var recurrenceEndDate by rememberSaveable(item?.id) { mutableStateOf((item?.recurrence?.end?.date).orEmpty()) }
+    var recurrenceCount by rememberSaveable(item?.id) { mutableStateOf((item?.recurrence?.end?.count ?: 10).toString()) }
+    var weekdays by remember(item?.id) { mutableStateOf((item?.recurrence?.weekdays ?: emptyList()).toSet()) }
+    var reminders by remember(item?.id) {
+        mutableStateOf(item?.reminders ?: reminderSettings.taskReminders)
+    }
+    var reminderRowsTouched by remember(item?.id) { mutableStateOf(item != null) }
+    var editScope by rememberSaveable(item?.id) { mutableStateOf("occurrence") }
     var validationError by remember { mutableStateOf<String?>(null) }
     var saving by remember { mutableStateOf(false) }
 
@@ -1040,13 +1134,19 @@ private fun ItemEditorDialog(
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(
                         selected = kind == ItemKind.Task,
-                        onClick = { kindValue = ItemKind.Task.wireValue },
+                        onClick = {
+                            kindValue = ItemKind.Task.wireValue
+                            if (item == null && !reminderRowsTouched) reminders = reminderSettings.taskReminders
+                        },
                         enabled = item == null && !saving && !isBusy,
                         label = { Text("Task") },
                     )
                     FilterChip(
                         selected = kind == ItemKind.Event,
-                        onClick = { kindValue = ItemKind.Event.wireValue },
+                        onClick = {
+                            kindValue = ItemKind.Event.wireValue
+                            if (item == null && !reminderRowsTouched) reminders = reminderSettings.eventReminders
+                        },
                         enabled = item == null && !saving && !isBusy,
                         label = { Text("Event") },
                     )
@@ -1090,6 +1190,78 @@ private fun ItemEditorDialog(
                     enabled = !saving && !isBusy,
                 )
                 Text("A time needs a date. Leave both fields empty for an undated item.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = recurrence != null, onCheckedChange = { enabled ->
+                        if (enabled && date.isNotBlank()) {
+                            val weekday = runCatching { LocalDate.parse(date).dayOfWeek.value % 7 }.getOrDefault(0)
+                            weekdays = setOf(weekday)
+                            recurrence = RecurrenceRule(1, "weeks", listOf(weekday), RecurrenceEnd("never"))
+                        } else recurrence = null
+                    }, enabled = !saving && !isBusy && date.isNotBlank())
+                    Text("Repeat")
+                }
+                recurrence?.let { rule ->
+                    OutlinedTextField(
+                        value = rule.interval.toString(),
+                        onValueChange = { value -> recurrence = recurrence?.copy(interval = value.toIntOrNull()?.coerceIn(1, 100) ?: 1) },
+                        modifier = Modifier.fillMaxWidth(), label = { Text("Repeat interval") }, singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), enabled = !saving && !isBusy,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                        listOf("days", "weeks", "months", "years").forEach { unit ->
+                            FilterChip(selected = rule.unit == unit, onClick = {
+                                recurrence = recurrence?.copy(unit = unit, weekdays = if (unit == "weeks") (weekdays.ifEmpty { setOf(0) }).sorted() else null)
+                            }, enabled = !saving && !isBusy, label = { Text(unit) })
+                        }
+                    }
+                    if (rule.unit == "weeks") {
+                        Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                            listOf("S", "M", "T", "W", "T", "F", "S").forEachIndexed { day, label ->
+                                FilterChip(selected = day in weekdays, onClick = {
+                                    weekdays = if (day in weekdays) (weekdays - day).ifEmpty { setOf(day) } else weekdays + day
+                                    recurrence = recurrence?.copy(weekdays = weekdays.sorted())
+                                }, enabled = !saving && !isBusy, label = { Text(label) })
+                            }
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                        listOf("never", "date", "count").forEach { end ->
+                            FilterChip(selected = recurrenceEndType == end, onClick = {
+                                recurrenceEndType = end
+                                recurrence = recurrence?.copy(end = when (end) {
+                                    "date" -> RecurrenceEnd("date", date = recurrenceEndDate.ifBlank { date })
+                                    "count" -> RecurrenceEnd("count", count = recurrenceCount.toIntOrNull() ?: 10)
+                                    else -> RecurrenceEnd("never")
+                                })
+                            }, enabled = !saving && !isBusy, label = { Text(when (end) { "date" -> "On date"; "count" -> "After count"; else -> "Never" }) })
+                        }
+                    }
+                    if (recurrenceEndType == "date") {
+                        OutlinedTextField(value = recurrenceEndDate, onValueChange = {
+                            recurrenceEndDate = it
+                            recurrence = recurrence?.copy(end = RecurrenceEnd("date", date = it))
+                        }, modifier = Modifier.fillMaxWidth(), label = { Text("End date (YYYY-MM-DD)") }, enabled = !saving && !isBusy)
+                    } else if (recurrenceEndType == "count") {
+                        OutlinedTextField(value = recurrenceCount, onValueChange = {
+                            recurrenceCount = it
+                            recurrence = recurrence?.copy(end = RecurrenceEnd("count", count = it.toIntOrNull() ?: 1))
+                        }, modifier = Modifier.fillMaxWidth(), label = { Text("Occurrence count") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), enabled = !saving && !isBusy)
+                    }
+                }
+                if (item?.seriesId != null) {
+                    Text("Apply changes to", style = MaterialTheme.typography.labelLarge)
+                    listOf("occurrence" to "This Occurrence", "following" to "This and following Occurrences", "series" to "Whole series").forEach { (scopeValue, label) ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            RadioButton(selected = editScope == scopeValue, onClick = { editScope = scopeValue }, enabled = !saving && !isBusy)
+                            Text(label, modifier = Modifier.clickable(enabled = !saving && !isBusy) { editScope = scopeValue })
+                        }
+                    }
+                }
+                Text("Reminders", style = MaterialTheme.typography.labelLarge)
+                ReminderRuleEditor(reminders, reminderSettings.emailAvailable && reminderSettings.emailEnabled, !saving && !isBusy) {
+                    reminders = it
+                    reminderRowsTouched = true
+                }
                 validationError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             }
         },
@@ -1102,7 +1274,20 @@ private fun ItemEditorDialog(
                         validationError = fields.reason
                     } else {
                         validationError = null
-                        val validFields = (fields as FieldValidation.Valid).fields
+                        val validFields = (fields as FieldValidation.Valid).fields.copy(
+                            recurrence = if (date.isBlank()) null else recurrence?.let { rule ->
+                                rule.copy(
+                                    weekdays = if (rule.unit == "weeks") weekdays.sorted() else null,
+                                    end = when (recurrenceEndType) {
+                                        "date" -> RecurrenceEnd("date", date = recurrenceEndDate.ifBlank { date })
+                                        "count" -> RecurrenceEnd("count", count = recurrenceCount.toIntOrNull() ?: 1)
+                                        else -> RecurrenceEnd("never")
+                                    },
+                                )
+                            },
+                            reminders = reminders,
+                            scope = if (item?.seriesId != null) editScope else null,
+                        )
                         scope.launch {
                             saving = true
                             try {
@@ -1125,6 +1310,54 @@ private fun ItemEditorDialog(
             TextButton(enabled = !saving && !isBusy, onClick = onDismiss) { Text("Cancel") }
         },
     )
+}
+
+@Composable
+private fun ReminderRuleEditor(
+    reminders: List<ReminderRule>,
+    emailAvailable: Boolean,
+    enabled: Boolean,
+    onChange: (List<ReminderRule>) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        reminders.forEachIndexed { index, reminder ->
+            Text("Reminder ${index + 1}", style = MaterialTheme.typography.labelMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                FilterChip(selected = reminder.delivery == "notification", onClick = {
+                    onChange(reminders.mapIndexed { row, value -> if (row == index) value.copy(delivery = "notification") else value })
+                }, enabled = enabled, label = { Text("Notification") })
+                FilterChip(selected = reminder.delivery == "email", onClick = {
+                    onChange(reminders.mapIndexed { row, value -> if (row == index) value.copy(delivery = "email") else value })
+                }, enabled = enabled && emailAvailable, label = { Text("Email") })
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = reminder.amount.toString(), onValueChange = { value ->
+                        val amount = value.toIntOrNull()?.coerceIn(0, 100_000) ?: 0
+                        onChange(reminders.mapIndexed { row, current -> if (row == index) current.copy(amount = amount) else current })
+                    }, modifier = Modifier.weight(1f), label = { Text("Offset") }, singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), enabled = enabled,
+                )
+                OutlinedTextField(
+                    value = reminder.time, onValueChange = { value ->
+                        onChange(reminders.mapIndexed { row, current -> if (row == index) current.copy(time = value) else current })
+                    }, modifier = Modifier.weight(1f), label = { Text("Clock time") }, singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii), enabled = enabled,
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                listOf("minutes", "hours", "days", "weeks", "months").forEach { unit ->
+                    FilterChip(selected = reminder.unit == unit, onClick = {
+                        onChange(reminders.mapIndexed { row, current -> if (row == index) current.copy(unit = unit) else current })
+                    }, enabled = enabled, label = { Text(unit.take(2)) })
+                }
+            }
+            TextButton(enabled = enabled, onClick = { onChange(reminders.filterIndexed { row, _ -> row != index }) }) { Text("Remove Reminder") }
+        }
+        TextButton(enabled = enabled && reminders.size < 20, onClick = {
+            onChange(reminders + ReminderRule("notification", 1, "days", "09:00"))
+        }) { Text("Add Reminder") }
+    }
 }
 
 @Composable
@@ -1165,6 +1398,61 @@ private fun SettingsDialog(
             }) { Text("Save") }
         },
         dismissButton = { TextButton(enabled = !isBusy, onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun ReminderSettingsDialog(
+    initial: ReminderSettings,
+    isBusy: Boolean,
+    onDismiss: () -> Unit,
+    onSave: suspend (ReminderSettings, Boolean) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var settings by remember(initial) { mutableStateOf(initial) }
+    var applyToExisting by rememberSaveable { mutableStateOf(false) }
+    var saving by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    AlertDialog(
+        onDismissRequest = { if (!saving && !isBusy) onDismiss() },
+        title = { Text("Reminder settings") },
+        text = {
+            Column(Modifier.fillMaxWidth().heightIn(max = 560.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = settings.pushEnabled, onCheckedChange = { settings = settings.copy(pushEnabled = it) }, enabled = !saving && !isBusy && settings.pushAvailable)
+                    Text("Push delivery${if (settings.pushAvailable) "" else " (not configured)"}")
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = settings.emailEnabled, onCheckedChange = { settings = settings.copy(emailEnabled = it) }, enabled = !saving && !isBusy && settings.emailAvailable)
+                    Text("Email delivery${if (settings.emailAvailable) "" else " (not configured)"}")
+                }
+                Text("Task defaults", style = MaterialTheme.typography.titleSmall)
+                ReminderRuleEditor(settings.taskReminders, settings.emailAvailable && settings.emailEnabled, !saving && !isBusy) {
+                    settings = settings.copy(taskReminders = it)
+                }
+                Text("Event defaults", style = MaterialTheme.typography.titleSmall)
+                ReminderRuleEditor(settings.eventReminders, settings.emailAvailable && settings.emailEnabled, !saving && !isBusy) {
+                    settings = settings.copy(eventReminders = it)
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = applyToExisting, onCheckedChange = { applyToExisting = it }, enabled = !saving && !isBusy)
+                    Text("Apply to items still using old defaults")
+                }
+                error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            }
+        },
+        confirmButton = {
+            Button(enabled = !saving && !isBusy, onClick = {
+                scope.launch {
+                    saving = true
+                    error = null
+                    try { onSave(settings, applyToExisting) }
+                    catch (failure: Exception) { error = readableError(failure) }
+                    finally { saving = false }
+                }
+            }) { Text(if (saving) "Saving…" else "Save") }
+        },
+        dismissButton = { TextButton(enabled = !saving && !isBusy, onClick = onDismiss) { Text("Cancel") } },
     )
 }
 

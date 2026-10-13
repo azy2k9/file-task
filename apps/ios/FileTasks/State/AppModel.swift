@@ -6,6 +6,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var user: AuthUser?
     @Published private(set) var items: [WorkspaceItem] = []
     @Published private(set) var files: [WorkspaceFile] = []
+    @Published private(set) var reminderSettings: ReminderSettings = .empty
     @Published private(set) var isRestoring = true
     @Published private(set) var isAuthenticating = false
     @Published private(set) var isLoadingItems = false
@@ -136,6 +137,48 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func saveReminderSettings(_ settings: ReminderSettings, applyToExisting: Bool) async throws {
+        let context = try currentContext()
+        do {
+            let updated = try await APIClient(baseURL: context.baseURL).updateReminderSettings(
+                settings, token: context.token, applyToExisting: applyToExisting
+            )
+            guard isCurrent(context) else { throw APIClientError.sessionChanged }
+            reminderSettings = updated
+            await refreshItems(using: context)
+        } catch {
+            handle(error, for: context)
+            throw error
+        }
+    }
+
+    func registerPushDevice(platform: String, pushToken: String) async throws -> PushDevice {
+        let context = try currentContext()
+        do {
+            let device = try await APIClient(baseURL: context.baseURL).registerPushDevice(
+                platform: platform, pushToken: pushToken, authToken: context.token
+            )
+            guard isCurrent(context) else { throw APIClientError.sessionChanged }
+            errorMessage = nil
+            return device
+        } catch {
+            handle(error, for: context)
+            throw error
+        }
+    }
+
+    func revokePushDevice(id: String) async throws {
+        let context = try currentContext()
+        do {
+            try await APIClient(baseURL: context.baseURL).revokePushDevice(id: id, token: context.token)
+            guard isCurrent(context) else { throw APIClientError.sessionChanged }
+            errorMessage = nil
+        } catch {
+            handle(error, for: context)
+            throw error
+        }
+    }
+
     func setCompleted(_ item: WorkspaceItem, to completed: Bool) async {
         let context: SessionContext
         do {
@@ -159,7 +202,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func delete(_ item: WorkspaceItem) async {
+    func delete(_ item: WorkspaceItem, scope: EditScope? = nil) async {
         let context: SessionContext
         do {
             context = try currentContext()
@@ -169,7 +212,7 @@ final class AppModel: ObservableObject {
         }
 
         do {
-            try await APIClient(baseURL: context.baseURL).deleteItem(id: item.id, token: context.token)
+            try await APIClient(baseURL: context.baseURL).deleteItem(id: item.id, scope: scope, token: context.token)
             guard isCurrent(context) else { return }
             items.removeAll { $0.id == item.id }
             itemRevision += 1
@@ -210,10 +253,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func attachFile(_ file: WorkspaceFile, to item: WorkspaceItem) async throws {
+    func attachFile(_ file: WorkspaceFile, to item: WorkspaceItem, scope: EditScope = .occurrence) async throws {
         let context = try currentContext()
         do {
-            try await APIClient(baseURL: context.baseURL).attachFile(id: file.id, to: item.id, token: context.token)
+            try await APIClient(baseURL: context.baseURL).attachFile(id: file.id, to: item.id, scope: scope, token: context.token)
             guard isCurrent(context) else { throw APIClientError.sessionChanged }
             await refreshItems(using: context)
         } catch {
@@ -222,11 +265,11 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func removeAttachment(_ attachment: FileAttachment, from file: WorkspaceFile) async throws {
+    func removeAttachment(_ attachment: FileAttachment, from file: WorkspaceFile, scope: EditScope = .occurrence) async throws {
         let context = try currentContext()
         do {
             try await APIClient(baseURL: context.baseURL).removeAttachment(
-                fileId: file.id, itemId: attachment.itemId, token: context.token
+                fileId: file.id, itemId: attachment.itemId, scope: scope, token: context.token
             )
             guard isCurrent(context) else { throw APIClientError.sessionChanged }
             await refreshItems(using: context)
@@ -316,13 +359,15 @@ final class AppModel: ObservableObject {
             let api = APIClient(baseURL: context.baseURL)
             async let itemsRequest = api.items(token: context.token)
             async let filesRequest = api.files(token: context.token)
-            let (refreshedItems, refreshedFiles) = try await (itemsRequest, filesRequest)
+            async let settingsRequest = api.reminderSettings(token: context.token)
+            let (refreshedItems, refreshedFiles, refreshedSettings) = try await (itemsRequest, filesRequest, settingsRequest)
             guard isCurrent(context),
                   refreshRequestID == requestID,
                   itemRevision == revisionAtStart,
                   fileRevision == fileRevisionAtStart else { return }
             items = refreshedItems
             files = refreshedFiles
+            reminderSettings = refreshedSettings
             errorMessage = nil
         } catch {
             guard isCurrent(context),
@@ -353,6 +398,7 @@ final class AppModel: ObservableObject {
         self.user = user
         items = []
         files = []
+        reminderSettings = .empty
         isLoadingItems = false
         errorMessage = nil
         return SessionContext(generation: sessionGeneration, token: token, baseURL: baseURL)
@@ -395,6 +441,7 @@ final class AppModel: ObservableObject {
         user = nil
         items = []
         files = []
+        reminderSettings = .empty
         errorMessage = nil
     }
 

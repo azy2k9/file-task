@@ -1,4 +1,5 @@
 import { database } from "./database";
+import { deliveryAvailability } from "./delivery";
 import { HttpError } from "./http";
 import type { ReminderRule } from "./items";
 
@@ -7,24 +8,31 @@ export interface ReminderSettings {
   eventReminders: ReminderRule[];
   pushEnabled: boolean;
   emailEnabled: boolean;
+  pushAvailable: boolean;
+  emailAvailable: boolean;
 }
 
-const EMPTY: ReminderSettings = { taskReminders: [], eventReminders: [], pushEnabled: false, emailEnabled: false };
 function parse(raw: unknown, fallback: ReminderRule[] = []) {
   try { return typeof raw === "string" ? JSON.parse(raw) as ReminderRule[] : fallback; } catch { return fallback; }
 }
 
 export function reminderSettings(userId: string): ReminderSettings {
+  const availability = deliveryAvailability();
   const row = database().prepare("SELECT * FROM user_preferences WHERE user_id=?").get(userId);
+  const emailOperational = availability.emailAvailable && Boolean(row?.email_enabled);
   return row ? {
-    taskReminders: parse(row.task_reminders), eventReminders: parse(row.event_reminders),
-    pushEnabled: Boolean(row.push_enabled), emailEnabled: Boolean(row.email_enabled),
-  } : EMPTY;
+    taskReminders: parse(row.task_reminders).filter((rule) => rule.delivery !== "email" || emailOperational),
+    eventReminders: parse(row.event_reminders).filter((rule) => rule.delivery !== "email" || emailOperational),
+    pushEnabled: Boolean(row.push_enabled) && availability.pushAvailable,
+    emailEnabled: Boolean(row.email_enabled) && availability.emailAvailable,
+    ...availability,
+  } : { taskReminders: [], eventReminders: [], pushEnabled: false, emailEnabled: false, ...availability };
 }
 
 export function itemReminderDefaults(userId: string, kind: "task" | "event") {
   const settings = reminderSettings(userId);
-  return kind === "task" ? settings.taskReminders : settings.eventReminders;
+  const defaults = kind === "task" ? settings.taskReminders : settings.eventReminders;
+  return defaults.filter((rule) => rule.delivery !== "email" || settings.emailEnabled);
 }
 
 export function updateReminderSettings(userId: string, body: Record<string, unknown>) {
@@ -51,6 +59,9 @@ export function updateReminderSettings(userId: string, body: Record<string, unkn
   const pushEnabled = body.pushEnabled === undefined ? before.pushEnabled : body.pushEnabled;
   const emailEnabled = body.emailEnabled === undefined ? before.emailEnabled : body.emailEnabled;
   if (typeof pushEnabled !== "boolean" || typeof emailEnabled !== "boolean") throw new HttpError(400, "Choose valid delivery settings.");
+  const availability = deliveryAvailability();
+  if (pushEnabled && !availability.pushAvailable) throw new HttpError(400, "Push delivery is not available on this server.");
+  if (emailEnabled && !availability.emailAvailable) throw new HttpError(400, "Email delivery is not available on this server.");
   if (!emailEnabled && [...taskReminders, ...eventReminders].some((rule) => rule.delivery === "email")) {
     throw new HttpError(400, "Remove Email Reminders before disabling email delivery.");
   }

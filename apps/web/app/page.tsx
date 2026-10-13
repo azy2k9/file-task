@@ -5,7 +5,7 @@ import type { ItemInput, ItemKind, RecurrenceRule, ReminderRule, WorkspaceItem }
 import FilesView from "./files-view";
 
 type Account = { id: string; email: string };
-type ReminderSettings = { taskReminders: ReminderRule[]; eventReminders: ReminderRule[]; pushEnabled: boolean; emailEnabled: boolean };
+type ReminderSettings = { taskReminders: ReminderRule[]; eventReminders: ReminderRule[]; pushEnabled: boolean; emailEnabled: boolean; pushAvailable: boolean; emailAvailable: boolean };
 type InAppNotification = { id: string; itemId: string; title: string; scheduledAt: string; readAt: string | null };
 type View = "agenda" | "task" | "event" | "files";
 type AuthMode = "login" | "register";
@@ -21,6 +21,54 @@ type Draft = {
 type Editor = { kind: ItemKind; item: WorkspaceItem | null };
 
 const emptyDraft = (reminders: ReminderRule[] = []): Draft => ({ title: "", details: "", scheduledDate: "", scheduledTime: "", recurrence: null, reminders, scope: "series" });
+
+const webPushPublicKey = process.env.NEXT_PUBLIC_FILETASKS_VAPID_PUBLIC_KEY ?? "";
+
+function browserPushDeviceKey(accountId: string) {
+  return `filetasks-push-device:${accountId}`;
+}
+
+function decodeVapidKey(value: string) {
+  const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+  const decoded = atob(base64 + "=".repeat((4 - (base64.length % 4)) % 4));
+  return Uint8Array.from(decoded, (character) => character.charCodeAt(0)).buffer;
+}
+
+async function registerBrowserPushDevice(accountId: string) {
+  if (!webPushPublicKey || !("serviceWorker" in navigator) || !("PushManager" in window)) {
+    throw new Error("Web push is not configured for this browser.");
+  }
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") throw new Error("Allow notifications before enabling push delivery.");
+  const registration = await navigator.serviceWorker.register("/filetasks-sw.js");
+  const ready = await navigator.serviceWorker.ready;
+  const existingSubscription = await ready.pushManager.getSubscription();
+  const subscription = existingSubscription ?? await ready.pushManager.subscribe({
+    userVisibleOnly: true,
+    applicationServerKey: decodeVapidKey(webPushPublicKey),
+  });
+  const response = await fetch("/api/devices/push", {
+    method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ platform: "web", token: subscription.toJSON() }),
+  });
+  if (!response.ok) throw new Error(await errorFromResponse(response, "Could not register this browser for push delivery."));
+  const result = await response.json() as { device: { id: string } };
+  localStorage.setItem(browserPushDeviceKey(accountId), result.device.id);
+  void registration;
+}
+
+async function revokeBrowserPushDevice(accountId: string) {
+  const deviceId = localStorage.getItem(browserPushDeviceKey(accountId));
+  if (deviceId) {
+    const response = await fetch(`/api/devices/push/${encodeURIComponent(deviceId)}`, { method: "DELETE", credentials: "same-origin" });
+    if (!response.ok && response.status !== 404) throw new Error(await errorFromResponse(response, "Could not revoke this browser's push registration."));
+    localStorage.removeItem(browserPushDeviceKey(accountId));
+  }
+  if ("serviceWorker" in navigator) {
+    const registration = await navigator.serviceWorker.getRegistration("/");
+    await registration?.pushManager.getSubscription().then((subscription) => subscription?.unsubscribe());
+  }
+}
 
 async function errorFromResponse(response: Response, fallback: string) {
   try {
@@ -358,6 +406,7 @@ function ItemDialog({
   error,
   busy,
   emailEnabled,
+  emailAvailable,
   onClose,
   onSubmit,
 }: {
@@ -367,6 +416,7 @@ function ItemDialog({
   error: string | null;
   busy: boolean;
   emailEnabled: boolean;
+  emailAvailable: boolean;
   onClose: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
@@ -483,7 +533,7 @@ function ItemDialog({
             {draft.recurrence.end.type === "count" && <label>Occurrences <input aria-label="Occurrence count" type="number" min="1" max="10000" value={draft.recurrence.end.count} disabled={busy} onChange={(event) => setDraft((current) => current.recurrence?.end.type === "count" ? ({ ...current, recurrence: { ...current.recurrence, end: { type: "count", count: Math.max(1, Number(event.target.value) || 1) } } }) : current)} /></label>}
           </div>}
           <h3>Reminders</h3>
-          <ReminderEditor reminders={draft.reminders} emailEnabled={emailEnabled} disabled={busy} onChange={(reminders) => setDraft((current) => ({ ...current, reminders }))} />
+          <ReminderEditor reminders={draft.reminders} emailEnabled={emailEnabled} emailAvailable={emailAvailable} disabled={busy} onChange={(reminders) => setDraft((current) => ({ ...current, reminders }))} />
         </section>
 
         <div className="dialog-actions">
@@ -497,14 +547,14 @@ function ItemDialog({
   );
 }
 
-function ReminderEditor({ reminders, emailEnabled, disabled, onChange }: {
-  reminders: ReminderRule[]; emailEnabled: boolean; disabled: boolean; onChange: (reminders: ReminderRule[]) => void;
+function ReminderEditor({ reminders, emailEnabled, emailAvailable, disabled, onChange }: {
+  reminders: ReminderRule[]; emailEnabled: boolean; emailAvailable: boolean; disabled: boolean; onChange: (reminders: ReminderRule[]) => void;
 }) {
   const update = (index: number, value: Partial<ReminderRule>) => onChange(reminders.map((row, rowIndex) => rowIndex === index ? { ...row, ...value } : row));
   return <div className="reminder-editor">
     {reminders.map((reminder, index) => <div className="reminder-row" key={index}>
       <select aria-label={`Reminder ${index + 1} delivery`} value={reminder.delivery} disabled={disabled} onChange={(event) => update(index, { delivery: event.target.value as ReminderRule["delivery"] })}>
-        <option value="notification">Notification</option>{emailEnabled && <option value="email">Email</option>}
+        <option value="notification">Notification</option>{emailEnabled && emailAvailable && <option value="email">Email</option>}
       </select>
       <label><span className="sr-only">Offset amount</span><input aria-label={`Reminder ${index + 1} offset`} type="number" min="0" value={reminder.amount} disabled={disabled} onChange={(event) => update(index, { amount: Math.max(0, Number(event.target.value) || 0) })} /></label>
       <select aria-label={`Reminder ${index + 1} offset unit`} value={reminder.unit} disabled={disabled} onChange={(event) => update(index, { unit: event.target.value as ReminderRule["unit"] })}>{["minutes", "hours", "days", "weeks", "months"].map((unit) => <option key={unit} value={unit}>{unit}</option>)}</select>
@@ -533,8 +583,9 @@ function NotificationsDialog({ notifications, onClose, onOpen }: {
   </dialog>;
 }
 
-function ReminderSettingsDialog({ initial, onClose, onSave }: {
+function ReminderSettingsDialog({ initial, accountId, onClose, onSave }: {
   initial: ReminderSettings;
+  accountId: string;
   onClose: () => void;
   onSave: (settings: ReminderSettings, applyToExisting: boolean) => Promise<void>;
 }) {
@@ -550,6 +601,7 @@ function ReminderSettingsDialog({ initial, onClose, onSave }: {
   const [appleUsername, setAppleUsername] = useState("");
   const [applePassword, setApplePassword] = useState("");
   const [appleCalendarUrl, setAppleCalendarUrl] = useState("");
+  const browserPushAvailable = settings.pushAvailable && Boolean(webPushPublicKey);
   useEffect(() => {
     const dialog = dialogRef.current;
     if (dialog && !dialog.open) dialog.showModal();
@@ -564,7 +616,14 @@ function ReminderSettingsDialog({ initial, onClose, onSave }: {
   }
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError(null);
-    try { await onSave(settings, applyToExisting); } catch (failure) { setError(failure instanceof Error ? failure.message : "Could not save Reminder settings."); }
+    try {
+      if (settings.pushEnabled && browserPushAvailable && !localStorage.getItem(browserPushDeviceKey(accountId))) {
+        await registerBrowserPushDevice(accountId);
+      } else if (!settings.pushEnabled && initial.pushEnabled) {
+        await revokeBrowserPushDevice(accountId);
+      }
+      await onSave(settings, applyToExisting);
+    } catch (failure) { setError(failure instanceof Error ? failure.message : "Could not save Reminder settings."); }
     finally { setBusy(false); }
   }
   async function updateCalendar(path: string, init?: RequestInit) {
@@ -592,11 +651,11 @@ function ReminderSettingsDialog({ initial, onClose, onSave }: {
       <div className="dialog-topline"><div><p className="eyebrow">YOUR ACCOUNT</p><h2 id="settings-dialog-title">Reminder settings</h2></div><button className="dialog-close icon-button" type="button" disabled={busy} aria-label="Close settings" onClick={onClose}>×</button></div>
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="setting-toggles">
-        <label><input type="checkbox" checked={settings.pushEnabled} disabled={busy} onChange={(event) => setSettings((current) => ({ ...current, pushEnabled: event.target.checked }))} /> Optional push delivery</label>
-        <label><input type="checkbox" checked={settings.emailEnabled} disabled={busy} onChange={(event) => setSettings((current) => ({ ...current, emailEnabled: event.target.checked }))} /> Email delivery</label>
+        <label><input type="checkbox" checked={settings.pushEnabled} disabled={busy || !browserPushAvailable} onChange={(event) => setSettings((current) => ({ ...current, pushEnabled: event.target.checked }))} /> Optional push delivery{!browserPushAvailable && " (not configured for this browser)"}</label>
+        <label><input type="checkbox" checked={settings.emailEnabled} disabled={busy || !settings.emailAvailable} onChange={(event) => setSettings((current) => ({ ...current, emailEnabled: event.target.checked }))} /> Email delivery{!settings.emailAvailable && " (not configured)"}</label>
       </div>
       <div className="auth-switch setting-tabs" role="group" aria-label="Reminder default type"><button type="button" className={kind === "task" ? "auth-switch-active" : ""} aria-pressed={kind === "task"} onClick={() => setKind("task")}>Task defaults</button><button type="button" className={kind === "event" ? "auth-switch-active" : ""} aria-pressed={kind === "event"} onClick={() => setKind("event")}>Event defaults</button></div>
-      <ReminderEditor reminders={reminders} emailEnabled={settings.emailEnabled} disabled={busy} onChange={changeReminders} />
+      <ReminderEditor reminders={reminders} emailEnabled={settings.emailEnabled} emailAvailable={settings.emailAvailable} disabled={busy} onChange={changeReminders} />
       <fieldset className="apply-defaults"><legend>When these defaults change</legend><label><input type="radio" name="apply-existing" checked={!applyToExisting} disabled={busy} onChange={() => setApplyToExisting(false)} /> Only new items</label><label><input type="radio" name="apply-existing" checked={applyToExisting} disabled={busy} onChange={() => setApplyToExisting(true)} /> Apply to existing items still using the old defaults</label></fieldset>
       <section className="calendar-settings" aria-labelledby="calendar-settings-title">
         <div className="calendar-settings-title"><div><p className="eyebrow">CONNECTED CALENDARS</p><h3 id="calendar-settings-title">Sync Calendar</h3></div><button className="button button-secondary" type="button" disabled={calendarBusy} onClick={() => void updateCalendar("/api/calendars/sync", { method: "POST" })}>{calendarBusy ? "Syncing…" : "Sync Calendar"}</button></div>
@@ -626,9 +685,10 @@ function DeleteDialog({
   busy: boolean;
   error: string | null;
   onClose: () => void;
-  onConfirm: () => void;
+  onConfirm: (scope?: "occurrence" | "following" | "series") => void;
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const [scope, setScope] = useState<"occurrence" | "following" | "series">("occurrence");
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -655,10 +715,17 @@ function DeleteDialog({
       <p className="delete-copy">
         <strong>{item.title}</strong> will be deleted from your account across all your devices. This can’t be undone.
       </p>
+      {item.seriesId && <label className="field-block"><span className="field-label">Delete scope</span>
+        <select aria-label="Delete scope" value={scope} disabled={busy} onChange={(event) => setScope(event.target.value as typeof scope)}>
+          <option value="occurrence">This Occurrence</option>
+          <option value="following">This and following Occurrences</option>
+          <option value="series">Whole series</option>
+        </select>
+      </label>}
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="dialog-actions">
         <button className="button button-quiet" type="button" disabled={busy} autoFocus onClick={onClose}>Keep it</button>
-        <button className="button button-danger" type="button" disabled={busy} onClick={onConfirm}>
+        <button className="button button-danger" type="button" disabled={busy} onClick={() => onConfirm(item.seriesId ? scope : undefined)}>
           {busy ? "Deleting…" : "Delete"}
         </button>
       </div>
@@ -732,7 +799,7 @@ export default function Page() {
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [clientReady, setClientReady] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [reminderSettings, setReminderSettings] = useState<ReminderSettings>({ taskReminders: [], eventReminders: [], pushEnabled: false, emailEnabled: false });
+  const [reminderSettings, setReminderSettings] = useState<ReminderSettings>({ taskReminders: [], eventReminders: [], pushEnabled: false, emailEnabled: false, pushAvailable: false, emailAvailable: false });
   const [notifications, setNotifications] = useState<InAppNotification[]>([]);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const identityVersion = useRef(0);
@@ -742,6 +809,7 @@ export default function Page() {
   const signingOutLock = useRef(false);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
   const handledEventLink = useRef<string | null>(null);
+  const handledPushItem = useRef<string | null>(null);
   const newTaskButtonRef = useRef<HTMLButtonElement>(null);
   const isMutating = mutation !== null;
 
@@ -1006,6 +1074,17 @@ export default function Page() {
     window.history.replaceState(null, "", window.location.pathname);
   }, [authStatus, items]);
 
+  useEffect(() => {
+    if (authStatus !== "signed-in") return;
+    const itemId = new URLSearchParams(window.location.search).get("item");
+    if (!itemId || handledPushItem.current === itemId) return;
+    const item = items.find((candidate) => candidate.id === itemId);
+    if (!item) return;
+    handledPushItem.current = itemId;
+    openEditor(item.kind, item);
+    window.history.replaceState(null, "", window.location.pathname);
+  }, [authStatus, items]);
+
   function closeEditor() {
     if (mutationLock.current) return;
     setEditor(null);
@@ -1133,14 +1212,14 @@ export default function Page() {
     }
   }
 
-  async function deleteItem() {
+  async function deleteItem(scope?: "occurrence" | "following" | "series") {
     if (!deleteTarget) return;
     const target = deleteTarget;
     const version = beginMutation(`delete:${target.id}`);
     if (version === null) return;
     setDeleteError(null);
     try {
-      const response = await fetch(`/api/items/${encodeURIComponent(target.id)}`, {
+      const response = await fetch(`/api/items/${encodeURIComponent(target.id)}${scope ? `?scope=${scope}` : ""}`, {
         method: "DELETE",
         credentials: "same-origin",
       });
@@ -1155,6 +1234,7 @@ export default function Page() {
         return;
       }
       setItems((current) => current.filter((item) => item.id !== target.id));
+      refreshAfterMutation(version);
       setLastUpdated(new Date());
       setDeleteTarget(null);
       setDeleteError(null);
@@ -1392,15 +1472,23 @@ export default function Page() {
           error={editorError}
           busy={mutation === "save" || mutation === "create"}
           emailEnabled={reminderSettings.emailEnabled}
+          emailAvailable={reminderSettings.emailAvailable}
           onClose={closeEditor}
           onSubmit={saveDraft}
         />
       )}
       {settingsOpen && <ReminderSettingsDialog
         initial={reminderSettings}
+        accountId={account?.id ?? ""}
         onClose={() => setSettingsOpen(false)}
         onSave={async (settings, applyToExisting) => {
-          const response = await fetch("/api/settings/reminders", { method: "PATCH", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...settings, applyToExisting }) });
+          const response = await fetch("/api/settings/reminders", { method: "PATCH", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+            taskReminders: settings.taskReminders,
+            eventReminders: settings.eventReminders,
+            pushEnabled: settings.pushEnabled,
+            emailEnabled: settings.emailEnabled,
+            applyToExisting,
+          }) });
           if (!response.ok) throw new Error(await errorFromResponse(response, "Could not save Reminder settings."));
           const result = await response.json() as { settings: ReminderSettings };
           setReminderSettings(result.settings);
