@@ -20,14 +20,14 @@ The Files section accepts external HTTP(S) links without extra server setup. Upl
 
 ## Native clients
 
-- [iOS setup](apps/ios/README.md): open the Xcode project on macOS.
+- [iOS setup](apps/ios/README.md): build and install on an iPhone from macOS. The guide covers local development and a persistent HTTPS server.
 - [Android setup](apps/android/README.md): open the Gradle project in Android Studio.
 
 Configure the same FileTasks server origin in each client and sign in with the same account. The Android emulator reaches a local host server through `http://10.0.2.2:3000`; the iOS simulator can use `http://localhost:3000`. Physical devices need a reachable server address. HTTP is a development option; use HTTPS for a hosted server. Refresh the agenda to see changes from another client; the web also refreshes when focused and every 30 seconds while visible. Network access is required to save and refresh.
 
 ## Current API prototype
 
-The current prototype routes API requests through Next.js route handlers; authentication, persistence, Tasks, Events, Recurrence rules, Reminders, Files, Attachments, Connected calendars, and the R2 storage adapter live under `services/api`. Configure Google OAuth and the calendar credential encryption key from `apps/web/.env.example` before connecting calendars. Apple Calendar uses an Apple ID app-specific password.
+The current prototype routes API requests through Next.js route handlers; authentication, persistence, Tasks, Events, Recurrence rules, Reminders, Files, Attachments, Connected calendars, and the R2 storage adapter live under `services/api`. The basic app needs no external identity provider or database service: FileTasks handles email/password accounts and stores them in SQLite. Google OAuth, Apple Calendar credentials, R2, and email or Push delivery adapters are optional integrations; configure only the ones you plan to use, as described in `apps/web/.env.example` and [the API contract](docs/api.md).
 
 ```sh
 npm run build
@@ -58,3 +58,7 @@ npm run build
 CI checks the web application and compiles both native projects with their platform SDKs. Native builds require their respective toolchains; a web build does not validate SwiftUI or Android code.
 
 See [the API contract](docs/api.md) for the shared client interface.
+
+## Personal iPhone setup
+
+The remaining hands-on setup checklist is tracked in [issue #10](https://github.com/azy2k9/file-task/issues/10). The short version is: install Xcode and Node.js on your Mac, start or deploy the FileTasks server, sign and run the iOS target on your connected iPhone, then enter the server origin in the app. The iOS target currently includes the APNs entitlement, so on-device signing requires a team with Push Notifications enabled; a no-push build config would be needed to use a free Personal Team. A local development server is enough for same-network testing; use HTTPS and persistent storage if you want the app available when the Mac is off or the phone is away from home.
