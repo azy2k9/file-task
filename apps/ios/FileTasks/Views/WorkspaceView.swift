@@ -50,6 +50,7 @@ struct WorkspaceView: View {
     @State private var fileToAttach: WorkspaceFile?
     @State private var fileToDelete: WorkspaceFile?
     @State private var attachmentToRemove: (file: WorkspaceFile, attachment: FileAttachment)?
+    @State private var pendingPushItemId: String?
 
     private var filteredItems: [WorkspaceItem] {
         model.items.filter { filter.includes($0) }
@@ -73,6 +74,17 @@ struct WorkspaceView: View {
             }
             return AgendaGroup(key: key, items: sortedItems)
         }
+    }
+
+    private func openPendingPushItem() {
+        guard let itemId = pendingPushItemId,
+              let item = model.items.first(where: { $0.id == itemId }) else { return }
+        pendingPushItemId = nil
+        PushRegistrationDelegate.pendingItemId = nil
+        section = .agenda
+        filter = item.kind == .task ? .tasks : .events
+        editingItem = item
+        showingEditor = true
     }
 
     var body: some View {
@@ -151,6 +163,33 @@ struct WorkspaceView: View {
             .listStyle(.insetGrouped)
             .refreshable { await model.refreshItems() }
             .navigationTitle(section == .files ? "Files" : "Workspace")
+            .onReceive(NotificationCenter.default.publisher(for: PushRegistrationDelegate.tokenNotification)) { notification in
+                guard model.reminderSettings.pushEnabled, !model.pushDeviceRevoked else { return }
+                if let failure = notification.object as? Error {
+                    model.errorMessage = failure.localizedDescription
+                    return
+                }
+                guard let token = notification.object as? String else { return }
+                Task { try? await model.registerPushDevice(platform: "ios", pushToken: token) }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .fileTasksPushItem)) { notification in
+                pendingPushItemId = notification.object as? String
+                openPendingPushItem()
+            }
+            .onAppear {
+                pendingPushItemId = PushRegistrationDelegate.pendingItemId
+                openPendingPushItem()
+            }
+            .onChange(of: model.items) { _ in
+                openPendingPushItem()
+            }
+            .onChange(of: model.reminderSettings.pushEnabled) { enabled in
+                guard enabled, !model.pushDeviceRevoked else { return }
+                Task {
+                    let settings = await UNUserNotificationCenter.current().notificationSettings()
+                    if settings.authorizationStatus == .authorized { UIApplication.shared.registerForRemoteNotifications() }
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Menu {
@@ -441,13 +480,42 @@ struct WorkspaceView: View {
             .accessibilityHint("Opens item details")
           }
           ForEach(item.files) { file in
-              Button("▤  \(file.name)") { openFile(file.id) }
-                  .font(.caption)
-                  .buttonStyle(.borderless)
-                  .padding(.leading, 40)
+              HStack {
+                  Button("▤  \(file.name)") { openFile(file.id) }
+                      .font(.caption)
+                      .buttonStyle(.borderless)
+                  Spacer()
+                  if let fullFile = model.files.first(where: { $0.id == file.id }),
+                     let source = sourceAttachment(for: item, in: fullFile) {
+                      Button("Remove", role: .destructive) {
+                          attachmentToRemove = (fullFile, FileAttachment(
+                              itemId: item.id,
+                              itemKind: item.kind,
+                              itemTitle: item.title,
+                              scope: source.scope
+                          ))
+                      }
+                      .font(.caption)
+                  }
+              }
+              .padding(.leading, 40)
           }
         }
         .padding(.vertical, 3)
+    }
+
+    private func sourceAttachment(for item: WorkspaceItem, in file: WorkspaceFile) -> FileAttachment? {
+        if let direct = file.attachments.first(where: { $0.itemId == item.id }) { return direct }
+        guard let seriesId = item.seriesId else { return nil }
+        if let series = file.attachments.first(where: { $0.scope == "series" && $0.itemId == seriesId }) { return series }
+        return file.attachments.first(where: { attachment in
+            guard attachment.scope == "following",
+                  let anchor = model.items.first(where: { $0.id == attachment.itemId }),
+                  anchor.seriesId == seriesId,
+                  let anchorDate = anchor.occurrenceDate,
+                  let itemDate = item.occurrenceDate else { return false }
+            return anchorDate <= itemDate
+        })
     }
 
     private func upload(_ url: URL) {

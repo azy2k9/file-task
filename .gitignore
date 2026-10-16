@@ -9,6 +9,7 @@ playwright-report/
 next-env.d.ts
 .DS_Store
 apps/ios/**/xcuserdata/
+apps/ios/.build/
 apps/android/.gradle/
 apps/android/**/build/
 apps/android/local.properties

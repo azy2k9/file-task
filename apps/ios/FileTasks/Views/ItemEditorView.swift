@@ -1,4 +1,6 @@
 import SwiftUI
+import UIKit
+import UserNotifications
 
 struct ItemEditorView: View {
     @EnvironmentObject private var model: AppModel
@@ -122,7 +124,7 @@ struct ItemEditorView: View {
                         }
                     ))
                     .disabled(!includesDate)
-                    if var rule = recurrence {
+                if let rule = recurrence {
                         Stepper("Every \(rule.interval)", value: Binding(
                             get: { recurrence?.interval ?? 1 },
                             set: { recurrence?.interval = min(100, max(1, $0)) }
@@ -160,7 +162,6 @@ struct ItemEditorView: View {
                         } else if recurrenceEndType == "count" {
                             Stepper("Occurrences: \(recurrenceCount)", value: $recurrenceCount, in: 1...10_000)
                         }
-                        rule.interval = max(1, rule.interval)
                     }
                 }
 
@@ -303,6 +304,27 @@ struct ReminderSettingsView: View {
                     Toggle("Email delivery", isOn: $settings.emailEnabled)
                         .disabled(isSaving || !settings.emailAvailable)
                     if !settings.emailAvailable { Text("Email delivery is not configured on this server.").font(.footnote).foregroundStyle(.secondary) }
+                    if model.hasRegisteredPushDevice {
+                        Button("Revoke this device's push registration", role: .destructive) {
+                            Task {
+                                do {
+                                    try await model.revokeCurrentPushDevice()
+                                    UIApplication.shared.unregisterForRemoteNotifications()
+                                } catch { errorMessage = error.localizedDescription }
+                            }
+                        }.disabled(isSaving)
+                    } else if model.pushDeviceRevoked && settings.pushEnabled {
+                        Button("Register this device for push delivery") {
+                            Task {
+                                do {
+                                    let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound])
+                                    guard granted else { throw NSError(domain: "FileTasksPush", code: 1, userInfo: [NSLocalizedDescriptionKey: "Allow notifications to register this device for push delivery."]) }
+                                    try model.allowPushDeviceRegistration()
+                                    UIApplication.shared.registerForRemoteNotifications()
+                                } catch { errorMessage = error.localizedDescription }
+                            }
+                        }.disabled(isSaving)
+                    }
                 }
                 Section("Task defaults") {
                     ReminderListEditor(reminders: $settings.taskReminders, emailAvailable: settings.emailAvailable && settings.emailEnabled)
@@ -330,7 +352,14 @@ struct ReminderSettingsView: View {
         errorMessage = nil
         defer { isSaving = false }
         do {
+            let shouldRegisterDevice = settings.pushEnabled && !model.hasRegisteredPushDevice
+                && (!model.pushDeviceRevoked || !model.reminderSettings.pushEnabled)
+            if shouldRegisterDevice {
+                let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound])
+                guard granted else { throw NSError(domain: "FileTasksPush", code: 1, userInfo: [NSLocalizedDescriptionKey: "Allow notifications to register this device for push delivery."]) }
+            }
             try await model.saveReminderSettings(settings, applyToExisting: applyToExisting)
+            if shouldRegisterDevice { UIApplication.shared.registerForRemoteNotifications() }
             dismiss()
         } catch { errorMessage = error.localizedDescription }
     }

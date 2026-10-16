@@ -12,6 +12,18 @@ This is the native SwiftUI client for FileTasks. It supports iOS 16 and later an
 
 For local development, enter the development server URL and turn on **Allow local development HTTP**. The app defaults to HTTPS and rejects HTTP unless that option is enabled. On a device, use a local hostname reachable from the device, such as a `.local` host; `localhost` on the phone points to the phone itself.
 
+To use Push delivery, enable Push Notifications for the iOS App ID and sign the app with a provisioning profile that includes the matching APNs entitlement. When Push is enabled in Reminder settings, the app requests notification permission, registers with APNs, and sends the device token to the shared FileTasks API. Revoke this device's registration from Reminder settings.
+
+## Acceptance tests
+
+Run the complete shared acceptance harness from the repository root on a Mac with Swift/Xcode command-line tools, Android SDK, and a booted Android emulator:
+
+```sh
+npm run test:acceptance
+```
+
+The harness keeps the API and fake calendar, delivery, and object-storage providers running while browser, Swift, and Android tests use the same account. The native cases upload and download real bytes through the fake object store, exercise scoped Recurrence and Attachment changes, register and revoke Push devices, and trigger a due Reminder through the delivery boundary. A focused Swift run is available with `swift test --package-path apps/ios`; set `FILETASKS_TEST_API_URL` to a running test API when running it separately.
+
 ## What it supports
 
 - Account registration, sign-in, session restore, and sign-out.

@@ -2,7 +2,7 @@
 
 A personal workspace for actionable **Tasks** and memorable **Events**. The clients are a Next.js web app, a native SwiftUI iOS app, and a Kotlin/Jetpack Compose Android app. All clients share one account and API.
 
-This implements [issue #2](https://github.com/azy2k9/file-task/issues/2) and the Files and Attachments slice in [issue #3](https://github.com/azy2k9/file-task/issues/3). Recurrence rules, Reminders, and connected calendars belong to later issues.
+This implements [issue #2](https://github.com/azy2k9/file-task/issues/2), the Files and Attachments slice in [issue #3](https://github.com/azy2k9/file-task/issues/3), and the cross-client Reminders, Recurrence, Attachments, and calendar workflows in [issue #9](https://github.com/azy2k9/file-task/issues/9).
 
 ## Run the web app
 
@@ -53,7 +53,7 @@ npm test
 npm run build
 ```
 
-Acceptance tests exercise the public HTTP application boundary and browser workflows using a temporary database and isolated accounts. They run a test server on port 3107. Stop another Next.js development server in this checkout before testing, because Next.js locks its development output directory. Run one workflow with `node --test --test-name-pattern='workflow name' apps/web/tests/workspace.test.mjs`.
+`npm test` runs the API and browser acceptance suite against a temporary database. For the complete shared cross-client harness, use `npm run test:acceptance` on a Mac with Swift/Xcode command-line tools, Android SDK, and a booted Android emulator. It runs web, iOS, and Android workflows against one live API, account, controlled clock, and set of provider fakes, including File byte transfers and observed Push delivery. Both commands use port 3107; stop another Next.js development server in this checkout before testing, because Next.js locks its development output directory. Run one web workflow with `node --test --test-name-pattern='workflow name' apps/web/tests/workspace.test.mjs`.
 
 CI checks the web application and compiles both native projects with their platform SDKs. Native builds require their respective toolchains; a web build does not validate SwiftUI or Android code.
 

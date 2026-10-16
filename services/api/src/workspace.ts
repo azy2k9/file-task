@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { RecurrenceRule, ReminderRule, WorkspaceFileSummary, WorkspaceItem } from "./items";
 import { database } from "./database";
+import { now } from "./clock";
 import { HttpError } from "./http";
 import { itemReminderDefaults, reminderSettings } from "./reminder-settings";
 
@@ -91,7 +92,7 @@ function reminderLeadDays(raw: unknown) {
 
 function occurrenceDates(startValue: string, rule: RecurrenceRule, leadDays = 0) {
   const start = new Date(`${startValue}T00:00:00Z`);
-  const horizon = new Date(); horizon.setUTCDate(horizon.getUTCDate() + Math.max(370, leadDays) + 2);
+  const horizon = now(); horizon.setUTCDate(horizon.getUTCDate() + Math.max(370, leadDays) + 2);
   const stop = rule.end.type === "date" ? new Date(`${rule.end.date}T00:00:00Z`) : horizon;
   const maxDate = rule.end.type === "date" && stop < horizon ? stop : horizon;
   const dates = [startValue];
@@ -128,11 +129,11 @@ function ensureOccurrences(userId: string) {
     const excluded = new Set(db.prepare("SELECT occurrence_date FROM occurrence_exclusions WHERE series_root_id=?").all(row.id).map((item) => String(item.occurrence_date)));
     for (const date of occurrenceDates(String(row.scheduled_date), rule, reminderLeadDays(row.reminders_json))) {
       if (known.has(date) || excluded.has(date)) continue;
-      const id = randomUUID(); const now = new Date().toISOString();
+      const id = randomUUID(); const createdAt = now().toISOString();
       db.prepare(`INSERT INTO items(id,user_id,kind,title,details,scheduled_date,scheduled_time,completed,created_at,updated_at,
         recurrence_json,reminders_json,series_root_id,occurrence_date)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, userId, row.kind, row.title, row.details, date, row.scheduled_time,
-        row.kind === "task" ? 0 : null, now, now, null, row.reminders_json ?? "[]", row.id, date);
+        row.kind === "task" ? 0 : null, createdAt, createdAt, null, row.reminders_json ?? "[]", row.id, date);
     }
   }
 }
@@ -169,6 +170,14 @@ export function listItems(userId: string) {
   const rows = database().prepare(`SELECT i.*, root.recurrence_json AS root_recurrence_json FROM items i
     LEFT JOIN items root ON root.id=i.series_root_id WHERE i.user_id=? AND NOT EXISTS(
       SELECT 1 FROM occurrence_exclusions x WHERE x.user_id=i.user_id AND x.series_root_id=i.series_root_id AND x.occurrence_date=i.occurrence_date)
+    ORDER BY i.scheduled_date IS NULL,i.scheduled_date,i.scheduled_time,i.created_at,i.id`).all(userId);
+  return withFiles(rows.map(fromRow), userId);
+}
+
+export function listItemsForCalendarSync(userId: string) {
+  ensureOccurrences(userId);
+  const rows = database().prepare(`SELECT i.*, root.recurrence_json AS root_recurrence_json FROM items i
+    LEFT JOIN items root ON root.id=i.series_root_id WHERE i.user_id=?
     ORDER BY i.scheduled_date IS NULL,i.scheduled_date,i.scheduled_time,i.created_at,i.id`).all(userId);
   return withFiles(rows.map(fromRow), userId);
 }
@@ -290,7 +299,7 @@ export function saveItem(userId: string, body: Record<string, unknown>, id?: str
   if (existing?.seriesId && scope === "occurrence" && id !== existing.seriesId) {
     write(id, false, item.scheduledDate);
     db.prepare("UPDATE items SET recurrence_json=NULL,series_root_id=?,occurrence_date=? WHERE user_id=? AND id=?")
-      .run(existing.seriesId, existing.scheduledDate, userId, id);
+      .run(existing.seriesId, existing.occurrenceDate ?? existing.scheduledDate, userId, id);
   } else write(id, !rootId || id === rootId);
   if (item.recurrence && !rootId) db.prepare("UPDATE items SET series_root_id=id,occurrence_date=scheduled_date,recurrence_json=? WHERE id=?").run(JSON.stringify(item.recurrence),id);
   if (existing?.recurrence && !item.recurrence) db.prepare("DELETE FROM items WHERE series_root_id=? AND id<>?").run(existing.id,id);

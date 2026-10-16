@@ -1,9 +1,10 @@
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:crypto";
 import { database } from "./database";
 import { HttpError } from "./http";
-import { listItems } from "./workspace";
+import { listItems, listItemsForCalendarSync } from "./workspace";
 import type { RecurrenceRule } from "./items";
 import { saveItem } from "./workspace";
+import { now, nowMs } from "./clock";
 
 type Provider = "google" | "apple";
 type Connection = { user_id: string; provider: Provider; account_label: string; access_token: string | null; refresh_token: string | null; calendar_url: string | null; expires_at: number | null };
@@ -64,8 +65,8 @@ export function createGoogleAuthorization(userId: string) {
   if (!clientId || !redirectUri) throw new HttpError(503, "Configure Google Calendar OAuth on the server before connecting an account.");
   encryptionKey();
   const state = randomBytes(32).toString("base64url");
-  database().prepare("DELETE FROM calendar_oauth_states WHERE expires_at <= ?").run(Date.now());
-  database().prepare("INSERT INTO calendar_oauth_states(state,user_id,expires_at) VALUES(?,?,?)").run(state,userId,Date.now()+10*60_000);
+  database().prepare("DELETE FROM calendar_oauth_states WHERE expires_at <= ?").run(nowMs());
+  database().prepare("INSERT INTO calendar_oauth_states(state,user_id,expires_at) VALUES(?,?,?)").run(state,userId,nowMs()+10*60_000);
   const url = new URL(process.env.FILETASKS_GOOGLE_AUTH_URL || "https://accounts.google.com/o/oauth2/v2/auth");
   url.searchParams.set("client_id", clientId); url.searchParams.set("redirect_uri", redirectUri);
   url.searchParams.set("response_type", "code"); url.searchParams.set("scope", "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly");
@@ -75,7 +76,7 @@ export function createGoogleAuthorization(userId: string) {
 
 export async function finishGoogleAuthorization(state: string, code: string) {
   const db = database();
-  const stateRow = db.prepare("SELECT user_id FROM calendar_oauth_states WHERE state=? AND expires_at>? ").get(state,Date.now());
+  const stateRow = db.prepare("SELECT user_id FROM calendar_oauth_states WHERE state=? AND expires_at>? ").get(state,nowMs());
   db.prepare("DELETE FROM calendar_oauth_states WHERE state=?").run(state);
   if (!stateRow) throw new HttpError(400, "Google Calendar connection expired. Start connecting again.");
   const clientId = process.env.GOOGLE_CALENDAR_CLIENT_ID!; const clientSecret = process.env.GOOGLE_CALENDAR_CLIENT_SECRET!;
@@ -94,7 +95,7 @@ export async function finishGoogleAuthorization(state: string, code: string) {
   db.prepare(`INSERT INTO calendar_connections(user_id,provider,account_label,access_token,refresh_token,calendar_url,connected_at,expires_at)
     VALUES(?,'google',?,?,?,?,?,?) ON CONFLICT(user_id,provider) DO UPDATE SET account_label=excluded.account_label,
     access_token=excluded.access_token,refresh_token=excluded.refresh_token,calendar_url=excluded.calendar_url,
-    connected_at=excluded.connected_at,expires_at=excluded.expires_at`).run(String(stateRow.user_id),calendar.summary ?? "Google Calendar",encrypt(tokens.access_token),refreshCipher,calendar.id,new Date().toISOString(),Date.now()+Math.max(60,tokens.expires_in ?? 3600)*1000-60_000);
+    connected_at=excluded.connected_at,expires_at=excluded.expires_at`).run(String(stateRow.user_id),calendar.summary ?? "Google Calendar",encrypt(tokens.access_token),refreshCipher,calendar.id,now().toISOString(),nowMs()+Math.max(60,tokens.expires_in ?? 3600)*1000-60_000);
 }
 
 export async function connectAppleCalendar(userId: string, body: Record<string, unknown>) {
@@ -140,11 +141,11 @@ export async function connectAppleCalendar(userId: string, body: Record<string, 
   const validation = await fetch(url, { method: "PROPFIND", headers: { Authorization: authorization, Depth: "0", "Content-Type": "application/xml; charset=utf-8" }, body: `<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>` });
   if (validation.status === 401 || validation.status === 403) throw new HttpError(400, "Apple Calendar rejected the Apple ID or app-specific password.");
   if (!validation.ok && validation.status !== 207) throw new HttpError(400, "Could not verify the Apple CalDAV calendar URL.");
-  const now = new Date().toISOString();
+  const connectedAt = now().toISOString();
   database().prepare(`INSERT INTO calendar_connections(user_id,provider,account_label,access_token,refresh_token,calendar_url,connected_at)
     VALUES(?,'apple',?,?,NULL,?,?) ON CONFLICT(user_id,provider) DO UPDATE SET account_label=excluded.account_label,
-    access_token=excluded.access_token,calendar_url=excluded.calendar_url,connected_at=excluded.connected_at`).run(userId,label,encrypt(JSON.stringify({ username: body.username.trim(), password: body.password })),url.toString(),now);
-  return { provider: "apple", accountLabel: label, connectedAt: now };
+    access_token=excluded.access_token,calendar_url=excluded.calendar_url,connected_at=excluded.connected_at`).run(userId,label,encrypt(JSON.stringify({ username: body.username.trim(), password: body.password })),url.toString(),connectedAt);
+  return { provider: "apple", accountLabel: label, connectedAt };
 }
 
 export function disconnectCalendar(userId: string, provider: Provider) {
@@ -161,6 +162,32 @@ export function excludeDeletedCalendarImports(userId: string, itemId: string) {
 
 function escapeIcs(value: string) { return value.replace(/\\/g,"\\\\").replace(/\r?\n/g,"\\n").replace(/,/g,"\\,").replace(/;/g,"\\;"); }
 function compactDate(value: string) { return value.replaceAll("-", ""); }
+function filetasksEventUrl(itemId: string) {
+  const base = process.env.FILETASKS_PUBLIC_URL || process.env.FILETASKS_ORIGIN;
+  return base ? `${base.replace(/\/$/,"")}/?event=${encodeURIComponent(itemId)}` : undefined;
+}
+function googleOriginalStart(date: string, time?: string | null) {
+  if (!time) return date;
+  const timeZone = process.env.FILETASKS_TIME_ZONE || "UTC";
+  const [year, month, day] = date.split("-").map(Number);
+  const [hour, minute] = time.split(":").map(Number);
+  const wallClock = Date.UTC(year, month - 1, day, hour, minute);
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  });
+  const offsetAt = (instant: number) => {
+    const parts = Object.fromEntries(formatter.formatToParts(new Date(instant)).map(({ type, value }) => [type, value]));
+    const localAsUtc = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute), Number(parts.second));
+    return (localAsUtc - Math.floor(instant / 1000) * 1000) / 60_000;
+  };
+  let instant = wallClock;
+  for (let attempt = 0; attempt < 3; attempt++) instant = wallClock - offsetAt(instant) * 60_000;
+  const offset = offsetAt(instant);
+  const sign = offset < 0 ? "-" : "+";
+  const absoluteOffset = Math.abs(offset);
+  const suffix = `${sign}${String(Math.floor(absoluteOffset / 60)).padStart(2,"0")}:${String(absoluteOffset % 60).padStart(2,"0")}`;
+  return `${date}T${time}:00${suffix}`;
+}
 function plusOneDay(value: string) { const date = new Date(`${value}T00:00:00Z`); date.setUTCDate(date.getUTCDate()+1); return date.toISOString().slice(0,10); }
 function oneHourLater(date: string, time: string) {
   const [hour, minute] = time.split(":").map(Number);
@@ -169,8 +196,8 @@ function oneHourLater(date: string, time: string) {
   const endTime = `${String(Math.floor(total % 1440 / 60)).padStart(2,"0")}:${String(total % 60).padStart(2,"0")}`;
   return `${endDate}T${endTime}:00`;
 }
-function icsFor(item: EventItem, uid: string, exceptions: EventItem[] = []) {
-  const stamp = new Date().toISOString().replace(/[-:]/g,"").replace(/\.\d{3}/," ").trim();
+function icsFor(item: EventItem, uid: string, exceptions: EventItem[] = [], excludedDates: string[] = []) {
+  const stamp = now().toISOString().replace(/[-:]/g,"").replace(/\.\d{3}/," ").trim();
   const fields = [`BEGIN:VCALENDAR`,`VERSION:2.0`,`PRODID:-//FileTasks//Calendar//EN`,`BEGIN:VEVENT`,`UID:${uid}`,`DTSTAMP:${stamp}`];
   if (item.scheduledDate) {
     if (item.scheduledTime) fields.push(`DTSTART:${compactDate(item.scheduledDate)}T${item.scheduledTime.replace(":","")}00`);
@@ -178,9 +205,14 @@ function icsFor(item: EventItem, uid: string, exceptions: EventItem[] = []) {
   }
   fields.push(`SUMMARY:${escapeIcs(item.title)}`);
   if (item.details) fields.push(`DESCRIPTION:${escapeIcs(item.details)}`);
-  const base = process.env.FILETASKS_PUBLIC_URL || process.env.FILETASKS_ORIGIN;
-  if (base) fields.push(`URL:${base.replace(/\/$/,"")}/?event=${encodeURIComponent(item.id)}`);
+  const url = filetasksEventUrl(item.id);
+  if (url) fields.push(`URL:${url}`);
   if (item.recurrence) fields.push(`RRULE:${rruleFor(item.recurrence)}`);
+  for (const date of excludedDates) {
+    fields.push(item.scheduledTime
+      ? `EXDATE:${compactDate(date)}T${item.scheduledTime.replace(":","")}00`
+      : `EXDATE;VALUE=DATE:${compactDate(date)}`);
+  }
   fields.push("END:VEVENT","END:VCALENDAR");
   for (const occurrence of exceptions) {
     const recurrenceId = occurrence.occurrenceDate;
@@ -194,6 +226,7 @@ function icsFor(item: EventItem, uid: string, exceptions: EventItem[] = []) {
     }
     exception.push(`SUMMARY:${escapeIcs(occurrence.title)}`);
     if (occurrence.details) exception.push(`DESCRIPTION:${escapeIcs(occurrence.details)}`);
+    if (url) exception.push(`URL:${url}`);
     exception.push("END:VEVENT");
     fields.splice(fields.length - 1,0,...exception);
   }
@@ -209,13 +242,29 @@ function rruleFor(rule: NonNullable<EventItem["recurrence"]>) {
   return parts.join(";");
 }
 
+function calendarExclusions(userId: string, rootId: string) {
+  return database().prepare("SELECT occurrence_date FROM occurrence_exclusions WHERE user_id=? AND series_root_id=? ORDER BY occurrence_date")
+    .all(userId, rootId).map((row) => String(row.occurrence_date));
+}
+
+function googleRecurrence(item: EventItem, excludedDates: string[]) {
+  if (!item.recurrence) return undefined;
+  const recurrence = [`RRULE:${rruleFor(item.recurrence)}`];
+  for (const date of excludedDates) {
+    recurrence.push(item.scheduledTime
+      ? `EXDATE;TZID=${process.env.FILETASKS_TIME_ZONE || "UTC"}:${compactDate(date)}T${item.scheduledTime.replace(":","")}00`
+      : `EXDATE;VALUE=DATE:${compactDate(date)}`);
+  }
+  return recurrence;
+}
+
 async function googleAccess(connection: Connection) {
-  if (connection.expires_at && connection.expires_at > Date.now() && connection.access_token) return decrypt(connection.access_token);
+  if (connection.expires_at && connection.expires_at > nowMs() && connection.access_token) return decrypt(connection.access_token);
   if (!connection.refresh_token) throw new HttpError(503, "Reconnect Google Calendar to continue syncing.");
   const response = await fetch(googleTokenUrl(), { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: process.env.GOOGLE_CALENDAR_CLIENT_ID ?? "", client_secret: process.env.GOOGLE_CALENDAR_CLIENT_SECRET ?? "", refresh_token: decrypt(connection.refresh_token), grant_type: "refresh_token" }) });
   if (!response.ok) throw new HttpError(502, "Google Calendar authorization expired. Reconnect the calendar.");
   const tokens = await response.json() as { access_token: string; expires_in: number };
-  database().prepare("UPDATE calendar_connections SET access_token=?,expires_at=? WHERE user_id=? AND provider='google'").run(encrypt(tokens.access_token),Date.now()+(tokens.expires_in-60)*1000,connection.user_id);
+  database().prepare("UPDATE calendar_connections SET access_token=?,expires_at=? WHERE user_id=? AND provider='google'").run(encrypt(tokens.access_token),nowMs()+(tokens.expires_in-60)*1000,connection.user_id);
   return tokens.access_token;
 }
 
@@ -253,7 +302,7 @@ function importEvent(userId: string, externalId: string, title: string, details:
 async function importGoogleEvents(connection: Connection) {
   const access = await googleAccess(connection); const calendarId = encodeURIComponent(connection.calendar_url ?? "primary");
   const existing = new Set(database().prepare("SELECT external_id FROM calendar_imports WHERE user_id=? AND provider='google' UNION SELECT external_id FROM calendar_import_exclusions WHERE user_id=? AND provider='google'").all(connection.user_id,connection.user_id).map((row) => String(row.external_id)));
-  const now = new Date(); const timeMin = new Date(now.getTime()-90*86_400_000).toISOString(); const timeMax = new Date(now.getTime()+370*86_400_000).toISOString();
+  const current = now(); const timeMin = new Date(current.getTime()-90*86_400_000).toISOString(); const timeMax = new Date(current.getTime()+370*86_400_000).toISOString();
   let pageToken: string | undefined; let imported = 0;
   do {
     const url = googleApiUrl(`calendar/v3/calendars/${calendarId}/events`);
@@ -288,8 +337,8 @@ async function importAppleEvents(connection: Connection) {
   if (!connection.access_token || !connection.calendar_url) throw new HttpError(503,"Reconnect Apple Calendar to continue syncing.");
   const credentials = JSON.parse(decrypt(connection.access_token)) as { username: string; password: string };
   const authorization = `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString("base64")}`;
-  const from = new Date(Date.now()-90*86_400_000).toISOString().replace(/[-:]/g,"").replace(/\.\d{3}Z$/, "Z");
-  const to = new Date(Date.now()+370*86_400_000).toISOString().replace(/[-:]/g,"").replace(/\.\d{3}Z$/, "Z");
+  const from = new Date(nowMs()-90*86_400_000).toISOString().replace(/[-:]/g,"").replace(/\.\d{3}Z$/, "Z");
+  const to = new Date(nowMs()+370*86_400_000).toISOString().replace(/[-:]/g,"").replace(/\.\d{3}Z$/, "Z");
   const body = `<?xml version="1.0" encoding="utf-8"?><c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"><c:time-range start="${from}" end="${to}"/></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>`;
   const response = await fetch(connection.calendar_url,{ method:"REPORT", headers:{ Authorization:authorization, Depth:"1", "Content-Type":"application/xml; charset=utf-8" }, body });
   if (!response.ok && response.status !== 207) throw new HttpError(502,"Could not read Events from Apple Calendar.");
@@ -327,9 +376,10 @@ async function syncGoogle(connection: Connection, events: EventItem[]) {
   }
   for (const item of roots) {
     const mapped = maps.get(item.id); const url = googleApiUrl(`calendar/v3/calendars/${calendarId}/events${mapped ? `/${encodeURIComponent(mapped)}` : ""}`);
-    const event = { summary: item.title, description: `${item.details}${process.env.FILETASKS_PUBLIC_URL || process.env.FILETASKS_ORIGIN ? `\n\nOpen in FileTasks: ${(process.env.FILETASKS_PUBLIC_URL || process.env.FILETASKS_ORIGIN)!.replace(/\/$/,"")}/?event=${encodeURIComponent(item.id)}` : ""}`,
+    const backlink = filetasksEventUrl(item.id);
+    const event = { summary: item.title, description: `${item.details}${backlink ? `\n\nOpen in FileTasks: ${backlink}` : ""}`,
       ...(item.scheduledDate ? item.scheduledTime ? { start: { dateTime: `${item.scheduledDate}T${item.scheduledTime}:00`, timeZone: process.env.FILETASKS_TIME_ZONE || "UTC" }, end: { dateTime: oneHourLater(item.scheduledDate,item.scheduledTime), timeZone: process.env.FILETASKS_TIME_ZONE || "UTC" } } : { start: { date: item.scheduledDate }, end: { date: plusOneDay(item.scheduledDate) } } : {}),
-      ...(item.recurrence ? { recurrence: [`RRULE:${rruleFor(item.recurrence)}`] } : {}), extendedProperties: { private: { filetasksItemId: item.id } } };
+      ...(item.recurrence ? { recurrence: googleRecurrence(item, calendarExclusions(connection.user_id, item.id)) } : {}), extendedProperties: { private: { filetasksItemId: item.id } } };
     let response = await fetch(url, { method: mapped ? "PUT" : "POST", headers: { Authorization: `Bearer ${access}`, "Content-Type": "application/json" }, body: JSON.stringify(event) });
     if (mapped && response.status === 404) response = await fetch(googleApiUrl(`calendar/v3/calendars/${calendarId}/events`), { method: "POST", headers: { Authorization: `Bearer ${access}`, "Content-Type": "application/json" }, body: JSON.stringify(event) });
     if (!response.ok) throw new HttpError(502, "An Event could not be synchronized to Google Calendar.");
@@ -339,23 +389,23 @@ async function syncGoogle(connection: Connection, events: EventItem[]) {
     maps.set(item.id,saved.id);
   }
   const byId = new Map(roots.map((item) => [item.id,item]));
-  const min = new Date(Date.now()-90*86_400_000).toISOString(); const max = new Date(Date.now()+370*86_400_000).toISOString();
   for (const occurrence of events.filter((item) => item.seriesId && item.id !== item.seriesId && item.occurrenceDate)) {
     const root = byId.get(occurrence.seriesId!); const rootEventId = maps.get(occurrence.seriesId!);
-    if (!root || !rootEventId || !occurrence.scheduledDate) continue;
+    if (!root || !rootEventId || !occurrence.scheduledDate || !occurrence.occurrenceDate) continue;
     const changed = occurrence.scheduledDate !== occurrence.occurrenceDate || occurrence.scheduledTime !== root.scheduledTime
       || occurrence.title !== root.title || occurrence.details !== root.details;
     if (!changed) continue;
     const instancesUrl = googleApiUrl(`calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(rootEventId)}/instances`);
-    instancesUrl.searchParams.set("timeMin",min); instancesUrl.searchParams.set("timeMax",max); instancesUrl.searchParams.set("maxResults","2500");
-    const instancesResponse = await fetch(instancesUrl,{headers:{Authorization:`Bearer ${access}`}});
+    instancesUrl.searchParams.set("originalStart",googleOriginalStart(occurrence.occurrenceDate,root.scheduledTime));
+    const instancesResponse = await fetch(instancesUrl,{headers:{Authorization:`Bearer ${access}`} });
     if (!instancesResponse.ok) throw new HttpError(502,"Could not synchronize a recurring Event Occurrence to Google Calendar.");
     const instances = await instancesResponse.json() as { items?: {id:string;originalStartTime?:{date?:string;dateTime?:string}}[] };
     const instance = instances.items?.find((entry) => (entry.originalStartTime?.dateTime ?? entry.originalStartTime?.date)?.slice(0,10) === occurrence.occurrenceDate);
     if (!instance) continue;
     const start = occurrence.scheduledTime ? {dateTime:`${occurrence.scheduledDate}T${occurrence.scheduledTime}:00`,timeZone:process.env.FILETASKS_TIME_ZONE||"UTC"} : {date:occurrence.scheduledDate};
     const end = occurrence.scheduledTime ? {dateTime:oneHourLater(occurrence.scheduledDate,occurrence.scheduledTime),timeZone:process.env.FILETASKS_TIME_ZONE||"UTC"} : {date:plusOneDay(occurrence.scheduledDate)};
-    const response = await fetch(googleApiUrl(`calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(instance.id)}`),{method:"PATCH",headers:{Authorization:`Bearer ${access}`,"Content-Type":"application/json"},body:JSON.stringify({summary:occurrence.title,description:occurrence.details,start,end})});
+    const occurrenceBacklink = filetasksEventUrl(root.id);
+    const response = await fetch(googleApiUrl(`calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(instance.id)}`),{method:"PATCH",headers:{Authorization:`Bearer ${access}`,"Content-Type":"application/json"},body:JSON.stringify({summary:occurrence.title,description:`${occurrence.details}${occurrenceBacklink ? `\n\nOpen in FileTasks: ${occurrenceBacklink}` : ""}`,start,end})});
     if (!response.ok) throw new HttpError(502,"A recurring Event Occurrence could not be synchronized to Google Calendar.");
   }
 }
@@ -383,7 +433,7 @@ async function syncApple(connection: Connection, events: EventItem[]) {
     const exceptions = events.filter((occurrence) => occurrence.seriesId === item.id && occurrence.id !== item.id
       && occurrence.occurrenceDate && (occurrence.scheduledDate !== occurrence.occurrenceDate || occurrence.scheduledTime !== item.scheduledTime
         || occurrence.title !== item.title || occurrence.details !== item.details));
-    const response = await fetch(targetUrl, { method: "PUT", headers: { Authorization: authorization, "Content-Type": "text/calendar; charset=utf-8" }, body: icsFor(item,uid,exceptions) });
+    const response = await fetch(targetUrl, { method: "PUT", headers: { Authorization: authorization, "Content-Type": "text/calendar; charset=utf-8" }, body: icsFor(item,uid,exceptions,calendarExclusions(connection.user_id,item.id)) });
     if (!response.ok) throw new HttpError(502, "An Event could not be synchronized to Apple Calendar.");
     database().prepare(`INSERT INTO calendar_copies(user_id,provider,item_id,external_id,resource_uid) VALUES(?,'apple',?,?,?)
       ON CONFLICT(user_id,provider,item_id) DO UPDATE SET external_id=excluded.external_id,resource_uid=excluded.resource_uid`).run(connection.user_id,item.id,targetUrl,uid);
@@ -398,7 +448,7 @@ export async function syncCalendars(userId: string) {
   for (const connection of connections) {
     if (connection.provider === "google") await importGoogleEvents(connection);
     else await importAppleEvents(connection);
-    const events = listItems(userId).filter((item) => item.kind === "event");
+    const events = listItemsForCalendarSync(userId).filter((item) => item.kind === "event");
     eventCount = events.length;
     if (connection.provider === "google") await syncGoogle(connection,events);
     else await syncApple(connection,events);

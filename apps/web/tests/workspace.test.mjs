@@ -1,8 +1,8 @@
-import { test, before, after } from "node:test";
+import { test, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,13 +18,30 @@ let deliveryRequests = [];
 let deliveredKeys = new Set();
 let failNextEmail = 0;
 let providerRequests = [];
+let storageRequests = [];
 let storageObjects = new Map();
 let googleEvents = new Map();
+let googleInstances = new Map();
+let googleExceptions = new Map();
+let googleInstanceRequests = [];
 let appleEvents = new Map();
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
 const nextBin = createRequire(import.meta.url).resolve("next/dist/bin/next");
 const base = "http://localhost:3107";
 let logs = "";
+let clockFile;
+let testClock = new Date("2026-10-13T12:00:00.000Z");
+let serverTimeZone = "UTC";
+
+async function setTestClock(value) {
+  testClock = new Date(value);
+  await writeFile(clockFile, testClock.toISOString());
+}
+
+async function advanceTestClock(milliseconds) {
+  await setTestClock(testClock.getTime() + milliseconds);
+}
 
 async function startServer() {
   server = spawn(process.execPath, [nextBin, "dev", "--port", "3107"], {
@@ -33,11 +50,12 @@ async function startServer() {
       ...process.env,
       FILETASKS_DATABASE_PATH: join(directory, "workspace.sqlite"),
       FILETASKS_ORIGIN: base,
-      FILETASKS_TIME_ZONE: "UTC",
+      FILETASKS_TIME_ZONE: serverTimeZone,
       FILETASKS_EMAIL_DELIVERY_URL: `${deliveryBase}/email`,
       FILETASKS_PUSH_DELIVERY_URL: `${deliveryBase}/push`,
       FILETASKS_REMINDER_WORKER_SECRET: "test-worker-secret",
       FILETASKS_REMINDER_RETRY_BASE_MS: "1000",
+      FILETASKS_TEST_CLOCK_PATH: clockFile,
       FILETASKS_CALENDAR_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
       FILETASKS_PUBLIC_URL: base,
       GOOGLE_CALENDAR_CLIENT_ID: "fake-client",
@@ -70,8 +88,12 @@ async function startDeliveryFake() {
   deliveredKeys = new Set();
   failNextEmail = 0;
   providerRequests = [];
+  storageRequests = [];
   storageObjects = new Map();
   googleEvents = new Map();
+  googleInstances = new Map();
+  googleExceptions = new Map();
+  googleInstanceRequests = [];
   appleEvents = new Map();
   deliveryServer = createServer(async (request, response) => {
     const chunks = [];
@@ -81,6 +103,7 @@ async function startDeliveryFake() {
     if (url.pathname.startsWith("/r2/")) {
       const key = url.pathname;
       const bytes = Buffer.concat(chunks);
+      storageRequests.push({ method: request.method, key });
       if (request.method === "PUT") {
         storageObjects.set(key, { bytes, contentType: request.headers["content-type"] || "application/octet-stream" });
         response.writeHead(200, { ETag: '"fake-etag"' }).end();
@@ -124,7 +147,16 @@ async function startDeliveryFake() {
         return;
       }
       if (request.method === "GET" && url.pathname.endsWith("/instances")) {
-        response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ items: [] }));
+        const originalStart = url.searchParams.get("originalStart");
+        googleInstanceRequests.push({ rootEventId: parts.at(-2), originalStart, timeMin: url.searchParams.get("timeMin"), timeMax: url.searchParams.get("timeMax") });
+        const items = [...googleInstances.values()].filter((instance) => {
+          if (!originalStart) return true;
+          const original = instance.originalStartTime?.dateTime ?? instance.originalStartTime?.date;
+          return original?.includes("T") && originalStart.includes("T")
+            ? Date.parse(original) === Date.parse(originalStart)
+            : original === originalStart;
+        });
+        response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ items }));
         return;
       }
       if (request.method === "DELETE") {
@@ -133,7 +165,13 @@ async function startDeliveryFake() {
         return;
       }
       if (request.method === "PUT" || request.method === "PATCH") {
-        if (!googleEvents.has(eventId)) { response.writeHead(404).end(); return; }
+        if (!googleEvents.has(eventId)) {
+          if (!googleInstances.has(eventId)) { response.writeHead(404).end(); return; }
+          googleExceptions.set(eventId, { ...body, id: eventId });
+          googleInstances.set(eventId, { ...googleInstances.get(eventId), ...body, id: eventId });
+          response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ id: eventId }));
+          return;
+        }
         googleEvents.set(eventId, { ...googleEvents.get(eventId), ...body, id: eventId });
         response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ id: eventId }));
         return;
@@ -191,8 +229,21 @@ async function stopServer() {
   }
 }
 
+async function runCommand(command, args, env = process.env, cwd = repoRoot) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    let output = "";
+    child.stdout.on("data", (data) => { output += data; });
+    child.stderr.on("data", (data) => { output += data; });
+    child.once("error", reject);
+    child.once("close", (code) => code === 0 ? resolve(output) : reject(new Error(`${command} ${args.join(" ")} failed with code ${code}:\n${output.slice(-6000)}`)));
+  });
+}
+
 before(async () => {
   directory = await mkdtemp(join(tmpdir(), "filetasks-test-"));
+  clockFile = join(directory, "clock.txt");
+  await setTestClock(testClock);
   await startDeliveryFake();
   await startServer();
 });
@@ -201,6 +252,14 @@ after(async () => {
   await stopServer();
   await stopDeliveryFake();
   if (directory) await rm(directory, { recursive: true, force: true });
+});
+
+afterEach(async () => {
+  if (serverTimeZone !== "UTC") {
+    serverTimeZone = "UTC";
+    await stopServer();
+    await startServer();
+  }
 });
 
 async function request(path, { token, cookie, method = "GET", body, headers = {} } = {}) {
@@ -442,6 +501,39 @@ test("the reminder worker honors configured clock times for date offsets and ski
   assert.equal(notifications.some(({ itemId }) => itemId === undated.id), false);
 });
 
+test("the controlled clock leaves timed and all-day Reminders pending until their configured times", async () => {
+  const owner = await account();
+  await setTestClock("2026-10-13T12:00:00.000Z");
+  const timed = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "Timed future Event", scheduledDate: "2026-10-14", scheduledTime: "08:30",
+    reminders: [{ delivery: "notification", amount: 1, unit: "days", time: "16:45" }],
+  } })).json()).item;
+  const allDay = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "All-day future Event", scheduledDate: "2026-10-14",
+    reminders: [{ delivery: "notification", amount: 0, unit: "days", time: "11:20" }],
+  } })).json()).item;
+
+  assert.deepEqual(await (await runReminderWorker()).json(), { attempted: 0, sent: 0, failed: 0 });
+  assert.equal((await (await request("/api/notifications", { token: owner.token })).json()).notifications.length, 0);
+  await setTestClock("2026-10-13T16:44:00.000Z");
+  await runReminderWorker();
+  assert.equal((await (await request("/api/notifications", { token: owner.token })).json()).notifications.length, 0);
+  await setTestClock("2026-10-13T16:45:00.000Z");
+  await runReminderWorker();
+  let notifications = (await (await request("/api/notifications", { token: owner.token })).json()).notifications;
+  assert.equal(notifications.some(({ itemId }) => itemId === timed.id), true);
+  assert.equal(notifications.some(({ itemId }) => itemId === allDay.id), false);
+
+  await setTestClock("2026-10-14T11:19:00.000Z");
+  await runReminderWorker();
+  notifications = (await (await request("/api/notifications", { token: owner.token })).json()).notifications;
+  assert.equal(notifications.some(({ itemId }) => itemId === allDay.id), false);
+  await setTestClock("2026-10-14T11:20:00.000Z");
+  await runReminderWorker();
+  notifications = (await (await request("/api/notifications", { token: owner.token })).json()).notifications;
+  assert.equal(notifications.some(({ itemId }) => itemId === allDay.id), true);
+});
+
 test("Email and push deliveries retry with a stable idempotency key and can be revoked", async () => {
   const owner = await account();
   const settings = await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: {
@@ -466,7 +558,7 @@ test("Email and push deliveries retry with a stable idempotency key and can be r
   failNextEmail = 1;
   const firstRun = await runReminderWorker();
   assert.deepEqual(await firstRun.json(), { attempted: 2, sent: 1, failed: 1 });
-  await delay(1_100);
+  await advanceTestClock(1_100);
   const retry = await runReminderWorker();
   assert.deepEqual(await retry.json(), { attempted: 1, sent: 1, failed: 0 });
   assert.deepEqual(await (await runReminderWorker()).json(), { attempted: 0, sent: 0, failed: 0 });
@@ -488,7 +580,7 @@ test("Email and push deliveries retry with a stable idempotency key and can be r
 
 test("long-lead Reminders extend rolling Occurrence materialization beyond the former horizon", async () => {
   const owner = await account();
-  const today = new Date().toISOString().slice(0, 10);
+  const today = testClock.toISOString().slice(0, 10);
   const root = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
     kind: "task", title: "Long lead task", scheduledDate: today,
     recurrence: { interval: 1, unit: "months", end: { type: "never" } },
@@ -594,6 +686,11 @@ test("Google and Apple Calendar copies sync through fake provider boundaries", a
   googleEvents.set(googleId, { ...googleEvents.get(googleId), summary: "External edit" });
   assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
   assert.equal(googleEvents.get(googleId).summary, "Updated cross-provider review");
+  const appleCopyPath = [...appleEvents.keys()][0];
+  appleEvents.set(appleCopyPath, appleEvents.get(appleCopyPath).replace("SUMMARY:Updated cross-provider review", "SUMMARY:External edit"));
+  assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+  assert.equal(appleEvents.get(appleCopyPath).includes("SUMMARY:Updated cross-provider review"), true);
+  assert.equal(appleEvents.get(appleCopyPath).includes("SUMMARY:External edit"), false);
   googleEvents.clear();
   assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
   assert.equal(googleEvents.size, 1);
@@ -608,6 +705,142 @@ test("Google and Apple Calendar copies sync through fake provider boundaries", a
   assert.equal(calendarRequests.some(({ method, path }) => method === "PUT" && path.startsWith("/google/calendar/")), true);
   assert.equal(calendarRequests.some(({ method }) => method === "REPORT"), true);
   assert.equal(calendarRequests.some(({ method }) => method === "DELETE"), true);
+});
+
+test("scoped recurring Event deletion syncs Google and Apple recurrence exclusions", async () => {
+  const owner = await account();
+  const authorization = await fetch(`${base}/api/calendars/google/connect`, {
+    headers: { Authorization: `Bearer ${owner.token}` }, redirect: "manual",
+  });
+  const authUrl = new URL(authorization.headers.get("location"));
+  const state = authUrl.searchParams.get("state");
+  assert.ok(state);
+  assert.equal((await fetch(`${base}/api/calendars/google/callback?state=${encodeURIComponent(state)}&code=fake-code`, { redirect: "manual" })).status, 303);
+  assert.equal((await request("/api/calendars", { token: owner.token, method: "POST", body: {
+    username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
+  } })).status, 201);
+
+  const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "Recurring provider review", scheduledDate: "2027-01-14", scheduledTime: "14:30",
+    recurrence: { interval: 1, unit: "weeks", weekdays: [4], end: { type: "count", count: 3 } },
+  } });
+  assert.equal(created.status, 201);
+  const root = (await created.json()).item;
+  const occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+    .filter((item) => item.seriesId === root.id).sort((left, right) => left.scheduledDate.localeCompare(right.scheduledDate));
+  assert.equal(occurrences.length, 3);
+  assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+  const googleId = [...googleEvents.keys()][0];
+  const applePath = [...appleEvents.keys()][0];
+
+  assert.equal((await request(`/api/items/${occurrences[1].id}?scope=occurrence`, { token: owner.token, method: "DELETE" })).status, 204);
+  assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+  assert.equal(googleEvents.has(googleId), true);
+  assert.equal(googleEvents.get(googleId).recurrence.includes(`EXDATE;TZID=UTC:${occurrences[1].scheduledDate.replaceAll("-", "")}T143000`), true);
+  assert.equal(appleEvents.get(applePath).includes(`EXDATE:${occurrences[1].scheduledDate.replaceAll("-", "")}T143000`), true);
+
+  assert.equal((await request(`/api/items/${root.id}?scope=occurrence`, { token: owner.token, method: "DELETE" })).status, 204);
+  assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+  assert.equal(googleEvents.has(googleId), true);
+  assert.equal(googleEvents.get(googleId).recurrence.includes(`EXDATE;TZID=UTC:${root.scheduledDate.replaceAll("-", "")}T143000`), true);
+  assert.equal(appleEvents.get(applePath).includes(`EXDATE:${root.scheduledDate.replaceAll("-", "")}T143000`), true);
+
+  assert.equal((await request(`/api/items/${occurrences[2].id}?scope=series`, { token: owner.token, method: "DELETE" })).status, 204);
+  assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+  assert.equal(googleEvents.size, 0);
+  assert.equal(appleEvents.size, 0);
+});
+
+test("recurring Google exceptions use immutable original starts after moves and retain FileTasks backlinks", async () => {
+  const owner = await account();
+  const authorization = await fetch(`${base}/api/calendars/google/connect`, {
+    headers: { Authorization: `Bearer ${owner.token}` }, redirect: "manual",
+  });
+  const authUrl = new URL(authorization.headers.get("location"));
+  const state = authUrl.searchParams.get("state");
+  assert.ok(state);
+  assert.equal((await fetch(`${base}/api/calendars/google/callback?state=${encodeURIComponent(state)}&code=fake-code`, { redirect: "manual" })).status, 303);
+  assert.equal((await request("/api/calendars", { token: owner.token, method: "POST", body: {
+    username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
+  } })).status, 201);
+
+  serverTimeZone = "Europe/London";
+  await stopServer();
+  await startServer();
+
+  const today = testClock.toISOString().slice(0, 10);
+  const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "Long-lead recurring Event", scheduledDate: today, scheduledTime: "09:00",
+    recurrence: { interval: 1, unit: "months", end: { type: "never" } },
+    reminders: [{ delivery: "notification", amount: 700, unit: "days", time: "08:00" }],
+  } });
+  assert.equal(created.status, 201);
+  const root = (await created.json()).item;
+  const allItems = (await (await request("/api/items", { token: owner.token })).json()).items;
+  const occurrence = allItems.filter((item) => item.seriesId === root.id && item.occurrenceDate)
+    .find((item) => Date.parse(`${item.occurrenceDate}T00:00:00Z`) - testClock.getTime() > 370 * 86_400_000
+      && Number(item.occurrenceDate.slice(5, 7)) >= 6 && Number(item.occurrenceDate.slice(5, 7)) <= 8);
+  assert.ok(occurrence, "expected a materialized summer Occurrence beyond 370 days");
+  assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+  assert.equal(googleInstanceRequests.length, 0, JSON.stringify(googleInstanceRequests));
+
+  const originalDate = occurrence.occurrenceDate;
+  const movedDate = new Date(`${originalDate}T00:00:00Z`);
+  movedDate.setUTCDate(movedDate.getUTCDate() + 10);
+  const movedDateString = movedDate.toISOString().slice(0, 10);
+  const instance = {
+    id: "google-long-lead-instance",
+    originalStartTime: { dateTime: `${originalDate}T09:00:00+01:00` },
+    start: { dateTime: `${originalDate}T09:00:00+01:00` },
+  };
+  googleInstances.set(instance.id, instance);
+  const edited = await request(`/api/items/${occurrence.id}`, { token: owner.token, method: "PATCH", body: {
+    scheduledDate: movedDateString, scheduledTime: "11:15", scope: "occurrence",
+  } });
+  assert.equal(edited.status, 200);
+  const persistedItems = (await (await request("/api/items", { token: owner.token })).json()).items;
+  const persistedRoot = persistedItems.find((item) => item.id === root.id);
+  const changedOccurrences = persistedItems.filter((item) => item.seriesId === root.id && item.id !== root.id && item.occurrenceDate)
+    .filter((item) => item.scheduledDate !== item.occurrenceDate || item.scheduledTime !== persistedRoot.scheduledTime
+      || item.title !== persistedRoot.title || item.details !== persistedRoot.details);
+  assert.deepEqual(changedOccurrences.map((item) => item.id), [occurrence.id]);
+  assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+
+  const originalStartRequest = googleInstanceRequests.find(({ originalStart }) => originalStart === `${originalDate}T09:00:00+01:00`);
+  assert.ok(originalStartRequest);
+  assert.equal(originalStartRequest.timeMin, null);
+  assert.equal(originalStartRequest.timeMax, null);
+  assert.deepEqual(googleExceptions.get(instance.id).start, {
+    dateTime: `${movedDateString}T11:15:00`, timeZone: "Europe/London",
+  });
+  const backlink = `${base}/?event=${encodeURIComponent(root.id)}`;
+  assert.ok(googleExceptions.get(instance.id).description.includes(backlink));
+
+  const movedAgain = new Date(`${originalDate}T00:00:00Z`);
+  movedAgain.setUTCDate(movedAgain.getUTCDate() + 20);
+  const movedAgainString = movedAgain.toISOString().slice(0, 10);
+  const movedAgainResponse = await request(`/api/items/${occurrence.id}`, { token: owner.token, method: "PATCH", body: {
+    scheduledDate: movedAgainString, title: "Restored from FileTasks", scope: "occurrence",
+  } });
+  assert.equal(movedAgainResponse.status, 200);
+  const movedAgainItem = (await movedAgainResponse.json()).item;
+  assert.equal(movedAgainItem.scheduledDate, movedAgainString);
+  assert.equal(movedAgainItem.occurrenceDate, originalDate);
+  googleInstances.set(instance.id, { ...googleInstances.get(instance.id), summary: "Edited outside FileTasks", start: { dateTime: "2039-01-01T09:00:00+00:00" } });
+  assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+  assert.ok(googleInstanceRequests.filter(({ originalStart }) => originalStart === `${originalDate}T09:00:00+01:00`).length >= 2);
+  const instancePatchRequests = providerRequests.filter(({ path }) => path.endsWith(`/events/${instance.id}`));
+  assert.ok(instancePatchRequests.length >= 3, "FileTasks should update the same Google instance after moving and restoring it");
+  assert.deepEqual(googleExceptions.get(instance.id).start, {
+    dateTime: `${movedAgainString}T11:15:00`, timeZone: "Europe/London",
+  });
+  assert.equal(googleExceptions.get(instance.id).summary, "Restored from FileTasks");
+
+  const appleCopy = [...appleEvents.values()][0];
+  const exceptionComponent = appleCopy.split("BEGIN:VEVENT").find((part) => part.includes(`RECURRENCE-ID:${originalDate.replaceAll("-", "")}T090000`));
+  assert.ok(exceptionComponent);
+  assert.ok(appleCopy.includes(`DTSTART:${movedAgainString.replaceAll("-", "")}T111500`));
+  assert.ok(exceptionComponent.includes(`URL:${backlink}`));
 });
 
 test("recurring items create independent Occurrences and honor occurrence and series edit scopes", async () => {
@@ -821,4 +1054,76 @@ test("a person's account and saved items remain available after the server resta
   assert.deepEqual((await response.json()).items, [item]);
   const login = await request("/api/auth/login", { method: "POST", body: { email: owner.user.email, password: "correct-horse-battery" } });
   assert.equal(login.status, 200);
+});
+
+test("iOS, Android and web run against one shared account, API and provider fakes", {
+  skip: process.env.FILETASKS_RUN_NATIVE_ACCEPTANCE !== "1",
+}, async () => {
+  await setTestClock("2026-10-13T12:00:00.000Z");
+  const email = `shared-native-${crypto.randomUUID()}@example.com`;
+  const password = "correct-horse-battery";
+  const namespace = crypto.randomUUID();
+  const sharedOwner = await account(email);
+  const providerIndex = providerRequests.length;
+  const workerDeliveriesBefore = providerRequests.filter(({ path, body }) => path === "/push" && body.operation === "deliver").length;
+  const nativeEnv = {
+    ...process.env,
+    FILETASKS_TEST_API_URL: base,
+    FILETASKS_TEST_EMAIL: email,
+    FILETASKS_TEST_PASSWORD: password,
+    FILETASKS_TEST_NAMESPACE: namespace,
+    FILETASKS_TEST_WORKER_SECRET: "test-worker-secret",
+  };
+
+  await runCommand("swift", ["test", "--package-path", "apps/ios"], nativeEnv);
+
+  const fakePort = new URL(deliveryBase).port;
+  const reversedPorts = ["3107", fakePort];
+  try {
+    for (const port of reversedPorts) await runCommand("adb", ["reverse", `tcp:${port}`, `tcp:${port}`]);
+    await runCommand("./gradlew", [
+      ":app:connectedDebugAndroidTest",
+      `-Pandroid.testInstrumentationRunnerArguments.apiUrl=${base}`,
+      `-Pandroid.testInstrumentationRunnerArguments.email=${email}`,
+      `-Pandroid.testInstrumentationRunnerArguments.password=${password}`,
+      `-Pandroid.testInstrumentationRunnerArguments.namespace=${namespace}`,
+      "-Pandroid.testInstrumentationRunnerArguments.workerSecret=test-worker-secret",
+    ], process.env, join(repoRoot, "apps/android"));
+  } finally {
+    for (const port of reversedPorts) await runCommand("adb", ["reverse", "--remove", `tcp:${port}`]).catch(() => {});
+  }
+
+  const nativeRequests = providerRequests.slice(providerIndex).filter(({ path }) => path === "/push");
+  assert.ok(nativeRequests.filter(({ body }) => body.operation === "register").length >= 2,
+    "both native clients should register with the shared push provider");
+  assert.ok(nativeRequests.filter(({ body }) => body.operation === "revoke").length >= 2,
+    "both native clients should revoke their shared push registrations");
+  const nativeDeliveries = nativeRequests.filter(({ body }) => body.operation === "deliver").length;
+  assert.equal(nativeDeliveries, providerRequests.filter(({ path, body }) => path === "/push" && body.operation === "deliver").length - workerDeliveriesBefore);
+  assert.ok(nativeDeliveries >= 2, "both native clients should cause observable push delivery requests at the shared fake");
+  assert.equal(providerRequests.slice(providerIndex).some(({ path, body }) => path === "/email" && body.operation === "deliver"), false);
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const page = await context.newPage();
+  try {
+    await page.goto(base);
+    await page.getByLabel("Email", { exact: true }).fill(email);
+    await page.getByLabel("Password", { exact: true }).fill(password);
+    await page.locator("form").getByRole("button", { name: "Sign in", exact: true }).click();
+    await page.getByRole("button", { name: "Events", exact: true }).click();
+    await expect(page.getByRole("heading", { name: `Cross-platform Event ${namespace}`, exact: true }).first()).toBeVisible();
+    await page.getByRole("button", { name: "Files", exact: true }).click();
+    for (const name of [`iOS upload ${namespace}.txt`, `Android upload ${namespace}.txt`]) {
+      const card = page.locator(".file-card").filter({ hasText: name });
+      await expect(card).toBeVisible();
+      const downloadsBefore = storageRequests.filter(({ method }) => method === "GET").length;
+      await card.getByRole("button", { name: "Open", exact: true }).click();
+      await expect.poll(() => storageRequests.filter(({ method }) => method === "GET").length).toBe(downloadsBefore + 1);
+    }
+  } finally {
+    await context.close();
+    await browser.close();
+  }
+  assert.equal(sharedOwner.user.email, email);
 });

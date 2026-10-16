@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UIKit
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -7,6 +8,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var items: [WorkspaceItem] = []
     @Published private(set) var files: [WorkspaceFile] = []
     @Published private(set) var reminderSettings: ReminderSettings = .empty
+    @Published private(set) var hasRegisteredPushDevice = false
+    @Published private(set) var pushDeviceRevoked = false
     @Published private(set) var isRestoring = true
     @Published private(set) var isAuthenticating = false
     @Published private(set) var isLoadingItems = false
@@ -139,13 +142,19 @@ final class AppModel: ObservableObject {
 
     func saveReminderSettings(_ settings: ReminderSettings, applyToExisting: Bool) async throws {
         let context = try currentContext()
+        let wasPushEnabled = reminderSettings.pushEnabled
         do {
             let updated = try await APIClient(baseURL: context.baseURL).updateReminderSettings(
                 settings, token: context.token, applyToExisting: applyToExisting
             )
             guard isCurrent(context) else { throw APIClientError.sessionChanged }
             reminderSettings = updated
+            if updated.pushEnabled && !wasPushEnabled, let user {
+                UserDefaults.standard.set(false, forKey: pushDeviceRevokedKey(for: user.id))
+                pushDeviceRevoked = false
+            }
             await refreshItems(using: context)
+            if !updated.pushEnabled { try await revokeCurrentPushDevice(using: context) }
         } catch {
             handle(error, for: context)
             throw error
@@ -159,8 +168,41 @@ final class AppModel: ObservableObject {
                 platform: platform, pushToken: pushToken, authToken: context.token
             )
             guard isCurrent(context) else { throw APIClientError.sessionChanged }
+            if let user { UserDefaults.standard.set(device.id, forKey: pushDeviceKey(for: user.id)) }
+            hasRegisteredPushDevice = true
+            if let user { UserDefaults.standard.set(false, forKey: pushDeviceRevokedKey(for: user.id)) }
+            pushDeviceRevoked = false
             errorMessage = nil
             return device
+        } catch {
+            handle(error, for: context)
+            throw error
+        }
+    }
+
+    func allowPushDeviceRegistration() throws {
+        guard let user, reminderSettings.pushEnabled else { throw APIClientError.missingToken }
+        UserDefaults.standard.set(false, forKey: pushDeviceRevokedKey(for: user.id))
+        pushDeviceRevoked = false
+    }
+
+    func revokeCurrentPushDevice() async throws {
+        try await revokeCurrentPushDevice(using: currentContext())
+    }
+
+    private func revokeCurrentPushDevice(using context: SessionContext) async throws {
+        guard let user, let deviceId = UserDefaults.standard.string(forKey: pushDeviceKey(for: user.id)) else {
+            hasRegisteredPushDevice = false
+            return
+        }
+        do {
+            try await APIClient(baseURL: context.baseURL).revokePushDevice(id: deviceId, token: context.token)
+            guard isCurrent(context) else { throw APIClientError.sessionChanged }
+            UserDefaults.standard.removeObject(forKey: pushDeviceKey(for: user.id))
+            UserDefaults.standard.set(true, forKey: pushDeviceRevokedKey(for: user.id))
+            hasRegisteredPushDevice = false
+            pushDeviceRevoked = true
+            errorMessage = nil
         } catch {
             handle(error, for: context)
             throw error
@@ -172,6 +214,10 @@ final class AppModel: ObservableObject {
         do {
             try await APIClient(baseURL: context.baseURL).revokePushDevice(id: id, token: context.token)
             guard isCurrent(context) else { throw APIClientError.sessionChanged }
+            if let user { UserDefaults.standard.removeObject(forKey: pushDeviceKey(for: user.id)) }
+            if let user { UserDefaults.standard.set(true, forKey: pushDeviceRevokedKey(for: user.id)) }
+            hasRegisteredPushDevice = false
+            pushDeviceRevoked = true
             errorMessage = nil
         } catch {
             handle(error, for: context)
@@ -321,8 +367,10 @@ final class AppModel: ObservableObject {
         }
 
         do {
+            try await revokeCurrentPushDevice(using: context)
             try await APIClient(baseURL: context.baseURL).logout(token: context.token)
             guard isCurrent(context) else { return }
+            UIApplication.shared.unregisterForRemoteNotifications()
             invalidateSession()
             do {
                 try tokenStore.delete()
@@ -399,6 +447,8 @@ final class AppModel: ObservableObject {
         items = []
         files = []
         reminderSettings = .empty
+        hasRegisteredPushDevice = UserDefaults.standard.string(forKey: pushDeviceKey(for: user.id)) != nil
+        pushDeviceRevoked = UserDefaults.standard.bool(forKey: pushDeviceRevokedKey(for: user.id))
         isLoadingItems = false
         errorMessage = nil
         return SessionContext(generation: sessionGeneration, token: token, baseURL: baseURL)
@@ -442,6 +492,8 @@ final class AppModel: ObservableObject {
         items = []
         files = []
         reminderSettings = .empty
+        hasRegisteredPushDevice = false
+        pushDeviceRevoked = false
         errorMessage = nil
     }
 
@@ -453,4 +505,7 @@ final class AppModel: ObservableObject {
             items.append(item)
         }
     }
+
+    private func pushDeviceKey(for userId: String) -> String { "filetasks.push-device.\(userId)" }
+    private func pushDeviceRevokedKey(for userId: String) -> String { "filetasks.push-device-revoked.\(userId)" }
 }

@@ -14,6 +14,18 @@ Install the resulting `app/build/outputs/apk/debug/app-debug.apk` on an emulator
 
 The Gradle wrapper pins Gradle 8.14.6 and checks its binary distribution against the SHA-256 published by Gradle. Android Gradle Plugin 8.13.2 requires Gradle 8.13 or newer and JDK 17. The project uses the Compose compiler Gradle plugin and the Compose BOM to keep Compose artifacts aligned. OkHttp handles HTTP requests, including the API's PATCH updates.
 
+To use Push delivery, configure a Firebase Android app for `com.filetasks.android` and place its `google-services.json` in `app/`. The client asks for notification permission when Push is enabled, registers its Firebase Installation ID with the shared FileTasks API, and revokes the device registration when requested. Firebase only supplies the Android device identity and transport; the FileTasks server continues to send through its configured push adapter. Push messages should include `title`, `body`, `scheduledAt`, and `itemId` data fields for the native notification.
+
+## Acceptance tests
+
+Run the complete shared acceptance harness from the repository root on a Mac with Swift/Xcode command-line tools, Android SDK, and a booted Android emulator:
+
+```sh
+npm run test:acceptance
+```
+
+The harness keeps the API and fake calendar, delivery, and object-storage providers running while browser, Swift, and Android tests use the same account. The Android instrumentation case reads and downloads the File uploaded by iOS, uploads and downloads its own File, exercises scoped Recurrence and Attachment changes, registers and revokes a Push device, and triggers a due Reminder through the shared delivery fake. A focused Android run can target a test API with `./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.apiUrl=http://10.0.2.2:3107`.
+
 ## Account and data behavior
 
 - Sign in or create an account with the shared `/api/auth` endpoints.

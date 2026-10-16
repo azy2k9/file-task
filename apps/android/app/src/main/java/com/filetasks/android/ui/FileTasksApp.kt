@@ -1,8 +1,11 @@
 package com.filetasks.android.ui
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -51,6 +54,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.input.ImeAction
@@ -63,6 +67,7 @@ import com.filetasks.android.data.ApiException
 import com.filetasks.android.data.ItemFields
 import com.filetasks.android.data.ItemKind
 import com.filetasks.android.data.FileAttachment
+import com.filetasks.android.data.PushDevice
 import com.filetasks.android.data.RecurrenceEnd
 import com.filetasks.android.data.RecurrenceRule
 import com.filetasks.android.data.ReminderRule
@@ -71,10 +76,15 @@ import com.filetasks.android.data.TokenStore
 import com.filetasks.android.data.WorkspaceFile
 import com.filetasks.android.data.WorkspaceFileSummary
 import com.filetasks.android.data.WorkspaceItem
+import com.filetasks.android.PushMessagingService
+import com.google.firebase.installations.FirebaseInstallations
+import com.google.firebase.messaging.FirebaseMessaging
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.tasks.await
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
@@ -86,11 +96,23 @@ private const val API_URL_KEY = "api_url"
 
 private data class EditorTarget(val item: WorkspaceItem?)
 
+private fun attachmentSourceFor(item: WorkspaceItem, file: WorkspaceFile, items: List<WorkspaceItem>): FileAttachment? {
+    file.attachments.firstOrNull { it.itemId == item.id }?.let { return it }
+    val seriesId = item.seriesId ?: return null
+    file.attachments.firstOrNull { it.scope == "series" && it.itemId == seriesId }?.let { return it }
+    val occurrenceDate = item.occurrenceDate ?: return null
+    return file.attachments.firstOrNull { attachment ->
+        if (attachment.scope != "following") return@firstOrNull false
+        val anchor = items.firstOrNull { it.id == attachment.itemId } ?: return@firstOrNull false
+        anchor.seriesId == seriesId && anchor.occurrenceDate?.let { it <= occurrenceDate } == true
+    }
+}
+
 private enum class ItemFilter { All, Tasks, Events }
 private enum class WorkspaceSection { Agenda, Files }
 
 @Composable
-fun FileTasksApp(context: Context) {
+fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) {
     MaterialTheme(colorScheme = lightColorScheme(primary = Color(0xFF315F57))) {
         val preferences = remember(context) {
             context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
@@ -107,6 +129,7 @@ fun FileTasksApp(context: Context) {
         var workspaceItems by remember { mutableStateOf(emptyList<WorkspaceItem>()) }
         var workspaceFiles by remember { mutableStateOf(emptyList<WorkspaceFile>()) }
         var reminderSettings by remember { mutableStateOf(ReminderSettings.Empty) }
+        var pushDeviceId by remember { mutableStateOf<String?>(null) }
         var initialLoading by remember { mutableStateOf(true) }
         var working by remember { mutableStateOf(false) }
         var recoveryAvailable by remember { mutableStateOf(false) }
@@ -129,6 +152,19 @@ fun FileTasksApp(context: Context) {
         var showLinkDialog by remember { mutableStateOf(false) }
         var linkName by rememberSaveable { mutableStateOf("") }
         var linkUrl by rememberSaveable { mutableStateOf("") }
+
+        LaunchedEffect(user?.id) {
+            pushDeviceId = user?.id?.let { preferences.getString(PushMessagingService.pushDeviceKey(it), null) }
+        }
+        var handledOpenItemRequest by remember { mutableStateOf<Long?>(null) }
+        LaunchedEffect(openItemRequest, workspaceItems) {
+            val (itemId, requestId) = openItemRequest ?: return@LaunchedEffect
+            if (handledOpenItemRequest == requestId) return@LaunchedEffect
+            val item = workspaceItems.firstOrNull { it.id == itemId } ?: return@LaunchedEffect
+            handledOpenItemRequest = requestId
+            workspaceSection = WorkspaceSection.Agenda.name
+            editorTarget = EditorTarget(item)
+        }
 
         LaunchedEffect(Unit) {
             val savedToken = withContext(Dispatchers.IO) { tokenStore.read() }
@@ -216,9 +252,17 @@ fun FileTasksApp(context: Context) {
 
         fun signOut() {
             val currentToken = token
+            val currentUserId = user?.id
             runAction {
                 if (currentToken != null) {
-                    runCatching { ApiClient(apiBaseUrl).logout(currentToken) }
+                    val api = ApiClient(apiBaseUrl)
+                    if (currentUserId != null) {
+                        val key = PushMessagingService.pushDeviceKey(currentUserId)
+                        pushDeviceId?.let { deviceId -> api.revokePushDevice(currentToken, PushDevice(deviceId, "android", "")) }
+                        preferences.edit().remove(key).remove(PushMessagingService.pushFidKey(currentUserId)).putBoolean("push_enabled", false).putBoolean("push_device_revoked", true).apply()
+                    }
+                    runCatching { FirebaseMessaging.getInstance().unregister().await() }
+                    runCatching { api.logout(currentToken) }
                 }
                 withContext(Dispatchers.IO) { tokenStore.clear() }
                 token = null
@@ -226,6 +270,7 @@ fun FileTasksApp(context: Context) {
                 workspaceItems = emptyList()
                 workspaceFiles = emptyList()
                 reminderSettings = ReminderSettings.Empty
+                pushDeviceId = null
                 recoveryAvailable = false
             }
         }
@@ -666,14 +711,58 @@ fun FileTasksApp(context: Context) {
             ReminderSettingsDialog(
                 initial = reminderSettings,
                 isBusy = working,
+                deviceRegistered = pushDeviceId != null,
                 onDismiss = { showReminderSettings = false },
+                onRevokeDevice = {
+                    if (!operationMutex.tryLock()) throw IllegalStateException("Please wait for the current request to finish.")
+                    working = true
+                    try {
+                        val currentToken = token ?: throw IllegalStateException("Sign in to manage push devices.")
+                        val currentUser = user ?: throw IllegalStateException("Sign in to manage push devices.")
+                        pushDeviceId?.let { deviceId ->
+                            ApiClient(apiBaseUrl).revokePushDevice(currentToken, PushDevice(deviceId, "android", ""))
+                            preferences.edit().remove(PushMessagingService.pushDeviceKey(currentUser.id))
+                                .remove(PushMessagingService.pushFidKey(currentUser.id)).putBoolean("push_device_revoked", true).apply()
+                            pushDeviceId = null
+                            FirebaseMessaging.getInstance().unregister().await()
+                        }
+                    } finally {
+                        working = false
+                        operationMutex.unlock()
+                    }
+                },
                 onSave = { updated, applyToExisting ->
                     if (!operationMutex.tryLock()) throw IllegalStateException("Please wait for the current request to finish.")
                     working = true
                     try {
                         val currentToken = token ?: throw IllegalStateException("Sign in to update Reminder settings.")
+                        val currentUser = user ?: throw IllegalStateException("Sign in to update Reminder settings.")
                         val api = ApiClient(apiBaseUrl)
-                        reminderSettings = api.updateReminderSettings(currentToken, updated, applyToExisting)
+                        val wasPushEnabled = reminderSettings.pushEnabled
+                        val savedSettings = api.updateReminderSettings(currentToken, updated, applyToExisting)
+                        val deviceKey = PushMessagingService.pushDeviceKey(currentUser.id)
+                        if (savedSettings.pushEnabled) {
+                            val deviceWasExplicitlyRevoked = preferences.getBoolean(PushMessagingService.PUSH_REVOKED_KEY, false) && wasPushEnabled
+                            preferences.edit().putBoolean("push_enabled", true)
+                                .putBoolean(PushMessagingService.PUSH_REVOKED_KEY, deviceWasExplicitlyRevoked).apply()
+                            if (pushDeviceId == null && !deviceWasExplicitlyRevoked) {
+                                FirebaseMessaging.getInstance().register().await()
+                                val installationId = FirebaseInstallations.getInstance().id.await()
+                                val device = api.registerPushDevice(currentToken, "android", installationId)
+                                preferences.edit().putString(deviceKey, device.id)
+                                    .putString(PushMessagingService.pushFidKey(currentUser.id), installationId).apply()
+                                pushDeviceId = device.id
+                            }
+                        } else {
+                            preferences.edit().putBoolean("push_enabled", false).putBoolean("push_device_revoked", true).apply()
+                            pushDeviceId?.let { deviceId ->
+                                api.revokePushDevice(currentToken, PushDevice(deviceId, "android", ""))
+                                preferences.edit().remove(deviceKey).remove(PushMessagingService.pushFidKey(currentUser.id)).apply()
+                                pushDeviceId = null
+                                FirebaseMessaging.getInstance().unregister().await()
+                            }
+                        }
+                        reminderSettings = savedSettings
                         workspaceItems = api.listItems(currentToken)
                         showReminderSettings = false
                     } finally {
@@ -940,6 +1029,13 @@ private fun WorkspaceScreen(
                                 onEdit = { onEdit(item) },
                                 onDelete = { onDelete(item) },
                                 onOpenFile = { summary -> files.firstOrNull { it.id == summary.id }?.let(onOpenFile) },
+                                onRemoveAttachment = { summary ->
+                                    val file = files.firstOrNull { it.id == summary.id }
+                                    val source = file?.let { attachmentSourceFor(item, it, items) }
+                                    if (file != null && source != null) {
+                                        onRemoveAttachment(file, source.copy(itemId = item.id, itemKind = item.kind, itemTitle = item.title))
+                                    }
+                                },
                             )
                         }
                     }
@@ -961,6 +1057,13 @@ private fun WorkspaceScreen(
                                 onEdit = { onEdit(item) },
                                 onDelete = { onDelete(item) },
                                 onOpenFile = { summary -> files.firstOrNull { it.id == summary.id }?.let(onOpenFile) },
+                                onRemoveAttachment = { summary ->
+                                    val file = files.firstOrNull { it.id == summary.id }
+                                    val source = file?.let { attachmentSourceFor(item, it, items) }
+                                    if (file != null && source != null) {
+                                        onRemoveAttachment(file, source.copy(itemId = item.id, itemKind = item.kind, itemTitle = item.title))
+                                    }
+                                },
                             )
                         }
                     }
@@ -978,6 +1081,7 @@ private fun WorkspaceItemCard(
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onOpenFile: (WorkspaceFileSummary) -> Unit,
+    onRemoveAttachment: (WorkspaceFileSummary) -> Unit,
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Row(Modifier.fillMaxWidth().padding(start = 12.dp, top = 12.dp, end = 8.dp, bottom = 8.dp)) {
@@ -1024,7 +1128,14 @@ private fun WorkspaceItemCard(
                     Text(item.details, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
                 }
                 item.files.forEach { file ->
-                    TextButton(onClick = { onOpenFile(file) }, enabled = enabled) { Text("▤ ${file.name}") }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = { onOpenFile(file) }, enabled = enabled, modifier = Modifier.weight(1f)) {
+                            Text("▤ ${file.name}")
+                        }
+                        TextButton(onClick = { onRemoveAttachment(file) }, enabled = enabled) {
+                            Text("Remove", color = MaterialTheme.colorScheme.error)
+                        }
+                    }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.align(Alignment.End)) {
                     TextButton(onClick = onEdit, enabled = enabled) { Text("Edit") }
@@ -1405,14 +1516,29 @@ private fun SettingsDialog(
 private fun ReminderSettingsDialog(
     initial: ReminderSettings,
     isBusy: Boolean,
+    deviceRegistered: Boolean,
     onDismiss: () -> Unit,
+    onRevokeDevice: suspend () -> Unit,
     onSave: suspend (ReminderSettings, Boolean) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
     var settings by remember(initial) { mutableStateOf(initial) }
     var applyToExisting by rememberSaveable { mutableStateOf(false) }
     var saving by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    var permissionWaiter by remember { mutableStateOf<CompletableDeferred<Boolean>?>(null) }
+    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        permissionWaiter?.complete(granted)
+        permissionWaiter = null
+    }
+    suspend fun requestNotificationPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < 33 || context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return true
+        val response = CompletableDeferred<Boolean>()
+        permissionWaiter = response
+        permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        return response.await()
+    }
     AlertDialog(
         onDismissRequest = { if (!saving && !isBusy) onDismiss() },
         title = { Text("Reminder settings") },
@@ -1421,6 +1547,17 @@ private fun ReminderSettingsDialog(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = settings.pushEnabled, onCheckedChange = { settings = settings.copy(pushEnabled = it) }, enabled = !saving && !isBusy && settings.pushAvailable)
                     Text("Push delivery${if (settings.pushAvailable) "" else " (not configured)"}")
+                }
+                if (deviceRegistered) {
+                    TextButton(enabled = !saving && !isBusy, onClick = {
+                        scope.launch {
+                            saving = true
+                            error = null
+                            try { onRevokeDevice() }
+                            catch (failure: Exception) { error = readableError(failure) }
+                            finally { saving = false }
+                        }
+                    }) { Text("Revoke this device's push registration") }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = settings.emailEnabled, onCheckedChange = { settings = settings.copy(emailEnabled = it) }, enabled = !saving && !isBusy && settings.emailAvailable)
@@ -1446,7 +1583,10 @@ private fun ReminderSettingsDialog(
                 scope.launch {
                     saving = true
                     error = null
-                    try { onSave(settings, applyToExisting) }
+                    try {
+                        if (settings.pushEnabled && !requestNotificationPermission()) throw IllegalStateException("Allow notifications to register this device for push delivery.")
+                        onSave(settings, applyToExisting)
+                    }
                     catch (failure: Exception) { error = readableError(failure) }
                     finally { saving = false }
                 }

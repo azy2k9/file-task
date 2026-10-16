@@ -13,6 +13,7 @@
     "build": "npm run build --workspace=@filetasks/web",
     "start": "npm run start --workspace=@filetasks/web",
     "typecheck": "npm run typecheck --workspace=@filetasks/web",
-    "test": "npm run test --workspace=@filetasks/web"
+    "test": "npm run test --workspace=@filetasks/web",
+    "test:acceptance": "FILETASKS_RUN_NATIVE_ACCEPTANCE=1 npm test"
   }
 }

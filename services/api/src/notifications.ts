@@ -4,6 +4,7 @@ import { deliveryAvailability, sendReminderDelivery } from "./delivery";
 import { listItems } from "./workspace";
 import { reminderSettings } from "./reminder-settings";
 import type { ReminderRule, WorkspaceItem } from "./items";
+import { now, nowMs } from "./clock";
 
 function zonedWallTime(date: string, time: string) {
   const zone = process.env.FILETASKS_TIME_ZONE || "UTC";
@@ -104,14 +105,14 @@ function deliverableJobs(userId: string, items: WorkspaceItem[], now: number) {
 
 export async function processDueReminders() {
   const db = database();
-  const now = Date.now();
+  const currentTime = nowMs();
   let attempted = 0;
   let sent = 0;
   let failed = 0;
   const accounts = db.prepare("SELECT id FROM users").all() as { id: string }[];
   const pendingIds = new Set<string>();
   for (const { id: userId } of accounts) {
-    for (const id of deliverableJobs(userId, listItems(userId), now)) pendingIds.add(id);
+    for (const id of deliverableJobs(userId, listItems(userId), currentTime)) pendingIds.add(id);
   }
   if (!pendingIds.size) return { attempted, sent, failed };
   const pending = db.prepare(`SELECT d.id,d.channel,d.target_id AS targetId,d.item_id AS itemId,
@@ -119,7 +120,7 @@ export async function processDueReminders() {
       i.title,i.reminders_json AS reminders,u.email,p.provider_id AS providerId
     FROM reminder_deliveries d JOIN items i ON i.id=d.item_id JOIN users u ON u.id=d.user_id
     LEFT JOIN push_devices p ON p.id=d.target_id AND p.user_id=d.user_id
-    WHERE d.status='pending' AND d.next_attempt_at<=?`).all(now) as {
+    WHERE d.status='pending' AND d.next_attempt_at<=?`).all(currentTime) as {
       id: string; channel: "email" | "push"; targetId: string; itemId: string; scheduledAt: string;
       reminderIndex: number; attempts: number; title: string; reminders: string; email: string; providerId: string | null;
     }[];
@@ -143,7 +144,7 @@ export async function processDueReminders() {
       };
       await sendReminderDelivery(job.channel, payload, job.id);
       db.prepare("UPDATE reminder_deliveries SET status='sent',sent_at=?,attempts=attempts+1,last_error=NULL WHERE id=? AND status='pending'")
-        .run(new Date().toISOString(), job.id);
+        .run(now().toISOString(), job.id);
       sent++;
     } catch (error) {
       failed++;
@@ -152,7 +153,7 @@ export async function processDueReminders() {
       const retryDelay = Math.min(3_600_000, retryBase * 2 ** Math.min(attempts - 1, 7));
       const message = error instanceof Error ? error.message.slice(0, 500) : "Delivery failed.";
       db.prepare("UPDATE reminder_deliveries SET attempts=?,next_attempt_at=?,last_error=? WHERE id=? AND status='pending'")
-        .run(attempts, now + retryDelay, message, job.id);
+        .run(attempts, currentTime + retryDelay, message, job.id);
     }
   }
   return { attempted, sent, failed };
@@ -164,6 +165,6 @@ export function listNotifications(userId: string) {
 }
 
 export function markNotificationRead(userId: string, id: string) {
-  const result = database().prepare("UPDATE notifications SET read_at=? WHERE user_id=? AND id=?").run(new Date().toISOString(), userId, id);
+  const result = database().prepare("UPDATE notifications SET read_at=? WHERE user_id=? AND id=?").run(now().toISOString(), userId, id);
   return result.changes > 0;
 }
