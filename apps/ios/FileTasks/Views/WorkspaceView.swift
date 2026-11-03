@@ -148,11 +148,7 @@ struct WorkspaceView: View {
                             ForEach(group.items) { item in
                                 itemRow(item)
                                     .swipeActions(edge: .trailing) {
-                                        Button(role: .destructive) {
-                                            itemPendingDeletion = item
-                                        } label: {
-                                            Label("Delete", systemImage: "trash")
-                                        }
+                                        deleteSwipeButton(for: item)
                                     }
                             }
                         }
@@ -414,6 +410,14 @@ struct WorkspaceView: View {
         case .all: return "Your workspace is empty"
         case .tasks: return "No Tasks yet"
         case .events: return "No Events yet"
+        }
+    }
+
+    private func deleteSwipeButton(for item: WorkspaceItem) -> some View {
+        Button(role: .destructive) {
+            itemPendingDeletion = item
+        } label: {
+            Label("Delete", systemImage: "trash")
         }
     }
 
