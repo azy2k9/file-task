@@ -58,6 +58,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         let originField = app.textFields["https://api.example.com"]
         XCTAssertTrue(originField.waitForExistence(timeout: 5))
         replaceText(in: originField, with: "http://localhost:3107")
+        XCTAssertEqual(originField.value as? String, "http://localhost:3107", "Server origin must be entered exactly before saving.")
         dismissKeyboardIfShown()
 
         let allowHTTP = app.switches["Allow local development HTTP"]
@@ -66,7 +67,11 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
             allowHTTP.tap()
         }
 
+        let settingsNavigation = app.navigationBars["Server settings"]
         app.buttons["Save"].tap()
+        let sheetDismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: settingsNavigation)
+        XCTAssertEqual(XCTWaiter.wait(for: [sheetDismissed], timeout: 10), .completed,
+                       "Server settings did not close after saving. Accessibility hierarchy: \(app.debugDescription)")
         XCTAssertTrue(app.textFields["Email"].waitForExistence(timeout: 5))
     }
 
@@ -238,7 +243,8 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
 
     private func replaceText(in field: XCUIElement, with value: String) {
         scrollToHittable(field, toward: .up, message: "The text field should be visible before editing it.")
-        field.tap()
+        // Place the insertion point after existing text before deleting it.
+        field.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5)).tap()
         if let currentValue = field.value as? String, !currentValue.isEmpty {
             field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: currentValue.count))
         }

@@ -533,7 +533,7 @@ async function runCommand(command, args, env = process.env, cwd = repoRoot, { de
       else if (spawnError) reject(spawnError);
       else if (groupError) reject(new Error(`${command} ${args.join(" ")} process cleanup failed: ${groupError.message}\n${output.slice(-6000)}`));
       else if (code === 0) resolve(output);
-      else reject(new Error(`${command} ${args.join(" ")} failed with ${signal ? `signal ${signal}` : `code ${code}`}:\n${output.slice(-6000)}`));
+      else reject(new Error(`${command} ${args.join(" ")} failed with ${signal ? `signal ${signal}` : `code ${code}`}:\n${output.slice(-30000)}`));
     });
 
     if (invocation.detached && child.pid && runnerProcessGroupStatePath) {
@@ -700,7 +700,9 @@ function cleanupHarness(signal) {
     try { await stopServer(); } catch (error) { errors.push(error); }
     try { await stopDeliveryFake(); } catch (error) { errors.push(error); }
     try { if (directory) await rm(directory, { recursive: true, force: true }); } catch (error) { errors.push(error); }
-    if (errors.length) throw new AggregateError(errors, "Could not completely clean up the temporary acceptance harness.");
+    if (errors.length) {
+      throw new AggregateError(errors, `Could not completely clean up the temporary acceptance harness:\n${errors.map(formatCleanupError).join("\n")}`);
+    }
   })();
   return harnessCleanupPromise;
 }
