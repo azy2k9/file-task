@@ -1819,7 +1819,7 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, save/re
     "-derivedDataPath", join(directory, "ios-ui-derived-data"),
     "-resultBundlePath", join(directory, "ios-ui-tests.xcresult"),
     "-parallel-testing-enabled", "NO",
-    "CODE_SIGNING_ALLOWED=NO",
+    // Simulator ad hoc signing supplies the app's Keychain entitlements.
     "test",
   ], process.env, repoRoot, { detached: true });
 
