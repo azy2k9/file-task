@@ -64,8 +64,18 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         let allowHTTP = app.switches["Allow local development HTTP"]
         XCTAssertTrue(allowHTTP.waitForExistence(timeout: 5))
         if (allowHTTP.value as? String) != "1" {
-            allowHTTP.tap()
+            // SwiftUI exposes both the labelled row and the nested switch.
+            // Tap the control itself rather than the centre of the whole row.
+            let switchControl = allowHTTP.switches.firstMatch
+            if switchControl.exists {
+                switchControl.tap()
+            } else {
+                allowHTTP.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+            }
         }
+        let httpEnabled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", "1"), object: allowHTTP)
+        XCTAssertEqual(XCTWaiter.wait(for: [httpEnabled], timeout: 5), .completed,
+                       "Local development HTTP must be enabled before saving. Accessibility hierarchy: \(app.debugDescription)")
 
         let settingsNavigation = app.navigationBars["Server settings"]
         app.buttons["Save"].tap()
