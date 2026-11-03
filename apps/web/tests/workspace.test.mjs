@@ -17,6 +17,7 @@ let deliveryBase;
 let deliveryRequests = [];
 let deliveredKeys = new Set();
 let failNextEmail = 0;
+let failNextGoogleRequest = null;
 let providerRequests = [];
 let storageRequests = [];
 let storageObjects = new Map();
@@ -33,6 +34,8 @@ let logs = "";
 let clockFile;
 let testClock = new Date("2026-10-13T12:00:00.000Z");
 let serverTimeZone = "UTC";
+const serverReadinessTimeoutMs = 30_000;
+const serverShutdownTimeoutMs = 2_000;
 
 async function setTestClock(value) {
   testClock = new Date(value);
@@ -44,49 +47,105 @@ async function advanceTestClock(milliseconds) {
 }
 
 async function startServer() {
-  server = spawn(process.execPath, [nextBin, "dev", "--port", "3107"], {
-    cwd: projectRoot,
-    env: {
-      ...process.env,
-      FILETASKS_DATABASE_PATH: join(directory, "workspace.sqlite"),
-      FILETASKS_ORIGIN: base,
-      FILETASKS_TIME_ZONE: serverTimeZone,
-      FILETASKS_EMAIL_DELIVERY_URL: `${deliveryBase}/email`,
-      FILETASKS_PUSH_DELIVERY_URL: `${deliveryBase}/push`,
-      FILETASKS_REMINDER_WORKER_SECRET: "test-worker-secret",
-      FILETASKS_REMINDER_RETRY_BASE_MS: "1000",
-      FILETASKS_TEST_CLOCK_PATH: clockFile,
-      FILETASKS_CALENDAR_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
-      FILETASKS_PUBLIC_URL: base,
-      GOOGLE_CALENDAR_CLIENT_ID: "fake-client",
-      GOOGLE_CALENDAR_CLIENT_SECRET: "fake-secret",
-      GOOGLE_CALENDAR_REDIRECT_URI: `${base}/api/calendars/google/callback`,
-      FILETASKS_GOOGLE_API_ORIGIN: `${deliveryBase}/google`,
-      FILETASKS_GOOGLE_TOKEN_URL: `${deliveryBase}/google-token`,
-      FILETASKS_GOOGLE_AUTH_URL: `${deliveryBase}/google-auth`,
-      FILETASKS_APPLE_CALDAV_ORIGIN: `${deliveryBase}/apple`,
-      FILETASKS_R2_ACCOUNT_ID: "fake-account",
-      FILETASKS_R2_ACCESS_KEY_ID: "fake-access-key",
-      FILETASKS_R2_SECRET_ACCESS_KEY: "fake-secret-key",
-      FILETASKS_R2_BUCKET: "filetasks-test",
-      FILETASKS_R2_ENDPOINT: `${deliveryBase}/r2`,
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  server.stdout.on("data", (data) => { logs += data; });
-  server.stderr.on("data", (data) => { logs += data; });
-  for (let attempt = 0; attempt < 100; attempt++) {
-    try { if ((await fetch(`${base}/api/auth/session`)).status === 401) return; } catch {}
-    if (server.exitCode !== null) throw new Error(logs);
-    await delay(200);
+  logs = "";
+  let child;
+  try {
+    child = spawn(process.execPath, [nextBin, "dev", "--port", "3107"], {
+      cwd: projectRoot,
+      detached: process.platform !== "win32",
+      env: {
+        ...process.env,
+        FILETASKS_DATABASE_PATH: join(directory, "workspace.sqlite"),
+        FILETASKS_ORIGIN: base,
+        FILETASKS_TIME_ZONE: serverTimeZone,
+        FILETASKS_EMAIL_DELIVERY_URL: `${deliveryBase}/email`,
+        FILETASKS_PUSH_DELIVERY_URL: `${deliveryBase}/push`,
+        FILETASKS_REMINDER_WORKER_SECRET: "test-worker-secret",
+        FILETASKS_REMINDER_RETRY_BASE_MS: "1000",
+        FILETASKS_TEST_CLOCK_PATH: clockFile,
+        FILETASKS_CALENDAR_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
+        FILETASKS_PUBLIC_URL: base,
+        GOOGLE_CALENDAR_CLIENT_ID: "fake-client",
+        GOOGLE_CALENDAR_CLIENT_SECRET: "fake-secret",
+        GOOGLE_CALENDAR_REDIRECT_URI: `${base}/api/calendars/google/callback`,
+        FILETASKS_GOOGLE_API_ORIGIN: `${deliveryBase}/google`,
+        FILETASKS_GOOGLE_TOKEN_URL: `${deliveryBase}/google-token`,
+        FILETASKS_GOOGLE_AUTH_URL: `${deliveryBase}/google-auth`,
+        FILETASKS_APPLE_CALDAV_ORIGIN: `${deliveryBase}/apple`,
+        FILETASKS_R2_ACCOUNT_ID: "fake-account",
+        FILETASKS_R2_ACCESS_KEY_ID: "fake-access-key",
+        FILETASKS_R2_SECRET_ACCESS_KEY: "fake-secret-key",
+        FILETASKS_R2_BUCKET: "filetasks-test",
+        FILETASKS_R2_ENDPOINT: `${deliveryBase}/r2`,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    throw new Error(`Could not spawn the Next.js dev server: ${error.message}`);
   }
-  throw new Error(`Server did not start: ${logs}`);
+  const generation = { child, ready: false, spawnError: null, exit: null, output: "" };
+  generation.closed = new Promise((resolve) => child.once("close", resolve));
+  server = generation;
+  child.once("error", (error) => { generation.spawnError = error; });
+  child.once("exit", (code, signal) => { generation.exit = { code, signal }; });
+  const collectOutput = (data) => {
+    generation.output += data.toString("utf8");
+    generation.ready ||= generation.output.includes("Ready in ");
+    if (server === generation) logs = generation.output;
+  };
+  child.stdout.on("data", collectOutput);
+  child.stderr.on("data", collectOutput);
+
+  const startedAt = Date.now();
+  let lastProbeStatus;
+  let lastProbeError;
+  try {
+    while (Date.now() - startedAt < serverReadinessTimeoutMs) {
+      if (generation.spawnError) throw new Error(`Could not spawn the Next.js dev server: ${generation.spawnError.message}`);
+      if (generation.exit || child.exitCode !== null || child.signalCode !== null) {
+        const reason = generation.exit?.signal ? `signal ${generation.exit.signal}` : `exit code ${generation.exit?.code ?? child.exitCode}`;
+        throw new Error(`Next.js dev server exited before becoming ready (${reason}).`);
+      }
+
+      // Next prints this only after binding. Waiting for this child generation's
+      // own Ready line prevents a stale listener on the fixed port passing the probe.
+      if (generation.ready) {
+        try {
+          const response = await appFetch("/api/auth/session", { signal: AbortSignal.timeout(1_000) });
+          lastProbeStatus = response.status;
+          await response.body?.cancel();
+          if (response.status === 401) {
+            if (generation.exit || child.exitCode !== null || child.signalCode !== null) {
+              throw new Error("Next.js dev server exited while its readiness probe was completing.");
+            }
+            return;
+          }
+        } catch (error) {
+          lastProbeError = error;
+        }
+      }
+      await delay(200);
+    }
+
+    const lastProbe = lastProbeStatus === undefined ? "no HTTP probe completed" : `last HTTP status ${lastProbeStatus}`;
+    const probeError = lastProbeError ? `; last probe error: ${lastProbeError.message}` : "";
+    throw new Error(`Next.js dev server did not become ready within ${serverReadinessTimeoutMs}ms (expected its Ready line and an API HTTP 401; ${lastProbe}${probeError}).`);
+  } catch (error) {
+    const startupError = error instanceof Error ? error : new Error(String(error));
+    try {
+      await stopServer(generation);
+    } catch (cleanupError) {
+      throw new AggregateError([startupError, cleanupError], `${startupError.message}\nNext.js output:\n${logs}`);
+    }
+    throw new Error(`${startupError.message}\nNext.js output:\n${logs}`);
+  }
 }
 
 async function startDeliveryFake() {
   deliveryRequests = [];
   deliveredKeys = new Set();
   failNextEmail = 0;
+  failNextGoogleRequest = null;
   providerRequests = [];
   storageRequests = [];
   storageObjects = new Map();
@@ -126,6 +185,12 @@ async function startDeliveryFake() {
     providerRequests.push({ path: url.pathname, method: request.method, body, text: bodyText });
     const idempotencyKey = request.headers["idempotency-key"];
     deliveryRequests.push({ path: request.url, body, idempotencyKey });
+    if (failNextGoogleRequest?.path === url.pathname && failNextGoogleRequest.method === request.method) {
+      const { status = 503 } = failNextGoogleRequest;
+      failNextGoogleRequest = null;
+      response.writeHead(status).end();
+      return;
+    }
     if (url.pathname === "/email" && body.operation === "deliver" && failNextEmail > 0) {
       failNextEmail--;
       response.writeHead(503).end();
@@ -221,12 +286,44 @@ async function stopDeliveryFake() {
   if (deliveryServer?.listening) await new Promise((resolve, reject) => deliveryServer.close((error) => error ? reject(error) : resolve()));
 }
 
-async function stopServer() {
-  if (server?.exitCode === null) {
-    const stopped = new Promise((resolve) => server.once("exit", resolve));
-    server.kill("SIGTERM");
-    await stopped;
+async function stopServer(generation = server) {
+  if (!generation) return;
+  const { child } = generation;
+  if (child.pid !== undefined && process.platform === "win32") {
+    // Node's Windows child.kill terminates only the CLI, leaving its worker.
+    try {
+      await runCommand("taskkill", ["/PID", String(child.pid), "/T", "/F"]);
+    } catch (error) {
+      if (!generation.exit && child.exitCode === null && child.signalCode === null) throw error;
+    }
+  } else if (child.pid !== undefined) {
+    const signalGroup = (signal) => {
+      try { process.kill(-child.pid, signal); return true; }
+      catch (error) { if (error.code === "ESRCH") return false; throw error; }
+    };
+    const waitForGroupExit = async () => {
+      const deadline = Date.now() + serverShutdownTimeoutMs;
+      while (signalGroup(0)) {
+        if (Date.now() >= deadline) return false;
+        await delay(25);
+      }
+      return true;
+    };
+    signalGroup("SIGTERM");
+    if (!(await waitForGroupExit())) {
+      signalGroup("SIGKILL");
+      if (!(await waitForGroupExit())) throw new Error(`Next.js dev server process group ${child.pid} did not exit after SIGKILL.`);
+    }
   }
+
+  // Wait for the CLI and its inherited stdout/stderr pipes to close before
+  // starting another generation, including when spawning failed.
+  const closed = await Promise.race([
+    generation.closed.then(() => true),
+    delay(serverShutdownTimeoutMs, undefined, { ref: false }).then(() => false),
+  ]);
+  if (!closed) throw new Error(`Next.js dev server process ${child.pid ?? "(not spawned)"} did not close its output.`);
+  if (server === generation) server = undefined;
 }
 
 async function runCommand(command, args, env = process.env, cwd = repoRoot) {
@@ -249,9 +346,15 @@ before(async () => {
 });
 
 after(async () => {
-  await stopServer();
-  await stopDeliveryFake();
-  if (directory) await rm(directory, { recursive: true, force: true });
+  try {
+    await stopServer();
+  } finally {
+    try {
+      await stopDeliveryFake();
+    } finally {
+      if (directory) await rm(directory, { recursive: true, force: true });
+    }
+  }
 });
 
 afterEach(async () => {
@@ -263,7 +366,7 @@ afterEach(async () => {
 });
 
 async function request(path, { token, cookie, method = "GET", body, headers = {} } = {}) {
-  return fetch(`${base}${path}`, {
+  return appFetch(path, {
     method,
     headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(cookie ? { Cookie: cookie } : {}),
       ...(body === undefined ? {} : { "Content-Type": "application/json" }), ...headers },
@@ -271,8 +374,14 @@ async function request(path, { token, cookie, method = "GET", body, headers = {}
   });
 }
 
+async function appFetch(path, options = {}) {
+  const headers = new Headers(options.headers);
+  headers.set("Connection", "close");
+  return fetch(`${base}${path}`, { ...options, headers });
+}
+
 async function runReminderWorker() {
-  return fetch(`${base}/api/internal/reminders/deliver`, {
+  return appFetch("/api/internal/reminders/deliver", {
     method: "POST",
     headers: { Authorization: "Bearer test-worker-secret" },
   });
@@ -477,7 +586,7 @@ test("due Notification Reminders appear in the in-app notification list and can 
 
 test("the reminder worker honors configured clock times for date offsets and skips undated items", async () => {
   const owner = await account();
-  assert.equal((await fetch(`${base}/api/internal/reminders/deliver`, { method: "POST" })).status, 401);
+  assert.equal((await appFetch("/api/internal/reminders/deliver", { method: "POST" })).status, 401);
   const timed = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
     kind: "event", title: "Timed Event", scheduledDate: "2020-01-02", scheduledTime: "08:30",
     reminders: [
@@ -650,14 +759,14 @@ test("uploaded Files transfer through the fake object store and open from anothe
 test("Google and Apple Calendar copies sync through fake provider boundaries", async () => {
   const owner = await account();
   const calendarRequestsStart = providerRequests.length;
-  const authorization = await fetch(`${base}/api/calendars/google/connect`, {
+  const authorization = await appFetch("/api/calendars/google/connect", {
     headers: { Authorization: `Bearer ${owner.token}` }, redirect: "manual",
   });
   assert.equal(authorization.status, 303);
   const authUrl = new URL(authorization.headers.get("location"));
   const state = authUrl.searchParams.get("state");
   assert.ok(state);
-  assert.equal((await fetch(`${base}/api/calendars/google/callback?state=${encodeURIComponent(state)}&code=fake-code`, { redirect: "manual" })).status, 303);
+  assert.equal((await appFetch(`/api/calendars/google/callback?state=${encodeURIComponent(state)}&code=fake-code`, { redirect: "manual" })).status, 303);
 
   const apple = await request("/api/calendars", { token: owner.token, method: "POST", body: {
     username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
@@ -709,13 +818,13 @@ test("Google and Apple Calendar copies sync through fake provider boundaries", a
 
 test("scoped recurring Event deletion syncs Google and Apple recurrence exclusions", async () => {
   const owner = await account();
-  const authorization = await fetch(`${base}/api/calendars/google/connect`, {
+  const authorization = await appFetch("/api/calendars/google/connect", {
     headers: { Authorization: `Bearer ${owner.token}` }, redirect: "manual",
   });
   const authUrl = new URL(authorization.headers.get("location"));
   const state = authUrl.searchParams.get("state");
   assert.ok(state);
-  assert.equal((await fetch(`${base}/api/calendars/google/callback?state=${encodeURIComponent(state)}&code=fake-code`, { redirect: "manual" })).status, 303);
+  assert.equal((await appFetch(`/api/calendars/google/callback?state=${encodeURIComponent(state)}&code=fake-code`, { redirect: "manual" })).status, 303);
   assert.equal((await request("/api/calendars", { token: owner.token, method: "POST", body: {
     username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
   } })).status, 201);
@@ -753,13 +862,14 @@ test("scoped recurring Event deletion syncs Google and Apple recurrence exclusio
 
 test("recurring Google exceptions use immutable original starts after moves and retain FileTasks backlinks", async () => {
   const owner = await account();
-  const authorization = await fetch(`${base}/api/calendars/google/connect`, {
+  const providerRequestsStart = providerRequests.length;
+  const authorization = await appFetch("/api/calendars/google/connect", {
     headers: { Authorization: `Bearer ${owner.token}` }, redirect: "manual",
   });
   const authUrl = new URL(authorization.headers.get("location"));
   const state = authUrl.searchParams.get("state");
   assert.ok(state);
-  assert.equal((await fetch(`${base}/api/calendars/google/callback?state=${encodeURIComponent(state)}&code=fake-code`, { redirect: "manual" })).status, 303);
+  assert.equal((await appFetch(`/api/calendars/google/callback?state=${encodeURIComponent(state)}&code=fake-code`, { redirect: "manual" })).status, 303);
   assert.equal((await request("/api/calendars", { token: owner.token, method: "POST", body: {
     username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
   } })).status, 201);
@@ -781,8 +891,35 @@ test("recurring Google exceptions use immutable original starts after moves and 
     .find((item) => Date.parse(`${item.occurrenceDate}T00:00:00Z`) - testClock.getTime() > 370 * 86_400_000
       && Number(item.occurrenceDate.slice(5, 7)) >= 6 && Number(item.occurrenceDate.slice(5, 7)) <= 8);
   assert.ok(occurrence, "expected a materialized summer Occurrence beyond 370 days");
-  assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+  const initialSync = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+  assert.equal(initialSync.status, 200, "initial Google and Apple synchronization should succeed before restart");
   assert.equal(googleInstanceRequests.length, 0, JSON.stringify(googleInstanceRequests));
+  assert.equal(googleEvents.size, 1, "initial synchronization should create one recurring Google copy");
+  const googleCopyId = [...googleEvents.keys()][0];
+  const itemsBeforeRestart = (await (await request("/api/items", { token: owner.token })).json()).items;
+  const providerObservationsBeforeRestart = providerRequests.slice(providerRequestsStart);
+  const googleCopiesBeforeRestart = [...googleEvents.entries()];
+  const appleCopiesBeforeRestart = [...appleEvents.entries()];
+
+  await stopServer();
+  await startServer();
+
+  const restoredSession = await request("/api/auth/session", { token: owner.token });
+  assert.equal(restoredSession.status, 200, "the same account should still authenticate after the synchronized restart");
+  assert.deepEqual((await restoredSession.json()).user, owner.user, "the saved account should survive the restart");
+  const restoredCalendars = await request("/api/calendars", { token: owner.token });
+  assert.equal(restoredCalendars.status, 200, "connected calendars should remain available after restart");
+  assert.deepEqual((await restoredCalendars.json()).calendars.map(({ provider, account_label }) => ({ provider, account_label })), [
+    { provider: "apple", account_label: "person@example.com" },
+    { provider: "google", account_label: "Fake Google Calendar" },
+  ], "both connected calendar accounts should persist across the restart");
+  const restoredItems = await request("/api/items", { token: owner.token });
+  assert.equal(restoredItems.status, 200, "saved recurring items should remain available after restart");
+  assert.deepEqual((await restoredItems.json()).items, itemsBeforeRestart, "the root Event and its Occurrences should be unchanged by restart");
+  assert.deepEqual(providerRequests.slice(providerRequestsStart), providerObservationsBeforeRestart,
+    "restarting and reading saved state should not issue provider requests");
+  assert.deepEqual([...googleEvents.entries()], googleCopiesBeforeRestart, "the fake Google copy should survive unchanged across restart");
+  assert.deepEqual([...appleEvents.entries()], appleCopiesBeforeRestart, "the fake Apple copy should survive unchanged across restart");
 
   const originalDate = occurrence.occurrenceDate;
   const movedDate = new Date(`${originalDate}T00:00:00Z`);
@@ -805,6 +942,8 @@ test("recurring Google exceptions use immutable original starts after moves and 
       || item.title !== persistedRoot.title || item.details !== persistedRoot.details);
   assert.deepEqual(changedOccurrences.map((item) => item.id), [occurrence.id]);
   assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+  assert.equal(googleEvents.size, 1, "updates after restart should keep the original Google copy");
+  assert.equal(googleEvents.has(googleCopyId), true, "updates after restart should use the same Google copy id");
 
   const originalStartRequest = googleInstanceRequests.find(({ originalStart }) => originalStart === `${originalDate}T09:00:00+01:00`);
   assert.ok(originalStartRequest);
@@ -831,6 +970,8 @@ test("recurring Google exceptions use immutable original starts after moves and 
   assert.ok(googleInstanceRequests.filter(({ originalStart }) => originalStart === `${originalDate}T09:00:00+01:00`).length >= 2);
   const instancePatchRequests = providerRequests.filter(({ path }) => path.endsWith(`/events/${instance.id}`));
   assert.ok(instancePatchRequests.length >= 3, "FileTasks should update the same Google instance after moving and restoring it");
+  assert.equal(googleEvents.size, 1, "moving the exception should not create another recurring Google copy");
+  assert.equal(googleEvents.has(googleCopyId), true, "moving the exception should continue using the same Google copy id");
   assert.deepEqual(googleExceptions.get(instance.id).start, {
     dateTime: `${movedAgainString}T11:15:00`, timeZone: "Europe/London",
   });
@@ -841,6 +982,29 @@ test("recurring Google exceptions use immutable original starts after moves and 
   assert.ok(exceptionComponent);
   assert.ok(appleCopy.includes(`DTSTART:${movedAgainString.replaceAll("-", "")}T111500`));
   assert.ok(exceptionComponent.includes(`URL:${backlink}`));
+
+  const itemsBeforeFailureRestart = (await (await request("/api/items", { token: owner.token })).json()).items;
+  const providerObservationCountBeforeFailureRestart = providerRequests.length;
+  await stopServer();
+  await startServer();
+  const itemsAfterFailureRestart = await request("/api/items", { token: owner.token });
+  assert.equal(itemsAfterFailureRestart.status, 200, "saved items should remain available before the controlled provider failure");
+  assert.deepEqual((await itemsAfterFailureRestart.json()).items, itemsBeforeFailureRestart,
+    "the edited exception should persist through the restart before the failed sync");
+  assert.equal(providerRequests.length, providerObservationCountBeforeFailureRestart,
+    "the restart should not change provider observations before the controlled failure");
+  assert.equal(googleEvents.has(googleCopyId), true, "the same Google copy should remain available after the second restart");
+
+  const failedOperationPath = `/google/calendar/v3/calendars/primary/events/${instance.id}`;
+  const priorPatchAttempts = providerRequests.filter(({ path, method }) => path === failedOperationPath && method === "PATCH").length;
+  failNextGoogleRequest = { method: "PATCH", path: failedOperationPath, status: 503 };
+  const failedSync = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+  assert.equal(failedSync.status, 502, "a failed Google provider operation should be reported by the API");
+  assert.deepEqual(await failedSync.json(), { error: "A recurring Event Occurrence could not be synchronized to Google Calendar." },
+    "the API should preserve the provider failure message");
+  const failedOperationAttempts = providerRequests.filter(({ path, method }) => path === failedOperationPath && method === "PATCH").length - priorPatchAttempts;
+  assert.equal(failedOperationAttempts, 1, "the failed Google provider operation should be attempted exactly once without retries");
+  assert.equal(failNextGoogleRequest, null, "the controlled fake failure should be consumed by one request");
 });
 
 test("recurring items create independent Occurrences and honor occurrence and series edit scopes", async () => {
@@ -1038,6 +1202,30 @@ test("a person can manage Tasks and Events through the browser and see another c
     console.error("Recent server output:", logs.slice(-4000));
     throw error;
   } finally { await browser.close(); }
+});
+
+test("server startup ignores a stale HTTP 401 on the fixed app origin", async () => {
+  await stopServer();
+  let staleListenerRequests = 0;
+  const staleListener = createServer((_request, response) => {
+    staleListenerRequests++;
+    response.writeHead(401).end();
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      staleListener.once("error", reject);
+      staleListener.listen(3107, resolve);
+    });
+    await assert.rejects(startServer(), /exited before becoming ready/);
+    assert.equal(staleListenerRequests, 0,
+      "readiness must wait for this Next child to emit Ready before probing the fixed origin");
+  } finally {
+    if (staleListener.listening) {
+      await new Promise((resolve, reject) => staleListener.close((error) => error ? reject(error) : resolve()));
+    }
+    await stopServer();
+    await startServer();
+  }
 });
 
 test("a person's account and saved items remain available after the server restarts", async () => {
