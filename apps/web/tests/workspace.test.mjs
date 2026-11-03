@@ -1812,16 +1812,20 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, save/re
 
   const simulatorId = process.env.FILETASKS_IOS_UI_SIMULATOR_ID;
   assert.ok(simulatorId, "The focused runner must create and pass a disposable iOS Simulator id.");
-  await runCommand("xcodebuild", [
-    "-project", "apps/ios/FileTasks.xcodeproj",
-    "-scheme", "FileTasks",
-    "-destination", `platform=iOS Simulator,id=${simulatorId}`,
-    "-derivedDataPath", join(directory, "ios-ui-derived-data"),
-    "-resultBundlePath", join(directory, "ios-ui-tests.xcresult"),
-    "-parallel-testing-enabled", "NO",
-    // Simulator ad hoc signing supplies the app's Keychain entitlements.
-    "test",
-  ], process.env, repoRoot, { detached: true });
+  try {
+    await runCommand("xcodebuild", [
+      "-project", "apps/ios/FileTasks.xcodeproj",
+      "-scheme", "FileTasks",
+      "-destination", `platform=iOS Simulator,id=${simulatorId}`,
+      "-derivedDataPath", join(directory, "ios-ui-derived-data"),
+      "-resultBundlePath", join(directory, "ios-ui-tests.xcresult"),
+      "-parallel-testing-enabled", "NO",
+      // Simulator ad hoc signing supplies the app's Keychain entitlements.
+      "test",
+    ], process.env, repoRoot, { detached: true });
+  } catch (error) {
+    throw new Error(`${error.message}\nRecent test server output:\n${logs.slice(-10000)}`, { cause: error });
+  }
 
   const registeredAccount = await request("/api/auth/login", {
     method: "POST",

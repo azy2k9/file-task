@@ -96,7 +96,8 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         scrollToHittable(createAccount, toward: .down)
         createAccount.tap()
         allowLocalNetworkIfPrompted()
-        XCTAssertTrue(app.buttons["Account options"].waitForExistence(timeout: 15), "Registration must complete through the installed app.")
+        XCTAssertTrue(app.buttons["Account options"].waitForExistence(timeout: 15),
+                      "Registration must complete through the installed app. Accessibility hierarchy: \(app.debugDescription)")
     }
 
     private func signOutInApp() {
@@ -118,7 +119,8 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         scrollToHittable(signIn, toward: .down)
         signIn.tap()
         allowLocalNetworkIfPrompted()
-        XCTAssertTrue(app.buttons["Create item"].waitForExistence(timeout: 15), "Sign-in must use the app's account flow.")
+        XCTAssertTrue(app.buttons["Create item"].waitForExistence(timeout: 15),
+                      "Sign-in must use the app's account flow. Accessibility hierarchy: \(app.debugDescription)")
     }
 
     private func signInFields(email: String) {
