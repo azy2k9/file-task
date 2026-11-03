@@ -89,76 +89,121 @@ struct WorkspaceView: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                Section {
-                    Picker("Section", selection: $section) {
-                        ForEach(WorkspaceSection.allCases) { option in Text(option.rawValue).tag(option) }
-                    }
-                    .pickerStyle(.segmented)
-                    .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
-                }
+            workspaceList
+        }
+    }
 
-                if section == .files {
-                    filesContent
-                } else {
-                if let error = model.errorMessage {
-                    Section {
-                        ErrorBanner(message: error, dismiss: model.dismissError)
-                            .listRowInsets(EdgeInsets())
-                            .listRowBackground(Color.clear)
-                    }
-                }
+    private var workspaceList: some View {
+        addingFileDialogs(
+            to: addingFileImporterAndLinks(
+                to: addingItemDialogs(
+                    to: addingEditorSheets(
+                        to: addingToolbar(
+                            to: addingLifecycle(to: baseWorkspaceList)
+                        )
+                    )
+                )
+            )
+        )
+    }
 
-                Section {
-                    Picker("Show", selection: $filter) {
-                        ForEach(ItemFilter.allCases) { option in
-                            Text(option.rawValue).tag(option)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
-                }
+    private var baseWorkspaceList: some View {
+        List {
+            sectionPicker
+            workspaceSectionContent
+        }
+        .listStyle(.insetGrouped)
+        .refreshable { await model.refreshItems() }
+        .navigationTitle(section == .files ? "Files" : "Workspace")
+    }
 
-                if model.isLoadingItems && model.items.isEmpty {
-                    Section {
-                        ProgressView("Loading your workspace…")
-                            .frame(maxWidth: .infinity)
-                            .listRowBackground(Color.clear)
-                    }
-                } else if groups.isEmpty {
-                    Section {
-                        VStack(spacing: 8) {
-                            Image(systemName: filter == .events ? "calendar" : "checklist")
-                                .font(.system(size: 32))
-                                .foregroundStyle(.secondary)
-                            Text(emptyTitle)
-                                .font(.headline)
-                            Text("Use + to add one, or pull down to refresh your workspace.")
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.center)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 28)
-                        .listRowBackground(Color.clear)
-                    }
-                } else {
-                    ForEach(groups) { group in
-                        Section(group.key == "undated" ? "Undated" : AgendaDate.title(for: group.key)) {
-                            ForEach(group.items) { item in
-                                itemRow(item)
-                                    .swipeActions(edge: .trailing) {
-                                        deleteSwipeButton(for: item)
-                                    }
-                            }
-                        }
-                    }
-                }
+    private var sectionPicker: some View {
+        Section {
+            Picker("Section", selection: $section) {
+                ForEach(WorkspaceSection.allCases) { option in Text(option.rawValue).tag(option) }
+            }
+            .pickerStyle(.segmented)
+            .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+        }
+    }
+
+    @ViewBuilder
+    private var workspaceSectionContent: some View {
+        if section == .files {
+            filesContent
+        } else {
+            agendaContent
+        }
+    }
+
+    @ViewBuilder
+    private var agendaContent: some View {
+        if let error = model.errorMessage {
+            Section {
+                ErrorBanner(message: error, dismiss: model.dismissError)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
+            }
+        }
+
+        Section {
+            Picker("Show", selection: $filter) {
+                ForEach(ItemFilter.allCases) { option in
+                    Text(option.rawValue).tag(option)
                 }
             }
-            .listStyle(.insetGrouped)
-            .refreshable { await model.refreshItems() }
-            .navigationTitle(section == .files ? "Files" : "Workspace")
+            .pickerStyle(.segmented)
+            .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+        }
+
+        agendaItemsContent
+    }
+
+    @ViewBuilder
+    private var agendaItemsContent: some View {
+        if model.isLoadingItems && model.items.isEmpty {
+            Section {
+                ProgressView("Loading your workspace…")
+                    .frame(maxWidth: .infinity)
+                    .listRowBackground(Color.clear)
+            }
+        } else if groups.isEmpty {
+            Section {
+                VStack(spacing: 8) {
+                    Image(systemName: filter == .events ? "calendar" : "checklist")
+                        .font(.system(size: 32))
+                        .foregroundStyle(.secondary)
+                    Text(emptyTitle)
+                        .font(.headline)
+                    Text("Use + to add one, or pull down to refresh your workspace.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 28)
+                .listRowBackground(Color.clear)
+            }
+        } else {
+            ForEach(groups) { group in
+                agendaGroup(group)
+            }
+        }
+    }
+
+    private func agendaGroup(_ group: AgendaGroup) -> some View {
+        Section(group.key == "undated" ? "Undated" : AgendaDate.title(for: group.key)) {
+            ForEach(group.items) { item in
+                itemRow(item)
+                    .swipeActions(edge: .trailing) {
+                        deleteSwipeButton(for: item)
+                    }
+            }
+        }
+    }
+
+    private func addingLifecycle<Content: View>(to content: Content) -> some View {
+        content
             .onReceive(NotificationCenter.default.publisher(for: PushRegistrationDelegate.tokenNotification)) { notification in
                 guard model.reminderSettings.pushEnabled, !model.pushDeviceRevoked else { return }
                 if let failure = notification.object as? Error {
@@ -186,48 +231,62 @@ struct WorkspaceView: View {
                     if settings.authorizationStatus == .authorized { UIApplication.shared.registerForRemoteNotifications() }
                 }
             }
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Menu {
-                        Button(action: openServerSettings) {
-                            Label("Server settings", systemImage: "server.rack")
-                        }
-                        Button {
-                            showingReminderSettings = true
-                        } label: {
-                            Label("Reminder settings", systemImage: "bell")
-                        }
-                        Button(role: .destructive) {
-                            showingLogoutConfirmation = true
-                        } label: {
-                            Label("Sign out", systemImage: "rectangle.portrait.and.arrow.right")
-                        }
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
-                    }
-                    .accessibilityLabel("Account options")
+    }
+
+    private func addingToolbar<Content: View>(to content: Content) -> some View {
+        content.toolbar { workspaceToolbar }
+    }
+
+    @ToolbarContentBuilder
+    private var workspaceToolbar: some ToolbarContent {
+        ToolbarItem(placement: .navigationBarLeading) {
+            Menu {
+                Button(action: openServerSettings) {
+                    Label("Server settings", systemImage: "server.rack")
                 }
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Menu {
-                        if section == .agenda {
-                            Button { beginCreating(.task) } label: { Label("New Task", systemImage: "checkmark.circle") }
-                            Button { beginCreating(.event) } label: { Label("New Event", systemImage: "calendar.badge.plus") }
-                        } else {
-                            Button { showingFileImporter = true } label: { Label("Upload File", systemImage: "square.and.arrow.up") }
-                            Button { showingLinkForm = true } label: { Label("Add external link", systemImage: "link") }
-                        }
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                    .accessibilityLabel(section == .files ? "Add File" : "Create item")
+                Button {
+                    showingReminderSettings = true
+                } label: {
+                    Label("Reminder settings", systemImage: "bell")
                 }
+                Button(role: .destructive) {
+                    showingLogoutConfirmation = true
+                } label: {
+                    Label("Sign out", systemImage: "rectangle.portrait.and.arrow.right")
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
             }
+            .accessibilityLabel("Account options")
+        }
+        ToolbarItem(placement: .navigationBarTrailing) {
+            Menu {
+                if section == .agenda {
+                    Button { beginCreating(.task) } label: { Label("New Task", systemImage: "checkmark.circle") }
+                    Button { beginCreating(.event) } label: { Label("New Event", systemImage: "calendar.badge.plus") }
+                } else {
+                    Button { showingFileImporter = true } label: { Label("Upload File", systemImage: "square.and.arrow.up") }
+                    Button { showingLinkForm = true } label: { Label("Add external link", systemImage: "link") }
+                }
+            } label: {
+                Image(systemName: "plus")
+            }
+            .accessibilityLabel(section == .files ? "Add File" : "Create item")
+        }
+    }
+
+    private func addingEditorSheets<Content: View>(to content: Content) -> some View {
+        content
             .sheet(isPresented: $showingEditor, onDismiss: { editingItem = nil }) {
                 ItemEditorView(item: editingItem, initialKind: newItemKind)
             }
             .sheet(isPresented: $showingReminderSettings) {
                 ReminderSettingsView()
             }
+    }
+
+    private func addingItemDialogs<Content: View>(to content: Content) -> some View {
+        content
             .confirmationDialog(
                 "Delete this \(itemPendingDeletion?.kind.title.lowercased() ?? "item")?",
                 isPresented: Binding(
@@ -259,6 +318,10 @@ struct WorkspaceView: View {
                 }
                 Button("Cancel", role: .cancel) { }
             }
+    }
+
+    private func addingFileImporterAndLinks<Content: View>(to content: Content) -> some View {
+        content
             .fileImporter(isPresented: $showingFileImporter, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
                 switch result {
                 case let .success(urls):
@@ -278,6 +341,10 @@ struct WorkspaceView: View {
             } message: {
                 Text("Save a web link in your Files section.")
             }
+    }
+
+    private func addingFileDialogs<Content: View>(to content: Content) -> some View {
+        content
             .confirmationDialog("Attach \(fileToAttach?.name ?? "File")", isPresented: Binding(
                 get: { fileToAttach != nil }, set: { if !$0 { fileToAttach = nil } }
             )) {
@@ -333,7 +400,6 @@ struct WorkspaceView: View {
                     Text("Remove this Attachment from “\(target.attachment.itemTitle)” only, or delete the File.")
                 }
             }
-        }
     }
 
     @ViewBuilder
