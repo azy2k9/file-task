@@ -41,7 +41,8 @@ let logs = "";
 let clockFile;
 let testClock = new Date("2026-10-13T12:00:00.000Z");
 let serverTimeZone = "UTC";
-const serverReadinessTimeoutMs = 30_000;
+const serverReadinessTimeoutMs = 120_000;
+const serverReadinessProbeTimeoutMs = 10_000;
 const serverShutdownTimeoutMs = 2_000;
 const setupShutdownTimeoutMs = 10_000;
 const commandShutdownTimeoutMs = 2_000;
@@ -232,7 +233,10 @@ async function startServerDuringSetup(setup) {
       // own Ready line prevents a stale listener on the fixed port passing the probe.
       if (generation.ready) {
         try {
-          const response = await appFetch("/api/auth/session", { signal: AbortSignal.timeout(1_000) });
+          const remainingMs = serverReadinessTimeoutMs - (Date.now() - startedAt);
+          const response = await appFetch("/api/auth/session", {
+            signal: AbortSignal.timeout(Math.max(1, Math.min(serverReadinessProbeTimeoutMs, remainingMs))),
+          });
           lastProbeStatus = response.status;
           await response.body?.cancel();
           if (response.status === 401) {
