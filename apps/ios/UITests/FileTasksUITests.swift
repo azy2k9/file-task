@@ -130,7 +130,31 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
 
         let passwordField = app.secureTextFields["Password"]
         XCTAssertTrue(passwordField.waitForExistence(timeout: 5))
-        replaceText(in: passwordField, with: password)
+        enterPassword(in: passwordField)
+    }
+
+    private func enterPassword(in field: XCUIElement) {
+        scrollToHittable(field, toward: .down, message: "The password field should be visible.")
+        field.tap()
+        dismissStrongPasswordSuggestionIfShown()
+
+        // iOS may present its strong-password sheet after the first keystroke.
+        // Handle it before typing the remaining characters.
+        field.typeText(String(password.prefix(1)))
+        dismissStrongPasswordSuggestionIfShown()
+        let firstCharacterWasEntered = (field.value as? String)?.count == 1
+        field.typeText(firstCharacterWasEntered ? String(password.dropFirst()) : password)
+        XCTAssertEqual((field.value as? String)?.count, password.count,
+                       "The full password should be entered before submitting the form. Accessibility hierarchy: \(app.debugDescription)")
+    }
+
+    private func dismissStrongPasswordSuggestionIfShown() {
+        let suggestion = app.staticTexts["Use Strong Password?"]
+        if suggestion.waitForExistence(timeout: 2) {
+            let close = app.buttons["Close"]
+            XCTAssertTrue(close.waitForExistence(timeout: 5), "The strong-password suggestion should offer a close button.")
+            close.tap()
+        }
     }
 
     private func createEventBySwitchingFromTask(title: String, customizedAmount: Int? = nil) {
