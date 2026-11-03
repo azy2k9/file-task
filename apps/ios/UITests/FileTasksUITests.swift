@@ -1,0 +1,295 @@
+import XCTest
+
+final class FileTasksReminderDefaultsUITests: XCTestCase {
+    private let app = XCUIApplication()
+    private let sharedEmail = "ios-ui-shared@example.com"
+    private let registrationEmail = "ios-ui-registration@example.com"
+    private let password = "correct-horse-battery"
+
+    override func setUpWithError() throws {
+        continueAfterFailure = false
+        app.launch()
+    }
+
+    func testRegistrationSignInCrossTypeReminderPreservation() {
+        configureLocalServerInApp()
+        registerSecondAccountInApp()
+        signOutInApp()
+        signInInApp(email: sharedEmail)
+
+        createEventBySwitchingFromTask(title: "UI Runner Event Default")
+        assertReminder(amount: 3, unit: "weeks")
+        saveCurrentItem()
+
+        openItem("UI Runner Event Default")
+        assertReminder(amount: 3, unit: "weeks")
+        cancelEditor()
+
+        createEventBySwitchingFromTask(title: "UI Runner Customized Event", customizedAmount: 4)
+        assertReminder(amount: 4, unit: "days")
+        saveCurrentItem()
+
+        openItem("UI Runner Customized Event")
+        assertReminder(amount: 4, unit: "days")
+        cancelEditor()
+
+        createTaskBySwitchingFromEvent(title: "UI Runner Event To Task")
+        assertReminder(amount: 2, unit: "days")
+        saveCurrentItem()
+
+        openItem("UI Runner Event To Task")
+        assertReminder(amount: 2, unit: "days")
+        cancelEditor()
+
+        createEventAfterRemovingAllReminders(title: "UI Runner No Reminders")
+        assertNoReminders()
+        saveCurrentItem()
+
+        openItem("UI Runner No Reminders")
+        assertNoReminders()
+        cancelEditor()
+    }
+
+    private func configureLocalServerInApp() {
+        let settingsButton = app.buttons["Server settings"]
+        XCTAssertTrue(settingsButton.waitForExistence(timeout: 10), "The sign-in screen should expose real Server settings.")
+        settingsButton.tap()
+
+        let originField = app.textFields["https://api.example.com"]
+        XCTAssertTrue(originField.waitForExistence(timeout: 5))
+        replaceText(in: originField, with: "http://localhost:3107")
+
+        let allowHTTP = app.switches["Allow local development HTTP"]
+        XCTAssertTrue(allowHTTP.waitForExistence(timeout: 5))
+        if (allowHTTP.value as? String) != "1" {
+            allowHTTP.tap()
+        }
+
+        app.buttons["Save"].tap()
+        XCTAssertTrue(app.textFields["Email"].waitForExistence(timeout: 5))
+    }
+
+    private func registerSecondAccountInApp() {
+        app.buttons["Create a new account"].tap()
+        signInFields(email: registrationEmail)
+
+        let createAccount = app.buttons["Create account"]
+        XCTAssertTrue(createAccount.waitForExistence(timeout: 5))
+        scrollToHittable(createAccount, toward: .down)
+        createAccount.tap()
+        allowLocalNetworkIfPrompted()
+        XCTAssertTrue(app.buttons["Account options"].waitForExistence(timeout: 15), "Registration must complete through the installed app.")
+    }
+
+    private func signOutInApp() {
+        app.buttons["Account options"].tap()
+        let signOutMenuItem = app.buttons["Sign out"]
+        XCTAssertTrue(signOutMenuItem.waitForExistence(timeout: 5))
+        signOutMenuItem.tap()
+
+        let confirmSignOut = app.buttons["Sign out"]
+        XCTAssertTrue(confirmSignOut.waitForExistence(timeout: 5), "The app should ask before signing out.")
+        confirmSignOut.tap()
+        XCTAssertTrue(app.textFields["Email"].waitForExistence(timeout: 10))
+    }
+
+    private func signInInApp(email: String) {
+        signInFields(email: email)
+        let signIn = app.buttons["Sign in"]
+        XCTAssertTrue(signIn.waitForExistence(timeout: 5))
+        scrollToHittable(signIn, toward: .down)
+        signIn.tap()
+        allowLocalNetworkIfPrompted()
+        XCTAssertTrue(app.buttons["Create item"].waitForExistence(timeout: 15), "Sign-in must use the app's account flow.")
+    }
+
+    private func signInFields(email: String) {
+        let emailField = app.textFields["Email"]
+        XCTAssertTrue(emailField.waitForExistence(timeout: 5))
+        replaceText(in: emailField, with: email)
+
+        let passwordField = app.secureTextFields["Password"]
+        XCTAssertTrue(passwordField.waitForExistence(timeout: 5))
+        replaceText(in: passwordField, with: password)
+    }
+
+    private func createEventBySwitchingFromTask(title: String, customizedAmount: Int? = nil) {
+        startNewItem(kind: "Task")
+
+        let reminderAmount = element(identifier: "itemEditor.reminder.amount.0")
+        scrollToHittable(reminderAmount, toward: .down, message: "The app should load the shared account's Task Reminder defaults before saving.")
+        assertReminder(amount: 2, unit: "days")
+        if let customizedAmount {
+            setReminderAmount(reminderAmount, to: customizedAmount)
+        }
+
+        selectType("Event")
+        setTitle(title)
+    }
+
+    private func createTaskBySwitchingFromEvent(title: String) {
+        startNewItem(kind: "Event")
+        let reminderAmount = element(identifier: "itemEditor.reminder.amount.0")
+        scrollToHittable(reminderAmount, toward: .down, message: "The app should load the shared account's Event Reminder defaults before saving.")
+        assertReminder(amount: 3, unit: "weeks")
+        selectType("Task")
+        setTitle(title)
+    }
+
+    private func createEventAfterRemovingAllReminders(title: String) {
+        startNewItem(kind: "Task")
+        let firstReminder = element(identifier: "itemEditor.reminder.amount.0")
+        scrollToHittable(firstReminder, toward: .down, message: "The Task's default Reminder should be visible before removing it.")
+        assertReminder(amount: 2, unit: "days")
+        let removeReminder = element(identifier: "itemEditor.reminder.remove.0")
+        scrollToHittable(removeReminder, toward: .down, message: "The Task's default Reminder should be available to remove.")
+        removeReminder.tap()
+
+        selectType("Event")
+        setTitle(title)
+        assertNoReminders()
+    }
+
+    private func startNewItem(kind: String) {
+        let createItem = app.buttons["Create item"]
+        scrollToHittable(createItem, toward: .up)
+        createItem.tap()
+        let newItem = app.buttons["New \(kind)"]
+        XCTAssertTrue(newItem.waitForExistence(timeout: 5), "The workspace should offer a new \(kind).")
+        newItem.tap()
+    }
+
+    private func selectType(_ kind: String) {
+        let typePicker = element(identifier: "itemEditor.type")
+        scrollToHittable(typePicker, toward: .up, message: "The new-item Type picker should be present.")
+        typePicker.tap()
+        let option = app.buttons[kind]
+        XCTAssertTrue(option.waitForExistence(timeout: 5), "The app should offer \(kind) as a new-item type.")
+        option.tap()
+        XCTAssertTrue(app.navigationBars["Create \(kind)"].waitForExistence(timeout: 5))
+    }
+
+    private func setTitle(_ title: String) {
+        let titleField = app.textFields["Title"]
+        scrollToHittable(titleField, toward: .up, message: "The item title field should be available after changing type.")
+        replaceText(in: titleField, with: title)
+    }
+
+    private func setReminderAmount(_ amountControl: XCUIElement, to expected: Int) {
+        scrollToHittable(amountControl, toward: .down, message: "The Reminder amount should be visible before editing it.")
+        let increment = amountControl.buttons.matching(
+            NSPredicate(format: "label CONTAINS[c] %@", "Increment")
+        ).firstMatch
+        scrollToHittable(increment, toward: .down, message: "The Reminder amount Stepper should expose a hittable increment control.")
+
+        let initial = Int((amountControl.value as? String) ?? amountControl.label) ?? 0
+        XCTAssertLessThanOrEqual(initial, expected)
+        for _ in 0..<max(0, expected - initial) {
+            increment.tap()
+        }
+        XCTAssertEqual(Int((amountControl.value as? String) ?? amountControl.label) ?? -1, expected)
+    }
+
+    private func assertReminder(amount: Int, unit: String, file: StaticString = #filePath, line: UInt = #line) {
+        let amountControl = element(identifier: "itemEditor.reminder.amount.0")
+        scrollToHittable(amountControl, toward: .down, message: "The first Reminder should be visible.", file: file, line: line)
+        XCTAssertEqual(Int((amountControl.value as? String) ?? amountControl.label) ?? -1, amount, file: file, line: line)
+
+        let unitControl = element(identifier: "itemEditor.reminder.unit.0")
+        XCTAssertTrue(unitControl.exists, file: file, line: line)
+        let unitValue = ((unitControl.value as? String) ?? unitControl.label).lowercased()
+        XCTAssertTrue(unitValue.contains(unit), "Expected Reminder unit \(unit), got \(unitValue).", file: file, line: line)
+
+        let deliveryControl = element(identifier: "itemEditor.reminder.delivery.0")
+        XCTAssertTrue(deliveryControl.exists, file: file, line: line)
+        let deliveryValue = ((deliveryControl.value as? String) ?? deliveryControl.label).lowercased()
+        XCTAssertTrue(deliveryValue.contains("notification"), "Expected in-app Notification delivery, got \(deliveryValue).", file: file, line: line)
+        let timeControl = element(identifier: "itemEditor.reminder.time.0")
+        scrollToHittable(timeControl, toward: .down, message: "The Reminder clock-time control should remain visible.", file: file, line: line)
+    }
+
+    private func assertNoReminders(file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertFalse(element(identifier: "itemEditor.reminder.amount.0").exists, file: file, line: line)
+        let addReminder = element(identifier: "itemEditor.reminder.add")
+        scrollToHittable(addReminder, toward: .down, message: "The editor should still offer Add Reminder when no defaults remain.", file: file, line: line)
+        XCTAssertTrue(addReminder.exists, file: file, line: line)
+    }
+
+    private func saveCurrentItem() {
+        app.buttons["Save"].tap()
+    }
+
+    private func openItem(_ title: String) {
+        let row = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", title)).firstMatch
+        scrollToHittable(row, toward: .down, maxSwipes: 10, message: "The saved item should appear in the signed-in workspace.")
+        row.tap()
+    }
+
+    private func cancelEditor() {
+        app.buttons["Cancel"].tap()
+    }
+
+    private func element(identifier: String) -> XCUIElement {
+        app.descendants(matching: .any).matching(identifier: identifier).firstMatch
+    }
+
+    private func replaceText(in field: XCUIElement, with value: String) {
+        scrollToHittable(field, toward: .up, message: "The text field should be visible before editing it.")
+        field.tap()
+        if let currentValue = field.value as? String, !currentValue.isEmpty {
+            field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: currentValue.count))
+        }
+        field.typeText(value)
+    }
+
+    private enum ScrollDirection: Equatable {
+        case up
+        case down
+    }
+
+    private func scrollToHittable(
+        _ target: XCUIElement,
+        toward direction: ScrollDirection,
+        maxSwipes: Int = 8,
+        message: String = "The requested control should become visible.",
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        for _ in 0...maxSwipes {
+            if target.isHittable { return }
+            dismissKeyboardIfShown()
+            if direction == .down {
+                app.swipeUp()
+            } else {
+                app.swipeDown()
+            }
+        }
+        XCTAssertTrue(target.isHittable, message, file: file, line: line)
+    }
+
+    private func dismissKeyboardIfShown() {
+        let keyboard = app.keyboards.firstMatch
+        guard keyboard.exists else { return }
+
+        let returnButton = keyboard.buttons.matching(
+            NSPredicate(format: "label IN %@", ["Done", "Go", "Next", "Return"])
+        ).firstMatch
+        if returnButton.exists {
+            returnButton.tap()
+            if !keyboard.exists { return }
+        }
+
+        let navigationBar = app.navigationBars.firstMatch
+        if navigationBar.exists {
+            navigationBar.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        }
+    }
+
+    private func allowLocalNetworkIfPrompted() {
+        let system = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let allow = system.alerts.buttons["Allow"]
+        if allow.waitForExistence(timeout: 3) {
+            allow.tap()
+        }
+    }
+}

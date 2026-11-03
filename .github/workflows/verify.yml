@@ -18,6 +18,13 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install chromium
+      - run: npm run test:ios-ui
       - run: xcodebuild -project apps/ios/FileTasks.xcodeproj -scheme FileTasks -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
   android:
     runs-on: ubuntu-latest

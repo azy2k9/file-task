@@ -21,6 +21,7 @@ struct ItemEditorView: View {
     @State private var recurrenceCount: Int
     @State private var weekdays: Set<Int>
     @State private var reminders: [ReminderRule]
+    @State private var remindersWereEdited = false
     @State private var scope: EditScope
     @State private var isSaving = false
     @State private var errorMessage: String?
@@ -74,6 +75,7 @@ struct ItemEditorView: View {
                                 Text(option.title).tag(option)
                             }
                         }
+                        .accessibilityIdentifier("itemEditor.type")
                     } else {
                         LabeledContent("Type", value: kind.title)
                     }
@@ -174,9 +176,35 @@ struct ItemEditorView: View {
                 }
 
                 Section("Reminders") {
+                    if item == nil && !model.hasLoadedReminderSettingsForCurrentSession {
+                        VStack(alignment: .leading, spacing: 8) {
+                            if let loadError = model.reminderSettingsLoadError {
+                                Text("Reminder defaults could not be loaded: \(loadError)")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            } else if model.isLoadingReminderSettings {
+                                Text("Loading reminder defaults…")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Text("Reminder defaults have not loaded yet.")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Button("Retry loading defaults") {
+                                Task { await model.refreshItems() }
+                            }
+                            .disabled(model.isLoadingReminderSettings)
+                            .accessibilityIdentifier("itemEditor.reminderDefaults.retry")
+                        }
+                    }
+
                     ReminderListEditor(
                         reminders: $reminders,
-                        emailAvailable: model.reminderSettings.emailAvailable && model.reminderSettings.emailEnabled
+                        emailAvailable: model.reminderSettings.emailAvailable && model.reminderSettings.emailEnabled,
+                        accessibilityIdentifierPrefix: "itemEditor.reminder",
+                        onUserEdit: { remindersWereEdited = true }
                     )
                 }
             }
@@ -197,16 +225,28 @@ struct ItemEditorView: View {
                             Text("Save")
                         }
                     }
-                    .disabled(isSaving)
+                    .disabled(isSaving || !canSave)
                 }
             }
         }
         .interactiveDismissDisabled(isSaving)
         .onAppear {
-            if item == nil && reminders.isEmpty {
-                reminders = kind == .task ? model.reminderSettings.taskReminders : model.reminderSettings.eventReminders
-            }
+            applyDefaultRemindersIfUntouched()
         }
+        .onChange(of: kind) { _ in applyDefaultRemindersIfUntouched() }
+        .onChange(of: model.hasLoadedReminderSettingsForCurrentSession) { _ in applyDefaultRemindersIfUntouched() }
+        .onChange(of: model.reminderSettings) { _ in applyDefaultRemindersIfUntouched() }
+    }
+
+    private var canSave: Bool {
+        item != nil || model.hasLoadedReminderSettingsForCurrentSession || remindersWereEdited
+    }
+
+    private func applyDefaultRemindersIfUntouched() {
+        guard item == nil,
+              !remindersWereEdited,
+              model.hasLoadedReminderSettingsForCurrentSession else { return }
+        reminders = kind == .task ? model.reminderSettings.taskReminders : model.reminderSettings.eventReminders
     }
 
     @MainActor
@@ -214,6 +254,10 @@ struct ItemEditorView: View {
         let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedTitle.isEmpty else {
             errorMessage = "Enter a title before saving."
+            return
+        }
+        guard canSave else {
+            errorMessage = "Load reminder defaults before saving, or edit the reminders intentionally."
             return
         }
 
@@ -228,7 +272,9 @@ struct ItemEditorView: View {
             scheduledDate: includesDate ? AgendaDate.dateString(from: date) : nil,
             scheduledTime: includesDate && includesTime ? AgendaDate.timeString(from: time) : nil,
             recurrence: makeRecurrence(),
-            reminders: reminders,
+            reminders: item == nil && !remindersWereEdited
+                ? (kind == .task ? model.reminderSettings.taskReminders : model.reminderSettings.eventReminders)
+                : reminders,
             scope: item?.seriesId == nil ? nil : scope
         )
         do {
@@ -255,31 +301,64 @@ struct ItemEditorView: View {
 private struct ReminderListEditor: View {
     @Binding var reminders: [ReminderRule]
     let emailAvailable: Bool
+    let accessibilityIdentifierPrefix: String
+    let onUserEdit: () -> Void
 
     var body: some View {
         ForEach(Array(reminders.enumerated()), id: \.offset) { index, _ in
             VStack(alignment: .leading, spacing: 8) {
-                Picker("Delivery", selection: $reminders[index].delivery) {
+                Picker("Delivery", selection: Binding(
+                    get: { reminders[index].delivery },
+                    set: { delivery in
+                        reminders[index].delivery = delivery
+                        onUserEdit()
+                    }
+                )) {
                     Text("Notification").tag(ReminderDelivery.notification)
                     if emailAvailable || reminders[index].delivery == .email { Text("Email").tag(ReminderDelivery.email) }
                 }
+                .accessibilityIdentifier("\(accessibilityIdentifierPrefix).delivery.\(index)")
                 HStack {
-                    Stepper("\(reminders[index].amount)", value: $reminders[index].amount, in: 0...100_000)
-                    Picker("Unit", selection: $reminders[index].unit) {
+                    Stepper("\(reminders[index].amount)", value: Binding(
+                        get: { reminders[index].amount },
+                        set: { amount in
+                            reminders[index].amount = amount
+                            onUserEdit()
+                        }
+                    ), in: 0...100_000)
+                    .accessibilityIdentifier("\(accessibilityIdentifierPrefix).amount.\(index)")
+                    Picker("Unit", selection: Binding(
+                        get: { reminders[index].unit },
+                        set: { unit in
+                            reminders[index].unit = unit
+                            onUserEdit()
+                        }
+                    )) {
                         ForEach(ReminderUnit.allCases) { unit in Text(unit.rawValue).tag(unit) }
                     }
+                    .accessibilityIdentifier("\(accessibilityIdentifierPrefix).unit.\(index)")
                 }
                 DatePicker("Clock time", selection: Binding(
                     get: { AgendaDate.time(from: reminders[index].time) ?? Date() },
-                    set: { reminders[index].time = AgendaDate.timeString(from: $0) }
+                    set: { time in
+                        reminders[index].time = AgendaDate.timeString(from: time)
+                        onUserEdit()
+                    }
                 ), displayedComponents: .hourAndMinute)
-                Button("Remove Reminder", role: .destructive) { reminders.remove(at: index) }
+                .accessibilityIdentifier("\(accessibilityIdentifierPrefix).time.\(index)")
+                Button("Remove Reminder", role: .destructive) {
+                    reminders.remove(at: index)
+                    onUserEdit()
+                }
+                .accessibilityIdentifier("\(accessibilityIdentifierPrefix).remove.\(index)")
             }
         }
         Button("Add Reminder") {
             reminders.append(ReminderRule(delivery: .notification, amount: 1, unit: .days, time: "09:00"))
+            onUserEdit()
         }
         .disabled(reminders.count >= 20)
+        .accessibilityIdentifier("\(accessibilityIdentifierPrefix).add")
     }
 }
 
@@ -327,10 +406,20 @@ struct ReminderSettingsView: View {
                     }
                 }
                 Section("Task defaults") {
-                    ReminderListEditor(reminders: $settings.taskReminders, emailAvailable: settings.emailAvailable && settings.emailEnabled)
+                    ReminderListEditor(
+                        reminders: $settings.taskReminders,
+                        emailAvailable: settings.emailAvailable && settings.emailEnabled,
+                        accessibilityIdentifierPrefix: "reminderSettings.task",
+                        onUserEdit: {}
+                    )
                 }
                 Section("Event defaults") {
-                    ReminderListEditor(reminders: $settings.eventReminders, emailAvailable: settings.emailAvailable && settings.emailEnabled)
+                    ReminderListEditor(
+                        reminders: $settings.eventReminders,
+                        emailAvailable: settings.emailAvailable && settings.emailEnabled,
+                        accessibilityIdentifierPrefix: "reminderSettings.event",
+                        onUserEdit: {}
+                    )
                 }
                 Section("Existing items") {
                     Toggle("Apply defaults to items still using the old defaults", isOn: $applyToExisting)
