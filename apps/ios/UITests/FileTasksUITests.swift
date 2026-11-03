@@ -58,6 +58,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         let originField = app.textFields["https://api.example.com"]
         XCTAssertTrue(originField.waitForExistence(timeout: 5))
         replaceText(in: originField, with: "http://localhost:3107")
+        dismissKeyboardIfShown()
 
         let allowHTTP = app.switches["Allow local development HTTP"]
         XCTAssertTrue(allowHTTP.waitForExistence(timeout: 5))
@@ -70,7 +71,9 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
     }
 
     private func registerSecondAccountInApp() {
-        app.buttons["Create a new account"].tap()
+        let createNewAccount = app.buttons["Create a new account"]
+        scrollToHittable(createNewAccount, toward: .down)
+        createNewAccount.tap()
         signInFields(email: registrationEmail)
 
         let createAccount = app.buttons["Create account"]
