@@ -218,6 +218,9 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         let removeReminder = element(identifier: "itemEditor.reminder.remove.0")
         scrollToHittable(removeReminder, toward: .down, message: "The Task's default Reminder should be available to remove.")
         removeReminder.tap()
+        let removalComplete = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: firstReminder)
+        XCTAssertEqual(XCTWaiter.wait(for: [removalComplete], timeout: 10), .completed,
+                       "Removing the only Reminder should remove its controls before switching type. Accessibility hierarchy: \(app.debugDescription)")
 
         selectType("Event")
         setTitle(title)
@@ -278,10 +281,13 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
     }
 
     private func assertNoReminders(file: StaticString = #filePath, line: UInt = #line) {
-        XCTAssertFalse(element(identifier: "itemEditor.reminder.amount.0").exists, file: file, line: line)
         let addReminder = element(identifier: "itemEditor.reminder.add")
         scrollToHittable(addReminder, toward: .down, message: "The editor should still offer Add Reminder when no defaults remain.", file: file, line: line)
         XCTAssertTrue(addReminder.exists, file: file, line: line)
+        let reminder = element(identifier: "itemEditor.reminder.amount.0")
+        let absent = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: reminder)
+        XCTAssertEqual(XCTWaiter.wait(for: [absent], timeout: 10), .completed,
+                       "No Reminder should be present. Accessibility hierarchy: \(app.debugDescription)", file: file, line: line)
     }
 
     private func saveCurrentItem() {
