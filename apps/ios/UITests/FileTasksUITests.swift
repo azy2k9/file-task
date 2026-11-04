@@ -101,12 +101,22 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
     }
 
     private func signOutInApp() {
-        app.buttons["Account options"].tap()
+        let accountOptions = app.buttons["Account options"]
+        XCTAssertTrue(accountOptions.waitForExistence(timeout: 10))
+        // SwiftUI exposes a labelled wrapper around the toolbar button. The
+        // wrapper may have no accessibility hit point even while it is visible.
+        accountOptions.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         let signOutMenuItem = app.buttons["Sign out"]
-        let menuReady = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == true AND hittable == true"), object: signOutMenuItem)
+        let visibleFrame = NSPredicate { _, _ in
+            guard signOutMenuItem.exists else { return false }
+            let frame = signOutMenuItem.frame
+            return frame.origin.x.isFinite && frame.origin.y.isFinite && frame.width > 0 && frame.height > 0
+                && self.app.frame.intersects(frame)
+        }
+        let menuReady = XCTNSPredicateExpectation(predicate: visibleFrame, object: signOutMenuItem)
         XCTAssertEqual(XCTWaiter.wait(for: [menuReady], timeout: 15), .completed,
-                       "The Sign out menu item should be available to tap. Accessibility hierarchy: \(app.debugDescription)")
-        signOutMenuItem.tap()
+                       "The Sign out menu item should have a visible frame. Accessibility hierarchy: \(app.debugDescription)")
+        signOutMenuItem.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
 
         let confirmation = app.sheets["Sign out of FileTasks?"]
         XCTAssertTrue(confirmation.waitForExistence(timeout: 10),
