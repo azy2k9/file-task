@@ -311,7 +311,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         let row = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", title)).firstMatch
         scrollToHittable(row, toward: .down, maxSwipes: 10, message: "The saved item should appear in the signed-in workspace.")
         row.tap()
-        let editor = app.navigationBars.matching(NSPredicate(format: "label BEGINSWITH %@", "Edit ")).firstMatch
+        let editor = app.navigationBars.matching(NSPredicate(format: "identifier BEGINSWITH %@", "Edit ")).firstMatch
         XCTAssertTrue(editor.waitForExistence(timeout: 30),
                       "The saved item should open in the editor. Accessibility hierarchy: \(app.debugDescription)")
     }
