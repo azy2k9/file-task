@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
+import { setEmulatorRunning } from "./emulator-control.mjs";
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
 const testName = "iOS UI acceptance: registration, cross-type Reminder preservation, save/reopen and browser read";
@@ -232,7 +233,7 @@ async function createDisposableSimulator(name, { runtimes, deviceTypes }) {
   throw new Error(`Could not create an isolated disposable iPhone Simulator.\n${attempts.slice(0, 3).join("\n")}`);
 }
 
-async function runFocusedAcceptance(simulatorId, processGroupStatePath, shared = false) {
+async function runFocusedAcceptance(simulatorId, processGroupStatePath, shared = false, androidSerial) {
   const pattern = `^${testName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
   const testFiles = shared
     ? (await readdir(join(repoRoot, "apps/web/tests"))).filter((name) => name.endsWith(".test.mjs")).sort()
@@ -253,6 +254,7 @@ async function runFocusedAcceptance(simulatorId, processGroupStatePath, shared =
         FILETASKS_RUN_SHARED_ACCEPTANCE: "1",
         FILETASKS_RUN_ANDROID_UI_ACCEPTANCE: "1",
         FILETASKS_RUN_NATIVE_ACCEPTANCE: "1",
+        FILETASKS_ANDROID_EMULATOR_SERIAL: androidSerial,
       } : {}),
       FILETASKS_IOS_UI_SIMULATOR_ID: simulatorId,
       FILETASKS_IOS_UI_PROCESS_GROUPS_PATH: processGroupStatePath,
@@ -333,6 +335,7 @@ async function main() {
   let processGroupStatePath;
   let failure;
   let safeToDeleteSimulator = true;
+  let androidSerial;
   try {
     const prerequisites = await checkPrerequisites(shared);
     if (shared) {
@@ -340,6 +343,7 @@ async function main() {
         const state = await capture("adb", ["get-state"]);
         const emulator = await capture("adb", ["shell", "getprop", "ro.kernel.qemu"]);
         const booted = await capture("adb", ["shell", "getprop", "sys.boot_completed"]);
+        androidSerial = await capture("adb", ["get-serialno"]);
         await capture("swift", ["--version"]);
         if (state !== "device" || emulator !== "1" || booted !== "1") throw new Error("No fully booted Android emulator was selected.");
       } catch (error) {
@@ -350,12 +354,16 @@ async function main() {
     console.log(`Using ${prerequisites.xcodeVersion.replaceAll("\n", " ")}.`);
     simulatorCreationAttempted = true;
     simulatorId = await createDisposableSimulator(simulatorName, prerequisites);
-    await run("xcrun", ["simctl", "boot", simulatorId]);
-    await run("xcrun", ["simctl", "bootstatus", simulatorId, "-b"]);
+    if (shared) {
+      await setEmulatorRunning((args) => capture("adb", args), androidSerial, false);
+    } else {
+      await run("xcrun", ["simctl", "boot", simulatorId]);
+      await run("xcrun", ["simctl", "bootstatus", simulatorId, "-b"]);
+    }
     if (interruptedSignal) throw new Error(`The iOS UI runner was interrupted by ${interruptedSignal}.`);
     processGroupStatePath = join(tmpdir(), `filetasks-ios-ui-groups-${randomUUID()}.json`);
     await writeFile(processGroupStatePath, "[]\n", { flag: "wx" });
-    await runFocusedAcceptance(simulatorId, processGroupStatePath, shared);
+    await runFocusedAcceptance(simulatorId, processGroupStatePath, shared, androidSerial);
     console.log(shared
       ? "The full web, iOS, and Android acceptance suite passed against the shared temporary backend."
       : "The focused iOS UI acceptance passed against the shared temporary API and browser.");
@@ -376,6 +384,14 @@ async function main() {
       failure = new AggregateError([failure, interruptionFailure].filter(Boolean), "Could not stop the interrupted iOS UI test process group safely.");
     }
     if (interruptedSignal && !failure) failure = new Error(`The iOS UI runner was interrupted by ${interruptedSignal}.`);
+
+    if (shared && androidSerial) {
+      try {
+        await setEmulatorRunning((args) => capture("adb", args, { cleanup: true }), androidSerial, true);
+      } catch (error) {
+        failure = new AggregateError([failure, error].filter(Boolean), "Could not restore the Android emulator after shared acceptance.");
+      }
+    }
 
     if (processGroupStatePath) {
       try {

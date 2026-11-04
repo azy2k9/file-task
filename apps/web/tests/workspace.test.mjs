@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { chromium, expect } from "@playwright/test";
 import { stopTrackedProcessGroups, terminateProcessGroup, waitForProcessGroupExit } from "../../../scripts/test-ios-ui.mjs";
+import { setEmulatorRunning } from "../../../scripts/emulator-control.mjs";
 
 let server;
 let sharedUIOwner;
@@ -51,7 +52,7 @@ let testClock = new Date("2026-10-13T12:00:00.000Z");
 let serverTimeZone = "UTC";
 const serverReadinessTimeoutMs = 120_000;
 const serverReadinessProbeTimeoutMs = 10_000;
-const serverShutdownTimeoutMs = 2_000;
+const serverShutdownTimeoutMs = process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1" ? 10_000 : 2_000;
 const setupShutdownTimeoutMs = 10_000;
 const commandShutdownTimeoutMs = 2_000;
 const browserShutdownTimeoutMs = 5_000;
@@ -295,7 +296,7 @@ async function startServerDuringSetup(setup) {
   logs = "";
   let child;
   try {
-    child = spawn(process.execPath, [nextBin, "dev", "--port", "3107"], {
+    child = spawn(process.execPath, [nextBin, "dev", ...(process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1" ? ["--webpack"] : []), "--port", "3107"], {
       cwd: projectRoot,
       detached: process.platform !== "win32",
       env: {
@@ -2623,6 +2624,7 @@ test("Android UI acceptance: recurring agenda updates are visible across clients
   const password = "correct-horse-battery";
   const owner = await account(email);
   if (shared) {
+    await setEmulatorRunning((args) => runCommand("adb", args), process.env.FILETASKS_ANDROID_EMULATOR_SERIAL, true);
     sharedUIOwner = owner;
     const mappings = await runCommand("adb", ["reverse", "--list"]);
     assert.equal(mappings.split(/\r?\n/).some((line) => /\btcp:3107\b/.test(line)), false,
@@ -2899,6 +2901,11 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, save/re
 
   const simulatorId = process.env.FILETASKS_IOS_UI_SIMULATOR_ID;
   assert.ok(simulatorId, "The focused runner must create and pass a disposable iOS Simulator id.");
+  if (process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1") {
+    await setEmulatorRunning((args) => runCommand("adb", args), process.env.FILETASKS_ANDROID_EMULATOR_SERIAL, false);
+    await runCommand("xcrun", ["simctl", "boot", simulatorId]);
+    await runCommand("xcrun", ["simctl", "bootstatus", simulatorId, "-b"]);
+  }
   try {
     await runCommand("xcodebuild", [
       "-project", "apps/ios/FileTasks.xcodeproj",
