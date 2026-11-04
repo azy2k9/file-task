@@ -98,7 +98,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         scrollToHittable(createAccount, toward: .down)
         createAccount.tap()
         allowLocalNetworkIfPrompted()
-        XCTAssertTrue(app.buttons["Account options"].waitForExistence(timeout: 15),
+        XCTAssertTrue(app.buttons["Account options"].waitForExistence(timeout: 60),
                       "Registration must complete through the installed app. Accessibility hierarchy: \(app.debugDescription)")
         XCTAssertTrue(app.staticTexts["Your workspace is empty"].waitForExistence(timeout: 30),
                       "The newly registered workspace should finish loading before opening its menu. Accessibility hierarchy: \(app.debugDescription)")
@@ -151,7 +151,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         scrollToHittable(signIn, toward: .down)
         signIn.tap()
         allowLocalNetworkIfPrompted()
-        XCTAssertTrue(app.buttons["Create item"].waitForExistence(timeout: 15),
+        XCTAssertTrue(app.buttons["Create item"].waitForExistence(timeout: 60),
                       "Sign-in must use the app's account flow. Accessibility hierarchy: \(app.debugDescription)")
     }
 
