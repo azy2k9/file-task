@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -180,9 +180,10 @@ function compareVersions(left, right) {
   return 0;
 }
 
-async function checkPrerequisites() {
+async function checkPrerequisites(shared = false) {
+  const command = shared ? "npm run test:shared-acceptance" : "npm run test:ios-ui";
   if (process.platform !== "darwin") {
-    throw new Error(`npm run test:ios-ui requires macOS with Xcode and an iOS Simulator runtime; detected ${process.platform}.`);
+    throw new Error(`${command} requires macOS with Xcode and an iOS Simulator runtime; detected ${process.platform}.`);
   }
 
   try {
@@ -207,7 +208,7 @@ async function checkPrerequisites() {
 
     return { xcodeVersion, runtimes, deviceTypes };
   } catch (error) {
-    throw new Error(`npm run test:ios-ui could not verify the Xcode Simulator prerequisites. Install/select a full Xcode installation and an iOS Simulator runtime.\n${error.message}`);
+    throw new Error(`${command} could not verify the Xcode Simulator prerequisites. Install/select a full Xcode installation and an iOS Simulator runtime.\n${error.message}`);
   }
 }
 
@@ -231,18 +232,28 @@ async function createDisposableSimulator(name, { runtimes, deviceTypes }) {
   throw new Error(`Could not create an isolated disposable iPhone Simulator.\n${attempts.slice(0, 3).join("\n")}`);
 }
 
-async function runFocusedAcceptance(simulatorId, processGroupStatePath) {
+async function runFocusedAcceptance(simulatorId, processGroupStatePath, shared = false) {
   const pattern = `^${testName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
+  const testFiles = shared
+    ? (await readdir(join(repoRoot, "apps/web/tests"))).filter((name) => name.endsWith(".test.mjs")).sort()
+        .map((name) => join("apps/web/tests", name))
+    : ["apps/web/tests/workspace.test.mjs"];
+  if (testFiles.length === 0) throw new Error("No web acceptance test files were found.");
   const result = await run(process.execPath, [
     "--test",
     "--test-concurrency=1",
     "--test-reporter=tap",
-    `--test-name-pattern=${pattern}`,
-    "apps/web/tests/workspace.test.mjs",
+    ...(shared ? [] : [`--test-name-pattern=${pattern}`]),
+    ...testFiles,
   ], {
     env: {
       ...process.env,
       FILETASKS_RUN_IOS_UI_ACCEPTANCE: "1",
+      ...(shared ? {
+        FILETASKS_RUN_SHARED_ACCEPTANCE: "1",
+        FILETASKS_RUN_ANDROID_UI_ACCEPTANCE: "1",
+        FILETASKS_RUN_NATIVE_ACCEPTANCE: "1",
+      } : {}),
       FILETASKS_IOS_UI_SIMULATOR_ID: simulatorId,
       FILETASKS_IOS_UI_PROCESS_GROUPS_PATH: processGroupStatePath,
     },
@@ -251,13 +262,29 @@ async function runFocusedAcceptance(simulatorId, processGroupStatePath) {
   });
 
   if (result.code !== 0) {
-    throw new Error(`The focused shared-backend iOS UI acceptance failed with exit code ${result.code}.`);
+    throw new Error(`${shared ? "The full shared acceptance suite" : "The focused iOS UI acceptance"} failed with exit code ${result.code}.`);
   }
   const escapedName = testName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const targetLinePattern = new RegExp(`^ok \\d+ - ${escapedName}(?:\\s|$)`);
   const targetLine = result.output.split(/\r?\n/).find((line) => targetLinePattern.test(line));
   if (!targetLine || /# (?:SKIP|TODO)\b/.test(targetLine) || !/^# fail 0$/m.test(result.output)) {
     throw new Error(`The focused iOS UI acceptance did not execute and pass its target test.\n${result.output.slice(-6000)}`);
+  }
+  if (shared) assertSharedAcceptanceReport(result.output);
+}
+
+export function assertSharedAcceptanceReport(output) {
+  for (const name of [
+    testName,
+    "Android UI acceptance: recurring agenda updates are visible across clients",
+    "iOS, Android and web run against one shared account, API and provider fakes",
+  ]) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const line = output.split(/\r?\n/).find((entry) => new RegExp(`^ok \\d+ - ${escaped}(?:\\s|$)`).test(entry));
+    if (!line || /# (?:SKIP|TODO)\b/.test(line)) throw new Error(`The required shared phase did not run: ${name}`);
+  }
+  if (/^ok \d+ - .*# (?:SKIP|TODO)\b/m.test(output) || !/^# skipped 0$/m.test(output) || !/^# todo 0$/m.test(output) || !/^# fail 0$/m.test(output)) {
+    throw new Error("The shared acceptance suite skipped, failed, or marked a test TODO.");
   }
 }
 
@@ -299,6 +326,7 @@ function errorDetails(error) {
 
 async function main() {
   installInterruptionHandlers();
+  const shared = process.argv.slice(2).includes("--shared");
   let simulatorId;
   const simulatorName = `FileTasks-UI-${randomUUID().slice(0, 8)}`;
   let simulatorCreationAttempted = false;
@@ -306,7 +334,18 @@ async function main() {
   let failure;
   let safeToDeleteSimulator = true;
   try {
-    const prerequisites = await checkPrerequisites();
+    const prerequisites = await checkPrerequisites(shared);
+    if (shared) {
+      try {
+        const state = await capture("adb", ["get-state"]);
+        const emulator = await capture("adb", ["shell", "getprop", "ro.kernel.qemu"]);
+        const booted = await capture("adb", ["shell", "getprop", "sys.boot_completed"]);
+        await capture("swift", ["--version"]);
+        if (state !== "device" || emulator !== "1" || booted !== "1") throw new Error("No fully booted Android emulator was selected.");
+      } catch (error) {
+        throw new Error(`The shared acceptance suite requires Swift, Android SDK platform-tools, and a booted Android emulator. ${error.message}`);
+      }
+    }
     if (interruptedSignal) throw new Error(`The iOS UI runner was interrupted by ${interruptedSignal}.`);
     console.log(`Using ${prerequisites.xcodeVersion.replaceAll("\n", " ")}.`);
     simulatorCreationAttempted = true;
@@ -316,8 +355,10 @@ async function main() {
     if (interruptedSignal) throw new Error(`The iOS UI runner was interrupted by ${interruptedSignal}.`);
     processGroupStatePath = join(tmpdir(), `filetasks-ios-ui-groups-${randomUUID()}.json`);
     await writeFile(processGroupStatePath, "[]\n", { flag: "wx" });
-    await runFocusedAcceptance(simulatorId, processGroupStatePath);
-    console.log("The focused iOS UI acceptance passed against the shared temporary API and browser.");
+    await runFocusedAcceptance(simulatorId, processGroupStatePath, shared);
+    console.log(shared
+      ? "The full web, iOS, and Android acceptance suite passed against the shared temporary backend."
+      : "The focused iOS UI acceptance passed against the shared temporary API and browser.");
   } catch (error) {
     failure = error;
   } finally {

@@ -14,6 +14,7 @@ import { chromium, expect } from "@playwright/test";
 import { stopTrackedProcessGroups, terminateProcessGroup, waitForProcessGroupExit } from "../../../scripts/test-ios-ui.mjs";
 
 let server;
+let sharedUIOwner;
 let deliveryServer;
 let deliveryStopPromise;
 let uiAcceptanceBrowser;
@@ -2617,9 +2618,17 @@ test("Android UI acceptance: recurring agenda updates are visible across clients
   skip: process.env.FILETASKS_RUN_ANDROID_UI_ACCEPTANCE !== "1",
 }, async () => {
   await setTestClock("2026-10-13T12:00:00.000Z");
-  const email = "android-ui-shared@example.com";
+  const shared = process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1";
+  const email = shared ? "ios-ui-shared@example.com" : "android-ui-shared@example.com";
   const password = "correct-horse-battery";
   const owner = await account(email);
+  if (shared) {
+    sharedUIOwner = owner;
+    const mappings = await runCommand("adb", ["reverse", "--list"]);
+    assert.equal(mappings.split(/\r?\n/).some((line) => /\btcp:3107\b/.test(line)), false,
+      "The Android emulator port 3107 must be available for the shared UI workflow.");
+    await runCommand("adb", ["reverse", "tcp:3107", "tcp:3107"]);
+  }
   try {
     const authorization = await beginGoogleAuthorization(owner);
     assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
@@ -2645,6 +2654,7 @@ test("Android UI acceptance: recurring agenda updates are visible across clients
     throw new Error(`${error.message}\nInstrumentation results:\n${reports}\nRecent test server output:\n${logs.slice(-10000)}`, { cause: error });
   } finally {
     failNextGoogleRequest = null;
+    if (shared) await runCommand("adb", ["reverse", "--remove", "tcp:3107"], process.env, repoRoot, { cleanup: true });
   }
 
   const response = await request("/api/items", { token: owner.token });
@@ -2678,10 +2688,12 @@ test("iOS, Android and web run against one shared account, API and provider fake
   skip: process.env.FILETASKS_RUN_NATIVE_ACCEPTANCE !== "1",
 }, async () => {
   await setTestClock("2026-10-13T12:00:00.000Z");
-  const email = `shared-native-${crypto.randomUUID()}@example.com`;
+  const shared = process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1";
+  const email = shared ? "ios-ui-shared@example.com" : `shared-native-${crypto.randomUUID()}@example.com`;
   const password = "correct-horse-battery";
   const namespace = crypto.randomUUID();
-  const sharedOwner = await account(email);
+  const sharedOwner = shared ? sharedUIOwner : await account(email);
+  assert.ok(sharedOwner, "The Android UI phase must create the account before the shared native workflow.");
   const providerIndex = providerRequests.length;
   const workerDeliveriesBefore = providerRequests.filter(({ path, body }) => path === "/push" && body.operation === "deliver").length;
   const nativeEnv = {
@@ -2708,10 +2720,15 @@ test("iOS, Android and web run against one shared account, API and provider fake
 
   const fakePort = new URL(deliveryBase).port;
   const reversedPorts = ["3107", fakePort];
+  const installedReverses = [];
   try {
-    for (const port of reversedPorts) await runCommand("adb", ["reverse", `tcp:${port}`, `tcp:${port}`]);
+    for (const port of reversedPorts) {
+      await runCommand("adb", ["reverse", `tcp:${port}`, `tcp:${port}`]);
+      installedReverses.push(port);
+    }
     await runCommand("./gradlew", [
       ":app:connectedDebugAndroidTest",
+      "-Pandroid.testInstrumentationRunnerArguments.class=com.filetasks.android.ApiClientAcceptanceTest",
       `-Pandroid.testInstrumentationRunnerArguments.apiUrl=${base}`,
       `-Pandroid.testInstrumentationRunnerArguments.email=${email}`,
       `-Pandroid.testInstrumentationRunnerArguments.password=${password}`,
@@ -2719,7 +2736,7 @@ test("iOS, Android and web run against one shared account, API and provider fake
       "-Pandroid.testInstrumentationRunnerArguments.workerSecret=test-worker-secret",
     ], process.env, join(repoRoot, "apps/android"));
   } finally {
-    for (const port of reversedPorts) await runCommand("adb", ["reverse", "--remove", `tcp:${port}`]).catch(() => {});
+    for (const port of installedReverses) await runCommand("adb", ["reverse", "--remove", `tcp:${port}`], process.env, repoRoot, { cleanup: true });
   }
 
   const nativeRequests = providerRequests.slice(providerIndex).filter(({ path }) => path === "/push");
@@ -2856,7 +2873,8 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, save/re
   const eventReminder = { delivery: "notification", amount: 3, unit: "weeks", time: "11:40" };
   const reverseTaskTitle = "UI Runner Event To Task";
   const noRemindersTitle = "UI Runner No Reminders";
-  const owner = await account(email);
+  const owner = process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1" ? sharedUIOwner : await account(email);
+  assert.ok(owner, "The Android UI phase must create the shared account before the iOS UI phase.");
 
   const settingsResponse = await request("/api/settings/reminders", {
     token: owner.token,
@@ -2934,10 +2952,16 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, save/re
       await page.getByLabel("Password", { exact: true }).fill(password);
       await page.locator("form").getByRole("button", { name: "Sign in", exact: true }).click();
       await page.getByRole("button", { name: "Events", exact: true }).click();
+      if (process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1") {
+        await expect(page.getByRole("heading", { name: "Android UI Following", exact: true }).first()).toBeVisible();
+      }
       await expect(page.getByRole("heading", { name: "UI Runner Event Default", exact: true }).first()).toBeVisible();
       await expect(page.getByRole("heading", { name: "UI Runner Customized Event", exact: true }).first()).toBeVisible();
       await expect(page.getByRole("heading", { name: noRemindersTitle, exact: true }).first()).toBeVisible();
       await page.getByRole("button", { name: "Tasks", exact: true }).click();
+      if (process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1") {
+        await expect(page.getByRole("heading", { name: "Android UI Whole Task", exact: true }).first()).toBeVisible();
+      }
       await expect(page.getByRole("heading", { name: reverseTaskTitle, exact: true }).first()).toBeVisible();
     } finally {
       await closeUIAcceptanceContext();
