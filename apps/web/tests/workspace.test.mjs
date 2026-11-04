@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { chromium, expect } from "@playwright/test";
 import { stopTrackedProcessGroups, terminateProcessGroup, waitForProcessGroupExit } from "../../../scripts/test-ios-ui.mjs";
 
@@ -53,6 +54,120 @@ const runnerOwnedProcessGroups = new Set();
 let interruptedSignal;
 let harnessCleanupPromise;
 const setupGate = createSetupGate();
+
+function appleProperty(component, name) {
+  return component.flatMap((line) => {
+    const separator = line.indexOf(":");
+    if (separator < 0) return [];
+    const [property, ...parameterParts] = line.slice(0, separator).split(";");
+    if (property.toUpperCase() !== name.toUpperCase()) return [];
+    const parameters = Object.fromEntries(parameterParts.map((parameter) => {
+      const equals = parameter.indexOf("=");
+      return equals < 0 ? [parameter.toUpperCase(), ""] : [parameter.slice(0, equals).toUpperCase(), parameter.slice(equals + 1)];
+    }));
+    return [{ value: line.slice(separator + 1), parameters }];
+  });
+}
+
+function validCompactDate(value) {
+  const match = value.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (!match) return false;
+  const [, year, month, day] = match.map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return year > 0 && date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
+
+function validCompactDateTime(value, requireZulu = false) {
+  const match = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z?)$/);
+  if (!match || (requireZulu && match[7] !== "Z")) return false;
+  const [, year, month, day, hour, minute, second] = match.map((part) => Number(part || 0));
+  return validCompactDate(`${String(year).padStart(4, "0")}${String(month).padStart(2, "0")}${String(day).padStart(2, "0")}`)
+    && hour < 24 && minute < 60 && second < 60;
+}
+
+function validIcsDateValue(value, parameters = {}) {
+  return parameters.VALUE?.toUpperCase() === "DATE" ? validCompactDate(value) : validCompactDateTime(value);
+}
+
+function validAppleCalendar(ics) {
+  if (!ics.endsWith("\r\n") || /(^|[^\r])\n|\r(?!\n)/.test(ics)) return false;
+  const rawLines = ics.slice(0, -2).split("\r\n");
+  const lines = [];
+  for (const line of rawLines) {
+    if (/^[ \t]/.test(line) && lines.length) lines[lines.length - 1] += line.slice(1);
+    else lines.push(line);
+  }
+  if (lines[0] !== "BEGIN:VCALENDAR" || lines.at(-1) !== "END:VCALENDAR") return false;
+
+  let currentEvent = null;
+  let events = [];
+  const calendarProperties = [];
+  for (const line of lines.slice(1, -1)) {
+    if (line === "BEGIN:VEVENT") {
+      if (currentEvent) return false;
+      currentEvent = [];
+    } else if (line === "END:VEVENT") {
+      if (!currentEvent) return false;
+      events.push(currentEvent);
+      currentEvent = null;
+    } else if (/^(?:BEGIN|END):/i.test(line)) return false;
+    else if (currentEvent) currentEvent.push(line);
+    else calendarProperties.push(line);
+  }
+  if (currentEvent || !events.length) return false;
+  if (appleProperty(calendarProperties, "VERSION").length !== 1 || appleProperty(calendarProperties, "VERSION")[0].value !== "2.0") return false;
+  if (appleProperty(calendarProperties, "PRODID").length !== 1 || !appleProperty(calendarProperties, "PRODID")[0].value) return false;
+
+  const rootStarts = appleProperty(events[0], "DTSTART");
+  if (rootStarts.length !== 1 || !validIcsDateValue(rootStarts[0].value, rootStarts[0].parameters)) return false;
+  const rootStart = rootStarts[0];
+  const rootIsDate = rootStart.parameters.VALUE?.toUpperCase() === "DATE";
+  const rootIsZulu = !rootIsDate && rootStart.value.endsWith("Z");
+  const uid = appleProperty(events[0], "UID")[0]?.value;
+  if (!uid || /[\r\n]/.test(uid)) return false;
+  for (const [index, event] of events.entries()) {
+    const eventUid = appleProperty(event, "UID");
+    const stamps = appleProperty(event, "DTSTAMP");
+    const starts = appleProperty(event, "DTSTART");
+    const recurrenceIds = appleProperty(event, "RECURRENCE-ID");
+    if (eventUid.length !== 1 || eventUid[0].value !== uid || stamps.length !== 1 || !validCompactDateTime(stamps[0].value, true)) return false;
+    if (starts.length !== 1 || !validIcsDateValue(starts[0].value, starts[0].parameters)) return false;
+    const startIsDate = starts[0].parameters.VALUE?.toUpperCase() === "DATE";
+    if (startIsDate !== rootIsDate || (!startIsDate && starts[0].value.endsWith("Z") !== rootIsZulu)) return false;
+    if (index === 0 ? recurrenceIds.length !== 0 : recurrenceIds.length !== 1) return false;
+    if (recurrenceIds.length === 1) {
+      const recurrenceIsDate = recurrenceIds[0].parameters.VALUE?.toUpperCase() === "DATE";
+      if (!validIcsDateValue(recurrenceIds[0].value, recurrenceIds[0].parameters) || recurrenceIsDate !== rootIsDate
+        || (!recurrenceIsDate && recurrenceIds[0].value.endsWith("Z") !== rootIsZulu)) return false;
+    }
+    for (const exclusion of appleProperty(event, "EXDATE")) {
+      const exclusionIsDate = exclusion.parameters.VALUE?.toUpperCase() === "DATE";
+      if (exclusionIsDate !== rootIsDate || !exclusion.value.split(",").every((value) => validIcsDateValue(value, exclusion.parameters)
+        && (exclusionIsDate || value.endsWith("Z") === rootIsZulu))) return false;
+    }
+    for (const rule of appleProperty(event, "RRULE")) {
+      const until = rule.value.split(";").find((part) => part.toUpperCase().startsWith("UNTIL="))?.slice(6);
+      if (until && (rootIsDate ? !validCompactDate(until)
+        : rootIsZulu ? !validCompactDateTime(until, true) : until.endsWith("Z") || !validCompactDateTime(until))) return false;
+    }
+  }
+  return true;
+}
+
+function escapeXml(value) {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+function appleCalendarFixture({ uid, date = "20270114", timestamp = "20261013T120000Z", recurrence = null, exceptionUid = uid } = {}) {
+  const lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//FileTasks Test//Calendar//EN", "BEGIN:VEVENT",
+    `UID:${uid}`, `DTSTAMP:${timestamp}`, `DTSTART;VALUE=DATE:${date}`, "SUMMARY:Imported calendar event"];
+  if (recurrence) lines.push(`RRULE:${recurrence}`);
+  lines.push("END:VEVENT");
+  if (recurrence) lines.push("BEGIN:VEVENT", `UID:${exceptionUid}`, `DTSTAMP:${timestamp}`, `RECURRENCE-ID;VALUE=DATE:${date}`,
+    `DTSTART;VALUE=DATE:${date}`, "SUMMARY:Imported calendar exception", "END:VEVENT");
+  lines.push("END:VCALENDAR");
+  return `${lines.join("\r\n")}\r\n`;
+}
 
 function writeRunnerProcessGroupState() {
   if (runnerProcessGroupStatePath) {
@@ -397,12 +512,25 @@ async function startDeliveryFakeDuringSetup(setup) {
         return;
       }
       if (request.method === "REPORT") {
-        response.writeHead(207, { "Content-Type": "application/xml" }).end("<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"></d:multistatus>");
+        const calendarPath = url.pathname.endsWith("/") ? url.pathname : `${url.pathname}/`;
+        const resources = [...appleEvents.entries()].filter(([path]) => path.startsWith(calendarPath));
+        const entries = resources.map(([path, calendarData], index) => `<d:response><d:href>${escapeXml(path)}</d:href><d:propstat><d:prop><d:getetag>"apple-${index + 1}"</d:getetag><c:calendar-data>${escapeXml(calendarData)}</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`).join("");
+        response.writeHead(207, { "Content-Type": "application/xml; charset=utf-8" })
+          .end(`<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">${entries}</d:multistatus>`);
         return;
       }
       if (request.method === "PUT") {
+        if (!request.headers["content-type"]?.toLowerCase().startsWith("text/calendar")) {
+          response.writeHead(415).end("Expected a text/calendar resource.");
+          return;
+        }
+        if (!validAppleCalendar(bodyText)) {
+          response.writeHead(400).end("Invalid iCalendar resource.");
+          return;
+        }
+        const existed = appleEvents.has(url.pathname);
         appleEvents.set(url.pathname, bodyText);
-        response.writeHead(201).end();
+        response.writeHead(existed ? 204 : 201).end();
         return;
       }
       if (request.method === "DELETE") {
@@ -1292,9 +1420,31 @@ test("Google and Apple Calendar copies sync through fake provider boundaries", a
   const event = (await created.json()).item;
   assert.equal(googleEvents.size, 1);
   assert.equal(appleEvents.size, 1);
+  const contextFileResponse = await request("/api/files", { token: owner.token, method: "POST", body: {
+    name: "Review agenda", url: "https://example.com/review-agenda.pdf",
+  } });
+  assert.equal(contextFileResponse.status, 201);
+  const contextFile = (await contextFileResponse.json()).file;
+  assert.equal((await request(`/api/files/${contextFile.id}/attachments`, { token: owner.token, method: "POST", body: { itemId: event.id } })).status, 201);
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const sync = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+    assert.equal(sync.status, 200);
+    assert.deepEqual((await sync.json()).synced.sort(), ["apple", "google"]);
+  }
+  assert.equal(googleEvents.size, 1);
+  assert.equal(appleEvents.size, 1);
+  const afterRepeatedSync = (await (await request("/api/items", { token: owner.token })).json()).items;
+  assert.deepEqual(afterRepeatedSync.map(({ id }) => id), [event.id]);
+  assert.deepEqual(afterRepeatedSync[0].files, [{ id: contextFile.id, name: "Review agenda", sourceType: "link" }]);
+  const fileContext = (await (await request("/api/files", { token: owner.token })).json()).files;
+  assert.deepEqual(fileContext.find(({ id }) => id === contextFile.id).attachments.map(({ itemId }) => itemId), [event.id]);
   const firstGoogleCopy = [...googleEvents.values()][0];
   assert.equal(firstGoogleCopy.extendedProperties.private.filetasksItemId, event.id);
   assert.equal(firstGoogleCopy.description.includes(`?event=${event.id}`), true);
+  const firstAppleCopy = [...appleEvents.values()][0];
+  assert.ok(firstAppleCopy.includes(`URL:${base}/?event=${event.id}`));
+  assert.match(firstAppleCopy, /^DTSTAMP:\d{8}T\d{6}Z$/m);
 
   const edited = await request(`/api/items/${event.id}`, { token: owner.token, method: "PATCH", body: {
     title: "Updated cross-provider review", scope: "series",
@@ -1328,6 +1478,63 @@ test("Google and Apple Calendar copies sync through fake provider boundaries", a
   assert.equal(calendarRequests.some(({ method }) => method === "DELETE"), true);
 });
 
+test("calendar import identity failures roll back Events and recurrence series at the public sync boundary", async () => {
+  const owner = await account();
+  const authorization = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
+    cookie: authorization.cookie, redirect: "manual",
+  })).status, 303);
+  assert.equal((await request("/api/calendars", { token: owner.token, method: "POST", body: {
+    username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
+  } })).status, 201);
+
+  const googleId = "external-google-series";
+  googleEvents.set(googleId, { id: googleId, summary: "Google import transaction", start: { date: "2027-01-14" }, recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=TH;COUNT=3"] });
+  const applePath = "/apple/calendar/external-apple-series.ics";
+
+  const directDatabase = new DatabaseSync(join(directory, "workspace.sqlite"));
+  try {
+    for (const provider of ["google", "apple"]) {
+      if (provider === "apple") {
+        const appleResource = await fetch(`${deliveryBase}${applePath}`, {
+          method: "PUT", headers: { "Content-Type": "text/calendar; charset=utf-8" },
+          body: appleCalendarFixture({ uid: "external-apple-series", recurrence: "RRULE:FREQ=WEEKLY;BYDAY=TH;COUNT=3" }),
+        });
+        assert.equal(appleResource.status, 201);
+      }
+      directDatabase.exec(`CREATE TRIGGER fail_calendar_copy_identity BEFORE INSERT ON calendar_copies
+        WHEN NEW.provider='${provider}' BEGIN SELECT RAISE(ABORT, 'injected calendar identity failure'); END`);
+      const failedSync = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+      assert.equal(failedSync.status, 500, `${provider} identity write should fail through the sync API: ${await failedSync.clone().text()}`);
+      const itemsAfterFailure = await request("/api/items", { token: owner.token });
+      assert.equal(itemsAfterFailure.status, 200);
+      assert.deepEqual((await itemsAfterFailure.json()).items, [], `${provider} failure must roll back the imported Event and its Occurrences`);
+      const importCount = directDatabase.prepare("SELECT COUNT(*) AS count FROM calendar_imports WHERE user_id=? AND provider=?").get(owner.user.id,provider).count;
+      const copyCount = directDatabase.prepare("SELECT COUNT(*) AS count FROM calendar_copies WHERE user_id=? AND provider=?").get(owner.user.id,provider).count;
+      assert.equal(importCount, 0, `${provider} import identity should roll back`);
+      assert.equal(copyCount, 0, `${provider} Calendar copy identity should roll back`);
+      directDatabase.exec("DROP TRIGGER fail_calendar_copy_identity");
+      if (provider === "google") googleEvents.clear();
+    }
+
+    const recovered = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+    assert.equal(recovered.status, 200);
+    const recoveredItems = (await (await request("/api/items", { token: owner.token })).json()).items;
+    assert.equal(recoveredItems.length, 3);
+    assert.equal(new Set(recoveredItems.map(({ seriesId }) => seriesId)).size, 1);
+    assert.equal(appleEvents.size, 1);
+    const repeated = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+    assert.equal(repeated.status, 200);
+    assert.equal((await (await request("/api/items", { token: owner.token })).json()).items.length, 3);
+    assert.equal(appleEvents.size, 1);
+  } finally {
+    directDatabase.exec("DROP TRIGGER IF EXISTS fail_calendar_copy_identity");
+    directDatabase.close();
+    googleEvents.clear();
+    appleEvents.delete(applePath);
+  }
+});
+
 test("scoped recurring Event deletion syncs Google and Apple recurrence exclusions", async () => {
   const owner = await account();
   const authorization = await beginGoogleAuthorization(owner);
@@ -1340,7 +1547,7 @@ test("scoped recurring Event deletion syncs Google and Apple recurrence exclusio
 
   const created = await request("/api/items", { token: owner.token, method: "POST", body: {
     kind: "event", title: "Recurring provider review", scheduledDate: "2027-01-14", scheduledTime: "14:30",
-    recurrence: { interval: 1, unit: "weeks", weekdays: [4], end: { type: "count", count: 3 } },
+    recurrence: { interval: 1, unit: "weeks", weekdays: [4], end: { type: "date", date: "2027-01-31" } },
   } });
   assert.equal(created.status, 201);
   const root = (await created.json()).item;
@@ -1350,6 +1557,8 @@ test("scoped recurring Event deletion syncs Google and Apple recurrence exclusio
   assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
   const googleId = [...googleEvents.keys()][0];
   const applePath = [...appleEvents.keys()][0];
+  assert.ok(googleEvents.get(googleId).recurrence.some((line) => line.includes("UNTIL=20270131T235959Z")));
+  assert.ok(appleEvents.get(applePath).includes("RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=TH;UNTIL=20270131T235959\r\n"));
 
   assert.equal((await request(`/api/items/${occurrences[1].id}?scope=occurrence`, { token: owner.token, method: "DELETE" })).status, 204);
   assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
@@ -1366,6 +1575,49 @@ test("scoped recurring Event deletion syncs Google and Apple recurrence exclusio
   assert.equal((await request(`/api/items/${occurrences[2].id}?scope=series`, { token: owner.token, method: "DELETE" })).status, 204);
   assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
   assert.equal(googleEvents.size, 0);
+  assert.equal(appleEvents.size, 0);
+});
+
+test("Apple Calendar keeps all-day recurrence exceptions in one valid Calendar resource", async () => {
+  const owner = await account();
+  assert.equal((await request("/api/calendars", { token: owner.token, method: "POST", body: {
+    username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
+  } })).status, 201);
+  const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "All-day recurring event", scheduledDate: "2027-01-14",
+    recurrence: { interval: 1, unit: "weeks", weekdays: [4], end: { type: "date", date: "2027-02-01" } },
+  } });
+  assert.equal(created.status, 201);
+  const root = (await created.json()).item;
+  const occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+    .filter((item) => item.seriesId === root.id).sort((left, right) => left.occurrenceDate.localeCompare(right.occurrenceDate));
+  assert.equal(occurrences.length, 3);
+  const selected = occurrences[1];
+  const movedDate = "2027-01-23";
+  const moved = await request(`/api/items/${selected.id}`, { token: owner.token, method: "PATCH", body: {
+    scheduledDate: movedDate, title: "Moved all-day event", scope: "occurrence",
+  } });
+  assert.equal(moved.status, 200);
+  const calendarData = [...appleEvents.values()][0];
+  const components = calendarData.split("BEGIN:VEVENT\r\n").slice(1)
+    .map((component) => component.slice(0, component.indexOf("END:VEVENT")));
+  assert.equal(components.length, 2, calendarData);
+  const uids = components.map((component) => component.match(/^UID:(.+)$/m)?.[1]);
+  assert.equal(new Set(uids).size, 1);
+  for (const component of components) assert.match(component, /^DTSTAMP:\d{8}T\d{6}Z$/m);
+  const exception = components.find((component) => component.includes("RECURRENCE-ID;VALUE=DATE:"));
+  assert.ok(exception);
+  assert.ok(exception.includes(`RECURRENCE-ID;VALUE=DATE:${selected.occurrenceDate.replaceAll("-", "")}`));
+  assert.ok(exception.includes(`DTSTART;VALUE=DATE:${movedDate.replaceAll("-", "")}`));
+  assert.ok(exception.includes(`URL:${base}/?event=${root.id}`));
+  assert.ok(calendarData.includes("RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=TH;UNTIL=20270201"));
+  assert.equal(appleEvents.size, 1);
+
+  const repeated = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+  assert.equal(repeated.status, 200);
+  assert.equal((await (await request("/api/items", { token: owner.token })).json()).items.length, 3);
+  assert.equal(appleEvents.size, 1);
+  assert.equal((await request(`/api/items/${root.id}?scope=series`, { token: owner.token, method: "DELETE" })).status, 204);
   assert.equal(appleEvents.size, 0);
 });
 
@@ -1484,7 +1736,11 @@ test("recurring Google exceptions use immutable original starts after moves and 
   assert.equal(googleExceptions.get(instance.id).summary, "Restored from FileTasks");
 
   const appleCopy = [...appleEvents.values()][0];
-  const exceptionComponent = appleCopy.split("BEGIN:VEVENT").find((part) => part.includes(`RECURRENCE-ID:${originalDate.replaceAll("-", "")}T090000`));
+  const appleComponents = appleCopy.split("BEGIN:VEVENT\r\n").slice(1)
+    .map((component) => component.slice(0, component.indexOf("END:VEVENT")));
+  assert.equal(new Set(appleComponents.map((component) => component.match(/^UID:(.+)$/m)?.[1])).size, 1);
+  for (const component of appleComponents) assert.match(component, /^DTSTAMP:\d{8}T\d{6}Z$/m);
+  const exceptionComponent = appleComponents.find((part) => part.includes(`RECURRENCE-ID:${originalDate.replaceAll("-", "")}T090000`));
   assert.ok(exceptionComponent);
   assert.ok(appleCopy.includes(`DTSTART:${movedAgainString.replaceAll("-", "")}T111500`));
   assert.ok(exceptionComponent.includes(`URL:${backlink}`));
@@ -1511,6 +1767,9 @@ test("recurring Google exceptions use immutable original starts after moves and 
   const failedOperationAttempts = providerRequests.filter(({ path, method }) => path === failedOperationPath && method === "PATCH").length - priorPatchAttempts;
   assert.equal(failedOperationAttempts, 1, "the failed Google provider operation should be attempted exactly once without retries");
   assert.equal(failNextGoogleRequest, null, "the controlled fake failure should be consumed by one request");
+  assert.equal((await request(`/api/items/${root.id}?scope=series`, { token: owner.token, method: "DELETE" })).status, 204);
+  assert.equal(googleEvents.size, 0);
+  assert.equal(appleEvents.size, 0);
 });
 
 test("recurring items create independent Occurrences and honor occurrence and series edit scopes", async () => {
@@ -1607,6 +1866,44 @@ test("Calendar sync is account-scoped and is a safe no-op before a provider is c
   assert.equal((await request("/api/calendars", { method: "POST", body: { username: "a@example.com", password: "secret" } })).status, 401);
 });
 
+test("the Apple provider fake validates iCalendar PUTs and reports stored calendar resources", async () => {
+  const invalidResources = [
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//FileTasks Test//EN\r\nEND:VCALENDAR\r\n",
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//FileTasks Test//EN\r\nBEGIN:VEVENT\r\nUID:missing-start@example.test\r\nDTSTAMP:20261013T120000Z\r\nSUMMARY:Missing start\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+    appleCalendarFixture({ uid: "bad-stamp@example.test", timestamp: "20261013T120000 Z" }),
+    appleCalendarFixture({ uid: "root@example.test", recurrence: "RRULE:FREQ=WEEKLY;BYDAY=TH;COUNT=2", exceptionUid: "different@example.test" }),
+    appleCalendarFixture({ uid: "floating-start@example.test", recurrence: "RRULE:FREQ=WEEKLY;BYDAY=TH;UNTIL=20270114T235959Z" }),
+  ];
+  for (const [index, calendarData] of invalidResources.entries()) {
+    const response = await fetch(`${deliveryBase}/apple/calendar/rejected-${index}.ics`, {
+      method: "PUT", headers: { "Content-Type": "text/calendar; charset=utf-8" }, body: calendarData,
+    });
+    assert.equal(response.status, 400);
+    assert.equal(appleEvents.has(`/apple/calendar/rejected-${index}.ics`), false);
+  }
+  const noCalendarContentType = await fetch(`${deliveryBase}/apple/calendar/rejected-content-type.ics`, {
+    method: "PUT", headers: { "Content-Type": "text/plain" }, body: appleCalendarFixture({ uid: "wrong-type@example.test" }),
+  });
+  assert.equal(noCalendarContentType.status, 415);
+
+  const resourcePath = "/apple/calendar/report-round-trip.ics";
+  const saved = await fetch(`${deliveryBase}${resourcePath}`, {
+    method: "PUT", headers: { "Content-Type": "text/calendar; charset=utf-8" },
+    body: appleCalendarFixture({ uid: "report-round-trip@example.test" }),
+  });
+  assert.equal(saved.status, 201);
+  const report = await fetch(`${deliveryBase}/apple/calendar/`, {
+    method: "REPORT", headers: { "Content-Type": "application/xml; charset=utf-8" },
+    body: "<?xml version=\"1.0\"?><c:calendar-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:prop><c:calendar-data/></d:prop></c:calendar-query>",
+  });
+  const reportXml = await report.text();
+  assert.equal(report.status, 207);
+  assert.ok(reportXml.includes(`<d:href>${resourcePath}</d:href>`));
+  assert.ok(reportXml.includes("UID:report-round-trip@example.test"));
+  await fetch(`${deliveryBase}${resourcePath}`, { method: "DELETE" });
+  assert.equal(appleEvents.has(resourcePath), false);
+});
+
 test("a person can manage Tasks and Events through the browser and see another client's changes", async () => {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
@@ -1640,7 +1937,9 @@ test("a person can manage Tasks and Events through the browser and see another c
     const saved = (await (await request("/api/items", { token: native.token })).json()).items[0];
     assert.equal(saved.title, "Compare car insurance");
     assert.equal(saved.completed, true);
-    await request("/api/items", { token: native.token, method: "POST", body: { kind: "event", title: "Birthday dinner", scheduledDate: "2026-11-12" } });
+    const birthdayResponse = await request("/api/items", { token: native.token, method: "POST", body: { kind: "event", title: "Birthday dinner", scheduledDate: "2026-11-12" } });
+    assert.equal(birthdayResponse.status, 201);
+    const birthday = (await birthdayResponse.json()).item;
     await page.getByRole("button", { name: /Refresh/ }).click();
     await expect(page.getByRole("heading", { name: "Birthday dinner", exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Events", exact: true }).click();
@@ -1681,10 +1980,28 @@ test("a person can manage Tasks and Events through the browser and see another c
     await expect(page.getByRole("button", { name: "Task: Compare car insurance", exact: true })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Event: Birthday dinner", exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Agenda", exact: true }).click();
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Reminder settings", exact: true })).toBeVisible();
+    await page.getByLabel("Apple ID", { exact: true }).fill("browser-calendar@example.com");
+    await page.getByLabel("App-specific password", { exact: true }).fill("fake-app-password");
+    await page.getByLabel(/CalDAV calendar URL/).fill(`${deliveryBase}/apple/calendar/`);
+    await page.getByRole("button", { name: "Connect Apple Calendar", exact: true }).click();
+    await expect(page.getByText("Apple Calendar · browser-calendar@example.com", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Sync Calendar", exact: true }).click();
+    await expect(page.getByText("Synced apple Calendar.", { exact: true })).toBeVisible();
+    assert.ok([...appleEvents.values()].some((calendarData) => calendarData.includes(`URL:${base}/?event=${birthday.id}`)));
+    const postSyncItems = (await (await request("/api/items", { token: native.token })).json()).items;
+    assert.ok(postSyncItems.find(({ id }) => id === birthday.id)?.files.some(({ name }) => name === "Application form"));
+    const postSyncFiles = (await (await request("/api/files", { token: native.token })).json()).files;
+    assert.ok(postSyncFiles.find(({ name }) => name === "Application form").attachments.some(({ itemId }) => itemId === birthday.id));
+    await page.getByRole("button", { name: "Close settings", exact: true }).click();
+    await page.getByRole("button", { name: "Agenda", exact: true }).click();
     await page.getByRole("button", { name: "New Event", exact: true }).click();
     await page.getByLabel("Title", { exact: true }).fill("Remember this moment");
     await page.getByRole("button", { name: "Save Event", exact: true }).click();
     await expect(page.getByRole("heading", { name: "Remember this moment", exact: true })).toBeVisible();
+    assert.equal((await request("/api/calendars/sync", { token: native.token, method: "POST" })).status, 200);
+    assert.equal([...appleEvents.values()].some((calendarData) => calendarData.includes("SUMMARY:Remember this moment")), false);
     await context.setOffline(true);
     await page.getByRole("button", { name: "Edit Remember this moment", exact: true }).click();
     await page.getByLabel("Title", { exact: true }).fill("Keep this draft");

@@ -238,7 +238,7 @@ function oneHourLater(date: string, time: string) {
   return `${endDate}T${endTime}:00`;
 }
 function icsFor(item: EventItem, uid: string, exceptions: EventItem[] = [], excludedDates: string[] = []) {
-  const stamp = now().toISOString().replace(/[-:]/g,"").replace(/\.\d{3}/," ").trim();
+  const stamp = now().toISOString().replace(/[-:]/g,"").replace(/\.\d{3}/,"");
   const fields = [`BEGIN:VCALENDAR`,`VERSION:2.0`,`PRODID:-//FileTasks//Calendar//EN`,`BEGIN:VEVENT`,`UID:${uid}`,`DTSTAMP:${stamp}`];
   if (item.scheduledDate) {
     if (item.scheduledTime) fields.push(`DTSTART:${compactDate(item.scheduledDate)}T${item.scheduledTime.replace(":","")}00`);
@@ -248,7 +248,7 @@ function icsFor(item: EventItem, uid: string, exceptions: EventItem[] = [], excl
   if (item.details) fields.push(`DESCRIPTION:${escapeIcs(item.details)}`);
   const url = filetasksEventUrl(item.id);
   if (url) fields.push(`URL:${url}`);
-  if (item.recurrence) fields.push(`RRULE:${rruleFor(item.recurrence)}`);
+  if (item.recurrence) fields.push(`RRULE:${rruleFor(item.recurrence,!item.scheduledTime,false)}`);
   for (const date of excludedDates) {
     fields.push(item.scheduledTime
       ? `EXDATE:${compactDate(date)}T${item.scheduledTime.replace(":","")}00`
@@ -274,12 +274,12 @@ function icsFor(item: EventItem, uid: string, exceptions: EventItem[] = [], excl
   return `${fields.join("\r\n")}\r\n`;
 }
 
-function rruleFor(rule: NonNullable<EventItem["recurrence"]>) {
+function rruleFor(rule: NonNullable<EventItem["recurrence"]>, dateOnly = false, untilUsesZulu = true) {
   const freq = { days: "DAILY", weeks: "WEEKLY", months: "MONTHLY", years: "YEARLY" }[rule.unit];
   const parts = [`FREQ=${freq}`,`INTERVAL=${rule.interval}`];
   if (rule.weekdays?.length) parts.push(`BYDAY=${rule.weekdays.map((day) => ["SU","MO","TU","WE","TH","FR","SA"][day]).join(",")}`);
   if (rule.end.type === "count") parts.push(`COUNT=${rule.end.count}`);
-  if (rule.end.type === "date") parts.push(`UNTIL=${compactDate(rule.end.date)}T235959Z`);
+  if (rule.end.type === "date") parts.push(`UNTIL=${compactDate(rule.end.date)}${dateOnly ? "" : `T235959${untilUsesZulu ? "Z" : ""}`}`);
   return parts.join(";");
 }
 
@@ -290,7 +290,7 @@ function calendarExclusions(userId: string, rootId: string) {
 
 function googleRecurrence(item: EventItem, excludedDates: string[]) {
   if (!item.recurrence) return undefined;
-  const recurrence = [`RRULE:${rruleFor(item.recurrence)}`];
+  const recurrence = [`RRULE:${rruleFor(item.recurrence,!item.scheduledTime,true)}`];
   for (const date of excludedDates) {
     recurrence.push(item.scheduledTime
       ? `EXDATE;TZID=${process.env.FILETASKS_TIME_ZONE || "UTC"}:${compactDate(date)}T${item.scheduledTime.replace(":","")}00`
@@ -314,7 +314,7 @@ function alreadyImported(userId: string, provider: Provider, externalId: string)
 }
 
 function recordImport(userId: string, provider: Provider, externalId: string, itemId: string, copyUrl?: string) {
-  database().prepare("INSERT OR IGNORE INTO calendar_imports(user_id,provider,external_id,item_id) VALUES(?,?,?,?)").run(userId,provider,externalId,itemId);
+  database().prepare("INSERT INTO calendar_imports(user_id,provider,external_id,item_id) VALUES(?,?,?,?)").run(userId,provider,externalId,itemId);
   database().prepare(`INSERT INTO calendar_copies(user_id,provider,item_id,external_id,resource_uid) VALUES(?,?,?,?,?)
     ON CONFLICT(user_id,provider,item_id) DO UPDATE SET external_id=excluded.external_id,resource_uid=excluded.resource_uid`).run(userId,provider,itemId,copyUrl ?? externalId,provider === "apple" ? externalId : null);
 }
@@ -334,10 +334,35 @@ function recurrenceFromRRule(input: string | null, startDate: string): Recurrenc
   return { interval,unit,...(weekdays?.length ? {weekdays} : {}),end };
 }
 
-function importEvent(userId: string, externalId: string, title: string, details: string, date: string, time: string | null, recurrence: RecurrenceRule | null = null) {
+function importEvent(userId: string, title: string, details: string, date: string, time: string | null, recurrence: RecurrenceRule | null = null) {
   const item = saveItem(userId,{ kind: "event", title: title.slice(0,200) || "Untitled Event", details: details.slice(0,10_000), scheduledDate: date, scheduledTime: time,
     ...(recurrence ? { recurrence } : {}) });
   return item.id;
+}
+
+function importEventWithIdentity(
+  userId: string,
+  provider: Provider,
+  externalId: string,
+  title: string,
+  details: string,
+  date: string,
+  time: string | null,
+  recurrence: RecurrenceRule | null = null,
+  copyUrl?: string,
+) {
+  const db = database();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const itemId = importEvent(userId,title,details,date,time,recurrence);
+    recordImport(userId,provider,externalId,itemId,copyUrl);
+    db.exec("COMMIT");
+    return itemId;
+  } catch (error) {
+    try { db.exec("ROLLBACK"); }
+    catch (rollbackError) { throw new AggregateError([error,rollbackError],"Calendar import transaction could not be rolled back."); }
+    throw error;
+  }
 }
 
 async function importGoogleEvents(connection: Connection) {
@@ -359,8 +384,8 @@ async function importGoogleEvents(connection: Connection) {
       const date = start.slice(0,10); const time = event.start?.dateTime ? start.slice(11,16) : null;
       const details = [event.description,event.location ? `Location: ${event.location}` : ""].filter(Boolean).join("\n\n");
       const recurrence = recurrenceFromRRule(event.recurrence?.find((line) => line.startsWith("RRULE:")) ?? null,date);
-      const itemId = importEvent(connection.user_id,event.id,event.summary ?? "Untitled Event",details,date,time,recurrence);
-      recordImport(connection.user_id,"google",event.id,itemId); existing.add(event.id); imported++;
+      importEventWithIdentity(connection.user_id,"google",event.id,event.summary ?? "Untitled Event",details,date,time,recurrence);
+      existing.add(event.id); imported++;
     }
     pageToken = result.nextPageToken;
   } while (pageToken);
@@ -383,7 +408,12 @@ async function importAppleEvents(connection: Connection) {
   const body = `<?xml version="1.0" encoding="utf-8"?><c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"><c:time-range start="${from}" end="${to}"/></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>`;
   const response = await fetch(connection.calendar_url,{ method:"REPORT", headers:{ Authorization:authorization, Depth:"1", "Content-Type":"application/xml; charset=utf-8" }, body });
   if (!response.ok && response.status !== 207) throw new HttpError(502,"Could not read Events from Apple Calendar.");
-  const xml = await response.text(); const existing = new Set(database().prepare("SELECT external_id FROM calendar_imports WHERE user_id=? AND provider='apple' UNION SELECT external_id FROM calendar_import_exclusions WHERE user_id=? AND provider='apple'").all(connection.user_id,connection.user_id).map((row) => String(row.external_id)));
+  const xml = await response.text(); const existing = new Set(database().prepare(`SELECT external_id FROM calendar_imports WHERE user_id=? AND provider='apple'
+    UNION SELECT external_id FROM calendar_import_exclusions WHERE user_id=? AND provider='apple'
+    UNION SELECT resource_uid AS external_id FROM calendar_copies WHERE user_id=? AND provider='apple' AND resource_uid IS NOT NULL`)
+    .all(connection.user_id,connection.user_id,connection.user_id).map((row) => String(row.external_id)));
+  const existingHrefs = new Set(database().prepare("SELECT external_id FROM calendar_copies WHERE user_id=? AND provider='apple'")
+    .all(connection.user_id).map((row) => String(row.external_id)));
   let imported = 0;
   for (const match of xml.matchAll(/<(?:[\w.-]+:)?response[^>]*>([\s\S]*?)<\/(?:[\w.-]+:)?response>/gi)) {
     const href = match[1].match(/<(?:[\w.-]+:)?href[^>]*>([^<]+)</i)?.[1];
@@ -392,7 +422,7 @@ async function importAppleEvents(connection: Connection) {
     const resourceUrl = new URL(xmlDecode(href),connection.calendar_url).toString();
     if (!isAppleCalDavHost(new URL(resourceUrl).hostname)) continue;
     const ics = xmlDecode(data); const uid = icsProperty(ics,"UID");
-    if (!uid || existing.has(uid)) continue;
+    if (!uid || existing.has(uid) || existingHrefs.has(resourceUrl)) continue;
     const startLine = ics.replace(/\r?\n[ \t]/g,"").split(/\r?\n/).find((line) => /^DTSTART(?:;[^:]*)?:/i.test(line));
     if (!startLine) continue;
     const startValue = startLine.slice(startLine.indexOf(":")+1); const dateMatch = startValue.match(/^(\d{4})(\d{2})(\d{2})/);
@@ -400,8 +430,8 @@ async function importAppleEvents(connection: Connection) {
     const date = `${dateMatch[1]}-${dateMatch[2]}-${dateMatch[3]}`; const timeMatch = startValue.match(/^\d{8}T(\d{2})(\d{2})/);
     const summary = icsProperty(ics,"SUMMARY") ?? "Untitled Event"; const description = icsProperty(ics,"DESCRIPTION") ?? "";
     const recurrence = recurrenceFromRRule(icsProperty(ics,"RRULE"),date);
-    const itemId = importEvent(connection.user_id,uid,summary,description,date,timeMatch ? `${timeMatch[1]}:${timeMatch[2]}` : null,recurrence);
-    recordImport(connection.user_id,"apple",uid,itemId,resourceUrl); existing.add(uid); imported++;
+    importEventWithIdentity(connection.user_id,"apple",uid,summary,description,date,timeMatch ? `${timeMatch[1]}:${timeMatch[2]}` : null,recurrence,resourceUrl);
+    existing.add(uid); existingHrefs.add(resourceUrl); imported++;
   }
   return imported;
 }
@@ -409,7 +439,7 @@ async function importAppleEvents(connection: Connection) {
 async function syncGoogle(connection: Connection, events: EventItem[]) {
   const access = await googleAccess(connection); const calendarId = encodeURIComponent(connection.calendar_url ?? "primary");
   const maps = new Map(database().prepare("SELECT item_id,external_id FROM calendar_copies WHERE user_id=? AND provider='google'").all(connection.user_id).map((row) => [String(row.item_id),String(row.external_id)]));
-  const roots = events.filter((item) => !item.seriesId || item.id === item.seriesId);
+  const roots = events.filter((item) => (!item.seriesId || item.id === item.seriesId) && item.scheduledDate);
   const liveIds = new Set(roots.map((item) => item.id));
   for (const [itemId, eventId] of maps) if (!liveIds.has(itemId)) {
     await fetch(googleApiUrl(`calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(eventId)}`), { method: "DELETE", headers: { Authorization: `Bearer ${access}` } });
@@ -456,7 +486,7 @@ async function syncApple(connection: Connection, events: EventItem[]) {
   const credentials = JSON.parse(decrypt(connection.access_token)) as { username: string; password: string };
   const authorization = `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString("base64")}`;
   const maps = new Map(database().prepare("SELECT item_id,external_id,resource_uid FROM calendar_copies WHERE user_id=? AND provider='apple'").all(connection.user_id).map((row) => [String(row.item_id),{ href:String(row.external_id),uid:String(row.resource_uid ?? row.external_id) }]));
-  const roots = events.filter((item) => !item.seriesId || item.id === item.seriesId);
+  const roots = events.filter((item) => (!item.seriesId || item.id === item.seriesId) && item.scheduledDate);
   const liveIds = new Set(roots.map((item) => item.id));
   const resourceUrl = (value: string) => {
     const url = /^https?:\/\//i.test(value) ? new URL(value) : new URL(`${connection.calendar_url!.replace(/\/$/,"")}/${encodeURIComponent(value)}.ics`);
