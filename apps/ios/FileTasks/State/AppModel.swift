@@ -8,6 +8,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var items: [WorkspaceItem] = []
     @Published private(set) var files: [WorkspaceFile] = []
     @Published private(set) var reminderSettings: ReminderSettings = .empty
+    @Published private(set) var hasLoadedReminderSettingsForCurrentSession = false
+    @Published private(set) var isLoadingReminderSettings = false
+    @Published private(set) var reminderSettingsLoadError: String?
     @Published private(set) var hasRegisteredPushDevice = false
     @Published private(set) var pushDeviceRevoked = false
     @Published private(set) var isRestoring = true
@@ -28,6 +31,7 @@ final class AppModel: ObservableObject {
     private var itemRevision = 0
     private var fileRevision = 0
     private var refreshRequestID = 0
+    private var reminderSettingsRequestID = 0
     private var authenticationAttemptID: UUID?
 
     init(settings: APISettings, tokenStore: KeychainTokenStore = KeychainTokenStore()) {
@@ -112,6 +116,9 @@ final class AppModel: ObservableObject {
             ))
         } catch {
             errorMessage = error.localizedDescription
+            if !hasLoadedReminderSettingsForCurrentSession {
+                reminderSettingsLoadError = error.localizedDescription
+            }
         }
     }
 
@@ -148,7 +155,11 @@ final class AppModel: ObservableObject {
                 settings, token: context.token, applyToExisting: applyToExisting
             )
             guard isCurrent(context) else { throw APIClientError.sessionChanged }
+            reminderSettingsRequestID += 1
             reminderSettings = updated
+            hasLoadedReminderSettingsForCurrentSession = true
+            isLoadingReminderSettings = false
+            reminderSettingsLoadError = nil
             if updated.pushEnabled && !wasPushEnabled, let user {
                 UserDefaults.standard.set(false, forKey: pushDeviceRevokedKey(for: user.id))
                 pushDeviceRevoked = false
@@ -396,32 +407,57 @@ final class AppModel: ObservableObject {
         guard isCurrent(context) else { return }
         refreshRequestID += 1
         let requestID = refreshRequestID
+        reminderSettingsRequestID += 1
+        let settingsRequestID = reminderSettingsRequestID
         let revisionAtStart = itemRevision
         let fileRevisionAtStart = fileRevision
         isLoadingItems = true
+        isLoadingReminderSettings = true
+        if !hasLoadedReminderSettingsForCurrentSession {
+            reminderSettingsLoadError = nil
+        }
         defer {
             if isCurrent(context), refreshRequestID == requestID { isLoadingItems = false }
+            if isCurrent(context), reminderSettingsRequestID == settingsRequestID {
+                isLoadingReminderSettings = false
+            }
+        }
+
+        let api = APIClient(baseURL: context.baseURL)
+        async let itemsRequest = api.items(token: context.token)
+        async let filesRequest = api.files(token: context.token)
+        async let settingsRequest = api.reminderSettings(token: context.token)
+
+        do {
+            let (refreshedItems, refreshedFiles) = try await (itemsRequest, filesRequest)
+            if isCurrent(context),
+               refreshRequestID == requestID,
+               itemRevision == revisionAtStart,
+               fileRevision == fileRevisionAtStart {
+                items = refreshedItems
+                files = refreshedFiles
+                errorMessage = nil
+            }
+        } catch {
+            if isCurrent(context),
+               refreshRequestID == requestID,
+               itemRevision == revisionAtStart,
+               fileRevision == fileRevisionAtStart {
+                handle(error, for: context)
+            }
         }
 
         do {
-            let api = APIClient(baseURL: context.baseURL)
-            async let itemsRequest = api.items(token: context.token)
-            async let filesRequest = api.files(token: context.token)
-            async let settingsRequest = api.reminderSettings(token: context.token)
-            let (refreshedItems, refreshedFiles, refreshedSettings) = try await (itemsRequest, filesRequest, settingsRequest)
-            guard isCurrent(context),
-                  refreshRequestID == requestID,
-                  itemRevision == revisionAtStart,
-                  fileRevision == fileRevisionAtStart else { return }
-            items = refreshedItems
-            files = refreshedFiles
+            let refreshedSettings = try await settingsRequest
+            guard isCurrent(context), reminderSettingsRequestID == settingsRequestID else { return }
             reminderSettings = refreshedSettings
-            errorMessage = nil
+            hasLoadedReminderSettingsForCurrentSession = true
+            reminderSettingsLoadError = nil
         } catch {
-            guard isCurrent(context),
-                  refreshRequestID == requestID,
-                  itemRevision == revisionAtStart,
-                  fileRevision == fileRevisionAtStart else { return }
+            guard isCurrent(context), reminderSettingsRequestID == settingsRequestID else { return }
+            if !hasLoadedReminderSettingsForCurrentSession {
+                reminderSettingsLoadError = error.localizedDescription
+            }
             handle(error, for: context)
         }
     }
@@ -447,6 +483,10 @@ final class AppModel: ObservableObject {
         items = []
         files = []
         reminderSettings = .empty
+        hasLoadedReminderSettingsForCurrentSession = false
+        isLoadingReminderSettings = false
+        reminderSettingsLoadError = nil
+        reminderSettingsRequestID += 1
         hasRegisteredPushDevice = UserDefaults.standard.string(forKey: pushDeviceKey(for: user.id)) != nil
         pushDeviceRevoked = UserDefaults.standard.bool(forKey: pushDeviceRevokedKey(for: user.id))
         isLoadingItems = false
@@ -492,6 +532,10 @@ final class AppModel: ObservableObject {
         items = []
         files = []
         reminderSettings = .empty
+        hasLoadedReminderSettingsForCurrentSession = false
+        isLoadingReminderSettings = false
+        reminderSettingsLoadError = nil
+        reminderSettingsRequestID += 1
         hasRegisteredPushDevice = false
         pushDeviceRevoked = false
         errorMessage = nil

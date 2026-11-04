@@ -1,6 +1,7 @@
 import { test, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
@@ -9,9 +10,15 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { chromium, expect } from "@playwright/test";
+import { stopTrackedProcessGroups, terminateProcessGroup, waitForProcessGroupExit } from "../../../scripts/test-ios-ui.mjs";
 
 let server;
 let deliveryServer;
+let deliveryStopPromise;
+let uiAcceptanceBrowser;
+let uiAcceptanceBrowserClosePromise;
+let uiAcceptanceContext;
+let uiAcceptanceContextClosePromise;
 let directory;
 let deliveryBase;
 let deliveryRequests = [];
@@ -34,12 +41,115 @@ let logs = "";
 let clockFile;
 let testClock = new Date("2026-10-13T12:00:00.000Z");
 let serverTimeZone = "UTC";
-const serverReadinessTimeoutMs = 30_000;
+const serverReadinessTimeoutMs = 120_000;
+const serverReadinessProbeTimeoutMs = 10_000;
 const serverShutdownTimeoutMs = 2_000;
+const setupShutdownTimeoutMs = 10_000;
+const commandShutdownTimeoutMs = 2_000;
+const browserShutdownTimeoutMs = 5_000;
+const activeCommands = new Set();
+const runnerProcessGroupStatePath = process.env.FILETASKS_IOS_UI_PROCESS_GROUPS_PATH;
+const runnerOwnedProcessGroups = new Set();
+let interruptedSignal;
+let harnessCleanupPromise;
+const setupGate = createSetupGate();
+
+function writeRunnerProcessGroupState() {
+  if (runnerProcessGroupStatePath) {
+    writeFileSync(runnerProcessGroupStatePath, `${JSON.stringify([...runnerOwnedProcessGroups])}\n`);
+  }
+}
+
+function trackRunnerOwnedProcessGroup(pid) {
+  if (!runnerProcessGroupStatePath || process.platform === "win32" || !pid) return;
+  runnerOwnedProcessGroups.add(pid);
+  writeRunnerProcessGroupState();
+}
+
+function forgetRunnerOwnedProcessGroup(pid) {
+  if (!runnerProcessGroupStatePath || process.platform === "win32" || !pid) return;
+  runnerOwnedProcessGroups.delete(pid);
+  writeRunnerProcessGroupState();
+}
+
+function createSetupGate() {
+  let closedReason;
+  const pending = new Map();
+
+  return {
+    begin(label) {
+      if (closedReason) throw new Error(`Cannot start ${label}: setup admission closed by ${closedReason}.`);
+      const key = Symbol(label);
+      let finish;
+      const finished = new Promise((resolve) => { finish = resolve; });
+      pending.set(key, { label, finished });
+      let isFinished = false;
+      return {
+        assertOpen() {
+          if (closedReason) throw new Error(`Cannot finish ${label}: setup admission closed by ${closedReason}.`);
+        },
+        finish() {
+          if (isFinished) return;
+          isFinished = true;
+          pending.delete(key);
+          finish();
+        },
+      };
+    },
+    closeAdmission(reason = "harness cleanup") {
+      closedReason ??= reason;
+    },
+    async waitForPending(timeoutMs) {
+      if (pending.size === 0) return;
+      const waiting = Promise.all([...pending.values()].map(({ finished }) => finished)).then(() => true);
+      const completed = await Promise.race([
+        waiting,
+        delay(timeoutMs, false, { ref: false }),
+      ]);
+      if (!completed) {
+        const labels = [...pending.values()].map(({ label }) => label).join(", ");
+        throw new Error(`Timed out after ${timeoutMs}ms waiting for setup to settle: ${labels}.`);
+      }
+    },
+  };
+}
+
+function settledWithin(promise, timeoutMs) {
+  return Promise.race([
+    promise.then(() => true),
+    delay(timeoutMs, false, { ref: false }),
+  ]);
+}
+
+function formatCleanupError(error) {
+  if (error instanceof AggregateError) {
+    return `${error.message}\n${[...error.errors].map(formatCleanupError).join("\n")}`;
+  }
+  return error instanceof Error ? error.stack ?? error.message : String(error);
+}
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    if (interruptedSignal) return;
+    interruptedSignal = signal;
+    setupGate.closeAdmission(signal);
+    process.exitCode = signal === "SIGINT" ? 130 : 143;
+    void cleanupHarness(signal).catch((error) => {
+      process.exitCode = 1;
+      process.stderr.write(`Interrupted acceptance harness cleanup failed: ${formatCleanupError(error)}\n`);
+    });
+  });
+}
 
 async function setTestClock(value) {
-  testClock = new Date(value);
-  await writeFile(clockFile, testClock.toISOString());
+  const setup = setupGate.begin("test clock update");
+  try {
+    testClock = new Date(value);
+    await writeFile(clockFile, testClock.toISOString());
+    setup.assertOpen();
+  } finally {
+    setup.finish();
+  }
 }
 
 async function advanceTestClock(milliseconds) {
@@ -47,6 +157,15 @@ async function advanceTestClock(milliseconds) {
 }
 
 async function startServer() {
+  const setup = setupGate.begin("Next.js dev server startup");
+  try {
+    return await startServerDuringSetup(setup);
+  } finally {
+    setup.finish();
+  }
+}
+
+async function startServerDuringSetup(setup) {
   logs = "";
   let child;
   try {
@@ -100,8 +219,11 @@ async function startServer() {
   let lastProbeStatus;
   let lastProbeError;
   try {
+    trackRunnerOwnedProcessGroup(child.pid);
     while (Date.now() - startedAt < serverReadinessTimeoutMs) {
+      setup.assertOpen();
       if (generation.spawnError) throw new Error(`Could not spawn the Next.js dev server: ${generation.spawnError.message}`);
+      if (interruptedSignal) throw new Error(`The acceptance harness was interrupted by ${interruptedSignal}.`);
       if (generation.exit || child.exitCode !== null || child.signalCode !== null) {
         const reason = generation.exit?.signal ? `signal ${generation.exit.signal}` : `exit code ${generation.exit?.code ?? child.exitCode}`;
         throw new Error(`Next.js dev server exited before becoming ready (${reason}).`);
@@ -111,13 +233,17 @@ async function startServer() {
       // own Ready line prevents a stale listener on the fixed port passing the probe.
       if (generation.ready) {
         try {
-          const response = await appFetch("/api/auth/session", { signal: AbortSignal.timeout(1_000) });
+          const remainingMs = serverReadinessTimeoutMs - (Date.now() - startedAt);
+          const response = await appFetch("/api/auth/session", {
+            signal: AbortSignal.timeout(Math.max(1, Math.min(serverReadinessProbeTimeoutMs, remainingMs))),
+          });
           lastProbeStatus = response.status;
           await response.body?.cancel();
           if (response.status === 401) {
             if (generation.exit || child.exitCode !== null || child.signalCode !== null) {
               throw new Error("Next.js dev server exited while its readiness probe was completing.");
             }
+            setup.assertOpen();
             return;
           }
         } catch (error) {
@@ -142,6 +268,23 @@ async function startServer() {
 }
 
 async function startDeliveryFake() {
+  const setup = setupGate.begin("provider fake startup");
+  try {
+    return await startDeliveryFakeDuringSetup(setup);
+  } catch (error) {
+    try {
+      await stopDeliveryFake();
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "Could not start or stop the provider fake.");
+    }
+    throw error;
+  } finally {
+    setup.finish();
+  }
+}
+
+async function startDeliveryFakeDuringSetup(setup) {
+  deliveryStopPromise = undefined;
   deliveryRequests = [];
   deliveredKeys = new Set();
   failNextEmail = 0;
@@ -279,41 +422,42 @@ async function startDeliveryFake() {
     deliveryServer.once("error", reject);
     deliveryServer.listen(0, "127.0.0.1", resolve);
   });
+  setup.assertOpen();
   deliveryBase = `http://127.0.0.1:${deliveryServer.address().port}`;
 }
 
 async function stopDeliveryFake() {
-  if (deliveryServer?.listening) await new Promise((resolve, reject) => deliveryServer.close((error) => error ? reject(error) : resolve()));
+  if (!deliveryServer?.listening) return;
+  if (!deliveryStopPromise) {
+    deliveryStopPromise = new Promise((resolve, reject) => deliveryServer.close((error) => error ? reject(error) : resolve()));
+  }
+  if (!(await settledWithin(deliveryStopPromise, serverShutdownTimeoutMs))) {
+    deliveryServer.closeAllConnections?.();
+    if (!(await settledWithin(deliveryStopPromise, serverShutdownTimeoutMs))) {
+      throw new Error(`Provider fake server did not close within ${serverShutdownTimeoutMs * 2}ms.`);
+    }
+  }
+  deliveryServer = undefined;
+  deliveryStopPromise = undefined;
 }
 
-async function stopServer(generation = server) {
+function stopServer(generation = server) {
   if (!generation) return;
+  if (!generation.stopPromise) generation.stopPromise = stopServerGeneration(generation);
+  return generation.stopPromise;
+}
+
+async function stopServerGeneration(generation) {
   const { child } = generation;
   if (child.pid !== undefined && process.platform === "win32") {
     // Node's Windows child.kill terminates only the CLI, leaving its worker.
     try {
-      await runCommand("taskkill", ["/PID", String(child.pid), "/T", "/F"]);
+      await runCommand("taskkill", ["/PID", String(child.pid), "/T", "/F"], process.env, repoRoot, { cleanup: true });
     } catch (error) {
       if (!generation.exit && child.exitCode === null && child.signalCode === null) throw error;
     }
   } else if (child.pid !== undefined) {
-    const signalGroup = (signal) => {
-      try { process.kill(-child.pid, signal); return true; }
-      catch (error) { if (error.code === "ESRCH") return false; throw error; }
-    };
-    const waitForGroupExit = async () => {
-      const deadline = Date.now() + serverShutdownTimeoutMs;
-      while (signalGroup(0)) {
-        if (Date.now() >= deadline) return false;
-        await delay(25);
-      }
-      return true;
-    };
-    signalGroup("SIGTERM");
-    if (!(await waitForGroupExit())) {
-      signalGroup("SIGKILL");
-      if (!(await waitForGroupExit())) throw new Error(`Next.js dev server process group ${child.pid} did not exit after SIGKILL.`);
-    }
+    await terminateProcessGroup(child.pid, "SIGTERM", { graceMs: serverShutdownTimeoutMs, killWaitMs: serverShutdownTimeoutMs });
   }
 
   // Wait for the CLI and its inherited stdout/stderr pipes to close before
@@ -323,41 +467,279 @@ async function stopServer(generation = server) {
     delay(serverShutdownTimeoutMs, undefined, { ref: false }).then(() => false),
   ]);
   if (!closed) throw new Error(`Next.js dev server process ${child.pid ?? "(not spawned)"} did not close its output.`);
+  if (child.pid && process.platform !== "win32" && runnerProcessGroupStatePath) {
+    if (!(await waitForProcessGroupExit(child.pid, 0))) {
+      throw new Error(`Next.js dev server process group ${child.pid} remained after shutdown.`);
+    }
+    forgetRunnerOwnedProcessGroup(child.pid);
+  }
   if (server === generation) server = undefined;
 }
 
-async function runCommand(command, args, env = process.env, cwd = repoRoot) {
+async function runCommand(command, args, env = process.env, cwd = repoRoot, { detached = true, cleanup = false } = {}) {
+  const setup = cleanup ? undefined : setupGate.begin(`${command} command`);
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    let spawnError;
+    let trackingError;
     let output = "";
+    let child;
+    try {
+      child = spawn(command, args, {
+        cwd,
+        env,
+        detached: detached && process.platform !== "win32",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      setup?.finish();
+      reject(error);
+      return;
+    }
+    let finishInvocation;
+    const invocation = {
+      command,
+      args,
+      child,
+      detached: detached && process.platform !== "win32",
+      finished: new Promise((resolveFinished) => { finishInvocation = resolveFinished; }),
+    };
+    activeCommands.add(invocation);
     child.stdout.on("data", (data) => { output += data; });
     child.stderr.on("data", (data) => { output += data; });
-    child.once("error", reject);
-    child.once("close", (code) => code === 0 ? resolve(output) : reject(new Error(`${command} ${args.join(" ")} failed with code ${code}:\n${output.slice(-6000)}`)));
+    child.once("error", (error) => { spawnError = error; });
+    child.once("close", async (code, signal) => {
+      let groupError;
+      if (child.pid && detached && process.platform !== "win32") {
+        try {
+          if (!(await waitForProcessGroupExit(child.pid, serverShutdownTimeoutMs))) {
+            await terminateProcessGroup(child.pid, "SIGTERM", { graceMs: serverShutdownTimeoutMs, killWaitMs: serverShutdownTimeoutMs });
+            groupError = new Error(`${command} exited while owned child processes remained; they were terminated.`);
+          }
+        } catch (error) {
+          groupError = error;
+        }
+        if (runnerProcessGroupStatePath) {
+          try {
+            if (!(await waitForProcessGroupExit(child.pid, 0))) {
+              groupError ??= new Error(`Owned process group ${child.pid} remained after command shutdown.`);
+            } else {
+              forgetRunnerOwnedProcessGroup(child.pid);
+            }
+          } catch (error) {
+            groupError ??= error;
+          }
+        }
+      }
+      activeCommands.delete(invocation);
+      finishInvocation();
+      setup?.finish();
+      if (trackingError) reject(trackingError);
+      else if (spawnError) reject(spawnError);
+      else if (groupError) reject(new Error(`${command} ${args.join(" ")} process cleanup failed: ${groupError.message}\n${output.slice(-6000)}`));
+      else if (code === 0) resolve(output);
+      else reject(new Error(`${command} ${args.join(" ")} failed with ${signal ? `signal ${signal}` : `code ${code}`}:\n${output.slice(-30000)}`));
+    });
+
+    if (invocation.detached && child.pid && runnerProcessGroupStatePath) {
+      try {
+        trackRunnerOwnedProcessGroup(child.pid);
+      } catch (error) {
+        trackingError = new Error(`Could not record owned command ${command} process group ${child.pid}: ${error.message}`);
+        try { process.kill(-child.pid, "SIGKILL"); } catch {}
+        child.kill("SIGKILL");
+      }
+    }
   });
 }
 
-before(async () => {
-  directory = await mkdtemp(join(tmpdir(), "filetasks-test-"));
-  clockFile = join(directory, "clock.txt");
-  await setTestClock(testClock);
-  await startDeliveryFake();
-  await startServer();
-});
-
-after(async () => {
-  try {
-    await stopServer();
-  } finally {
-    try {
-      await stopDeliveryFake();
-    } finally {
-      if (directory) await rm(directory, { recursive: true, force: true });
+async function stopActiveCommands(signal = "SIGTERM") {
+  const invocations = [...activeCommands];
+  const results = await Promise.allSettled(invocations.map(async (invocation) => {
+    const { child, detached, finished, command, args } = invocation;
+    if (child.pid === undefined) {
+      if (!(await settledWithin(finished, commandShutdownTimeoutMs))) {
+        throw new Error(`Owned command ${command} (pid unknown) did not finish closing.`);
+      }
+      return;
     }
+
+    if (process.platform === "win32") {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        if (!(await settledWithin(finished, commandShutdownTimeoutMs))) {
+          throw new Error(`Owned command ${command} (pid ${child.pid}) did not finish closing.`);
+        }
+        return;
+      }
+      try {
+        await runCommand("taskkill", ["/PID", String(child.pid), "/T", "/F"], process.env, repoRoot, { cleanup: true });
+      } catch (error) {
+        if (child.exitCode === null && child.signalCode === null) throw error;
+      }
+    } else if (detached) {
+      let terminationError;
+      try {
+        await terminateProcessGroup(child.pid, signal, {
+          graceMs: commandShutdownTimeoutMs,
+          killWaitMs: commandShutdownTimeoutMs + 1_000,
+        });
+      } catch (error) {
+        terminationError = error;
+      }
+
+      if (!(await settledWithin(finished, commandShutdownTimeoutMs))) {
+        try {
+          await terminateProcessGroup(child.pid, "SIGKILL", { graceMs: 0, killWaitMs: commandShutdownTimeoutMs });
+        } catch (error) {
+          terminationError ??= error;
+        }
+      }
+      if (!(await settledWithin(finished, commandShutdownTimeoutMs))) {
+        throw new Error(`Owned command ${command} ${args.join(" ")} (pid ${child.pid}) did not exit after ${signal} and SIGKILL${terminationError ? `: ${terminationError.message}` : "."}`);
+      }
+      if (terminationError) throw new Error(`Could not confirm cleanup of owned command ${command} (pid ${child.pid}): ${terminationError.message}`);
+      return;
+    } else {
+      if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+      if (!(await settledWithin(finished, commandShutdownTimeoutMs))) {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        if (!(await settledWithin(finished, commandShutdownTimeoutMs + 1_000))) {
+          throw new Error(`Owned command ${command} ${args.join(" ")} (pid ${child.pid}) did not exit after ${signal} and SIGKILL.`);
+        }
+      }
+      return;
+    }
+
+    if (!(await settledWithin(finished, commandShutdownTimeoutMs + 1_000))) {
+      throw new Error(`Owned command ${command} ${args.join(" ")} (pid ${child.pid}) did not close after termination.`);
+    }
+  }));
+
+  const failures = results.filter(({ status }) => status === "rejected").map(({ reason }) => reason);
+  if (failures.length) throw new AggregateError(failures, "Could not stop every owned acceptance command.");
+}
+
+async function closeUIAcceptanceBrowser() {
+  const errors = [];
+  try {
+    await closeUIAcceptanceContext();
+  } catch (error) {
+    errors.push(error);
+  }
+  if (uiAcceptanceBrowser) {
+    try {
+      if (!uiAcceptanceBrowserClosePromise) uiAcceptanceBrowserClosePromise = uiAcceptanceBrowser.close();
+      if (!(await settledWithin(uiAcceptanceBrowserClosePromise, browserShutdownTimeoutMs))) {
+        throw new Error(`UI acceptance browser did not close within ${browserShutdownTimeoutMs}ms.`);
+      }
+      uiAcceptanceBrowser = undefined;
+      uiAcceptanceBrowserClosePromise = undefined;
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length) throw new AggregateError(errors, "Could not close the UI acceptance browser cleanly.");
+}
+
+async function closeUIAcceptanceContext() {
+  if (!uiAcceptanceContext) return;
+  if (!uiAcceptanceContextClosePromise) uiAcceptanceContextClosePromise = uiAcceptanceContext.close();
+  if (!(await settledWithin(uiAcceptanceContextClosePromise, browserShutdownTimeoutMs))) {
+    throw new Error(`UI acceptance browser context did not close within ${browserShutdownTimeoutMs}ms.`);
+  }
+  uiAcceptanceContext = undefined;
+  uiAcceptanceContextClosePromise = undefined;
+}
+
+async function launchUIAcceptanceBrowser() {
+  const setup = setupGate.begin("UI acceptance browser startup");
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+    setup.assertOpen();
+    uiAcceptanceBrowser = browser;
+    return browser;
+  } catch (error) {
+    if (browser && uiAcceptanceBrowser !== browser) await browser.close().catch(() => {});
+    throw error;
+  } finally {
+    setup.finish();
+  }
+}
+
+async function createUIAcceptanceContext(browser) {
+  const setup = setupGate.begin("UI acceptance browser context startup");
+  let context;
+  try {
+    context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    setup.assertOpen();
+    uiAcceptanceContext = context;
+    return context;
+  } catch (error) {
+    if (context && uiAcceptanceContext !== context) await context.close().catch(() => {});
+    throw error;
+  } finally {
+    setup.finish();
+  }
+}
+
+async function createUIAcceptancePage(context) {
+  const setup = setupGate.begin("UI acceptance page startup");
+  try {
+    const page = await context.newPage();
+    setup.assertOpen();
+    return page;
+  } finally {
+    setup.finish();
+  }
+}
+
+function cleanupHarness(signal) {
+  if (harnessCleanupPromise) return harnessCleanupPromise;
+  setupGate.closeAdmission(signal ?? "harness cleanup");
+  harnessCleanupPromise = (async () => {
+    const errors = [];
+    try { await stopActiveCommands(signal ?? "SIGTERM"); } catch (error) { errors.push(error); }
+    try { await setupGate.waitForPending(setupShutdownTimeoutMs); } catch (error) { errors.push(error); }
+    try { await closeUIAcceptanceBrowser(); } catch (error) { errors.push(error); }
+    try { await stopServer(); } catch (error) { errors.push(error); }
+    try { await stopDeliveryFake(); } catch (error) { errors.push(error); }
+    try { if (directory) await rm(directory, { recursive: true, force: true }); } catch (error) { errors.push(error); }
+    if (errors.length) {
+      throw new AggregateError(errors, `Could not completely clean up the temporary acceptance harness:\n${errors.map(formatCleanupError).join("\n")}`);
+    }
+  })();
+  return harnessCleanupPromise;
+}
+
+before(async () => {
+  const setup = setupGate.begin("temporary acceptance harness startup");
+  try {
+    directory = await mkdtemp(join(tmpdir(), "filetasks-test-"));
+    setup.assertOpen();
+    clockFile = join(directory, "clock.txt");
+    await setTestClock(testClock);
+    setup.assertOpen();
+    await startDeliveryFake();
+    setup.assertOpen();
+    await startServer();
+    setup.assertOpen();
+  } catch (error) {
+    if (directory && (interruptedSignal || harnessCleanupPromise)) {
+      await rm(directory, { recursive: true, force: true }).catch(() => {});
+      directory = undefined;
+    }
+    throw error;
+  } finally {
+    setup.finish();
   }
 });
 
+after(async () => {
+  await cleanupHarness();
+});
+
 afterEach(async () => {
+  if (interruptedSignal) return;
   if (serverTimeZone !== "UTC") {
     serverTimeZone = "UTC";
     await stopServer();
@@ -1314,4 +1696,186 @@ test("iOS, Android and web run against one shared account, API and provider fake
     await browser.close();
   }
   assert.equal(sharedOwner.user.email, email);
+});
+
+test("runner interruption stops only its owned process-group descendants", {
+  skip: process.platform === "win32",
+}, async () => {
+  const childSource = `
+    process.on("SIGTERM", () => {});
+    setInterval(() => {}, 1000);
+  `;
+  const ownerSource = `
+    const { spawn } = require("node:child_process");
+    spawn(process.execPath, ["-e", ${JSON.stringify(childSource)}], { stdio: "ignore" });
+    process.on("SIGTERM", () => {});
+    console.log("ready");
+    setInterval(() => {}, 1000);
+  `;
+  const spawnGroup = (source) => spawn(process.execPath, ["-e", source], {
+    detached: true,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  const waitForReady = (child) => new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("The process-group fixture did not start.")), 5_000);
+    child.stdout.once("data", (data) => {
+      clearTimeout(timeout);
+      assert.match(data.toString(), /ready/);
+      resolve();
+    });
+    child.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+  });
+
+  const owned = spawnGroup(ownerSource);
+  const unrelated = spawnGroup('console.log("ready"); process.on("SIGTERM", () => process.exit(0)); setInterval(() => {}, 1000);');
+  const ownedClosed = new Promise((resolve) => owned.once("close", resolve));
+  const unrelatedClosed = new Promise((resolve) => unrelated.once("close", resolve));
+  try {
+    await Promise.all([waitForReady(owned), waitForReady(unrelated)]);
+    const shutdownStartedAt = Date.now();
+    const trackedGroupsPath = join(directory, "owned-process-groups.json");
+    await writeFile(trackedGroupsPath, JSON.stringify([owned.pid]));
+    await stopTrackedProcessGroups(trackedGroupsPath, { graceMs: 150, killWaitMs: 2_000 });
+    assert.ok(Date.now() - shutdownStartedAt >= 100, "The hung owned group should require SIGKILL escalation.");
+    await ownedClosed;
+    assert.equal(unrelated.exitCode, null, "Interrupting the runner must leave unrelated process groups alone.");
+  } finally {
+    await Promise.all([
+      terminateProcessGroup(owned.pid, "SIGTERM", { graceMs: 250, killWaitMs: 1_000 }).catch(() => {}),
+      terminateProcessGroup(unrelated.pid, "SIGTERM", { graceMs: 250, killWaitMs: 1_000 }).catch(() => {}),
+    ]);
+    await Promise.all([ownedClosed, unrelatedClosed]);
+  }
+});
+
+test("interruption closes setup admission and waits for an in-flight setup to self-clean", async () => {
+  const gate = createSetupGate();
+  let releaseSetup;
+  let cleanupFinished = false;
+  let lateResourcePublished = false;
+  let lateResourceDisposed = false;
+  const token = gate.begin("pending browser startup");
+  const setup = (async () => {
+    let localResource;
+    try {
+      await new Promise((resolve) => { releaseSetup = resolve; });
+      localResource = { close() { lateResourceDisposed = true; } };
+      token.assertOpen();
+    } catch (error) {
+      localResource?.close();
+      throw error;
+    } finally {
+      token.finish();
+    }
+    lateResourcePublished = true;
+  })();
+
+  gate.closeAdmission("SIGTERM");
+  assert.throws(() => gate.begin("late xcodebuild spawn"), /setup admission closed by SIGTERM/);
+  const cleanup = gate.waitForPending(1_000).then(() => { cleanupFinished = true; });
+  await delay(20);
+  assert.equal(cleanupFinished, false, "Cleanup must wait for setup that started before interruption.");
+
+  releaseSetup();
+  await assert.rejects(setup, /setup admission closed by SIGTERM/);
+  await cleanup;
+  assert.equal(lateResourcePublished, false, "A resource must not be published after interruption.");
+  assert.equal(lateResourceDisposed, true, "Late setup must clean up its resource before releasing the barrier.");
+  assert.equal(cleanupFinished, true);
+});
+
+test("iOS UI acceptance: registration, cross-type Reminder preservation, save/reopen and browser read", {
+  skip: process.env.FILETASKS_RUN_IOS_UI_ACCEPTANCE !== "1",
+}, async () => {
+  await setTestClock("2026-10-13T12:00:00.000Z");
+  const email = "ios-ui-shared@example.com";
+  const password = "correct-horse-battery";
+  const taskReminder = { delivery: "notification", amount: 2, unit: "days", time: "09:15" };
+  const eventReminder = { delivery: "notification", amount: 3, unit: "weeks", time: "11:40" };
+  const reverseTaskTitle = "UI Runner Event To Task";
+  const noRemindersTitle = "UI Runner No Reminders";
+  const owner = await account(email);
+
+  const settingsResponse = await request("/api/settings/reminders", {
+    token: owner.token,
+    method: "PATCH",
+    body: {
+      taskReminders: [taskReminder],
+      eventReminders: [eventReminder],
+      pushEnabled: false,
+      emailEnabled: false,
+    },
+  });
+  assert.equal(settingsResponse.status, 200, "The shared account should receive separate Task and Event defaults.");
+  const savedSettings = (await settingsResponse.json()).settings;
+  assert.deepEqual(savedSettings.taskReminders, [taskReminder]);
+  assert.deepEqual(savedSettings.eventReminders, [eventReminder]);
+
+  const simulatorId = process.env.FILETASKS_IOS_UI_SIMULATOR_ID;
+  assert.ok(simulatorId, "The focused runner must create and pass a disposable iOS Simulator id.");
+  try {
+    await runCommand("xcodebuild", [
+      "-project", "apps/ios/FileTasks.xcodeproj",
+      "-scheme", "FileTasks",
+      "-destination", `platform=iOS Simulator,id=${simulatorId}`,
+      "-derivedDataPath", join(directory, "ios-ui-derived-data"),
+      "-resultBundlePath", join(directory, "ios-ui-tests.xcresult"),
+      "-parallel-testing-enabled", "NO",
+      // Simulator ad hoc signing supplies the app's Keychain entitlements.
+      "test",
+    ], process.env, repoRoot, { detached: true });
+  } catch (error) {
+    throw new Error(`${error.message}\nRecent test server output:\n${logs.slice(-10000)}`, { cause: error });
+  }
+
+  const registeredAccount = await request("/api/auth/login", {
+    method: "POST",
+    body: { email: "ios-ui-registration@example.com", password },
+  });
+  assert.equal(registeredAccount.status, 200, "The UI must register its second account through the app.");
+
+  const sharedItemsResponse = await request("/api/items", { token: owner.token });
+  assert.equal(sharedItemsResponse.status, 200);
+  const { items } = await sharedItemsResponse.json();
+  const defaultEvent = items.find(({ title }) => title === "UI Runner Event Default");
+  const customizedEvent = items.find(({ title }) => title === "UI Runner Customized Event");
+  const reverseTask = items.find(({ title }) => title === reverseTaskTitle);
+  const noRemindersEvent = items.find(({ title }) => title === noRemindersTitle);
+  assert.ok(defaultEvent, "The UI-created Event should be persisted in the shared account.");
+  assert.ok(customizedEvent, "The customized UI-created Event should be persisted in the shared account.");
+  assert.ok(reverseTask, "The Event-to-Task UI flow should persist a Task in the shared account.");
+  assert.ok(noRemindersEvent, "The remove-all UI flow should persist an Event in the shared account.");
+  assert.equal(defaultEvent.kind, "event");
+  assert.deepEqual(defaultEvent.reminders, [eventReminder]);
+  assert.equal(customizedEvent.kind, "event");
+  assert.deepEqual(customizedEvent.reminders, [{ ...taskReminder, amount: 4 }]);
+  assert.equal(reverseTask.kind, "task");
+  assert.deepEqual(reverseTask.reminders, [taskReminder]);
+  assert.equal(noRemindersEvent.kind, "event");
+  assert.deepEqual(noRemindersEvent.reminders, []);
+
+  uiAcceptanceBrowser = await launchUIAcceptanceBrowser();
+  try {
+    uiAcceptanceContext = await createUIAcceptanceContext(uiAcceptanceBrowser);
+    try {
+      const page = await createUIAcceptancePage(uiAcceptanceContext);
+      await page.goto(base);
+      await page.getByLabel("Email", { exact: true }).fill(email);
+      await page.getByLabel("Password", { exact: true }).fill(password);
+      await page.locator("form").getByRole("button", { name: "Sign in", exact: true }).click();
+      await page.getByRole("button", { name: "Events", exact: true }).click();
+      await expect(page.getByRole("heading", { name: "UI Runner Event Default", exact: true }).first()).toBeVisible();
+      await expect(page.getByRole("heading", { name: "UI Runner Customized Event", exact: true }).first()).toBeVisible();
+      await expect(page.getByRole("heading", { name: noRemindersTitle, exact: true }).first()).toBeVisible();
+      await page.getByRole("button", { name: "Tasks", exact: true }).click();
+      await expect(page.getByRole("heading", { name: reverseTaskTitle, exact: true }).first()).toBeVisible();
+    } finally {
+      await closeUIAcceptanceContext();
+    }
+  } finally {
+    await closeUIAcceptanceBrowser();
+  }
 });

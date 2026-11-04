@@ -55,7 +55,9 @@ npm run build
 
 `npm test` runs the API and browser acceptance suite against a temporary database. For the complete shared cross-client harness, use `npm run test:acceptance` on a Mac with Swift/Xcode command-line tools, Android SDK, and a booted Android emulator. It runs web, iOS, and Android workflows against one live API, account, controlled clock, and set of provider fakes, including File byte transfers and observed Push delivery. Both commands use port 3107; stop another Next.js development server in this checkout before testing, because Next.js locks its development output directory. Run one web workflow with `node --test --test-name-pattern='workflow name' apps/web/tests/workspace.test.mjs`.
 
-CI checks the web application and compiles both native projects with their platform SDKs. Native builds require their respective toolchains; a web build does not validate SwiftUI or Android code.
+Run the focused real-app iOS Reminder acceptance with `npm run test:ios-ui` on macOS with Xcode, an installed iOS Simulator runtime, and Playwright Chromium (`npx playwright install chromium`). It creates and deletes a blank disposable iPhone Simulator, starts the same temporary API/database, controlled clock, and provider fakes used by the web tests, then drives registration, sign-in, item type changes, Reminder customization, and save/reopen in the SwiftUI app. It also reads the saved items in the web app. Missing macOS, Xcode, or simulator prerequisites fail the command. This focused workflow does not need Android.
+
+CI checks the web application, runs the focused iOS UI acceptance on macOS, and compiles both native projects with their platform SDKs. Native builds require their respective toolchains; a web build does not validate SwiftUI or Android code.
 
 See [the API contract](docs/api.md) for the shared client interface.
 

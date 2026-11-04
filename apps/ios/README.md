@@ -68,6 +68,15 @@ Keep provider secrets out of the repository and the iPhone app. The complete use
 
 ## Acceptance tests
 
+Run the focused real-app UI acceptance from the repository root on a Mac with Xcode, an installed iOS Simulator runtime, and Playwright Chromium:
+
+```sh
+npx playwright install chromium
+npm run test:ios-ui
+```
+
+The runner creates and removes a blank disposable iPhone Simulator, then runs the SwiftUI app against the same temporary API, SQLite database, controlled clock, and delivery/calendar/storage fakes as the web acceptance harness. It registers a second account in the app, signs out, signs into the harness account, changes a new item from Task to Event, checks Event defaults after reopening, preserves a deliberate Reminder edit, and confirms both saved Events in the browser. It configures `http://localhost:3107` and the local HTTP opt-in through the app's Server settings. The focused command does not reuse or erase an existing simulator and does not require Android.
+
 Run the complete shared acceptance harness from the repository root on a Mac with Swift/Xcode command-line tools, Android SDK, and a booted Android emulator:
 
 ```sh
