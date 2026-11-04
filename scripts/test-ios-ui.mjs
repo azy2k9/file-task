@@ -24,15 +24,22 @@ function signalProcessGroup(pid, signal) {
   }
 }
 
-export function processGroupExists(pid) {
+function probeProcessGroup(pid) {
   if (process.platform === "win32") throw new Error("POSIX process groups are not available on Windows.");
   try {
     process.kill(-pid, 0);
-    return true;
+    return "present";
   } catch (error) {
-    if (error.code === "ESRCH") return false;
+    if (error.code === "ESRCH") return "gone";
+    // On macOS a group probe can fail if any member is not signalable.
+    // This does not establish that the group has exited.
+    if (error.code === "EPERM") return "permission-denied";
     throw error;
   }
+}
+
+export function processGroupExists(pid) {
+  return probeProcessGroup(pid) !== "gone";
 }
 
 export async function waitForProcessGroupExit(pid, timeoutMs = 2_000) {
@@ -47,11 +54,20 @@ export async function waitForProcessGroupExit(pid, timeoutMs = 2_000) {
 
 export async function terminateProcessGroup(pid, signal = "SIGTERM", { graceMs = 2_000, killWaitMs = 5_000 } = {}) {
   if (process.platform === "win32") throw new Error("POSIX process groups are not available on Windows.");
-  if (!processGroupExists(pid)) return;
+  const initialState = probeProcessGroup(pid);
+  if (initialState === "gone") return;
+  if (initialState === "permission-denied") {
+    throw new Error(`Cannot safely signal process group ${pid}: permission denied.`);
+  }
 
   signalProcessGroup(pid, signal);
   if (await waitForProcessGroupExit(pid, graceMs)) return;
 
+  const state = probeProcessGroup(pid);
+  if (state === "gone") return;
+  if (state === "permission-denied") {
+    throw new Error(`Cannot verify process group ${pid} exited after ${signal}: permission denied.`);
+  }
   signalProcessGroup(pid, "SIGKILL");
   if (!(await waitForProcessGroupExit(pid, killWaitMs))) {
     throw new Error(`Owned process group ${pid} did not exit after ${signal} and SIGKILL.`);
