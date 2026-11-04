@@ -11,17 +11,39 @@ const digest = (token: string) => createHash("sha256").update(token).digest("hex
 export function requestToken(request: Request) {
   const authorization = request.headers.get("authorization");
   if (authorization) return authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
-  return request.headers.get("cookie")?.split(";").map((part) => part.trim())
-    .find((part) => part.startsWith("filetasks_session="))?.slice("filetasks_session=".length) || "";
+  return requestCookie(request, "filetasks_session") || "";
 }
 
-export function requireUser(request: Request): { id: string; email: string } {
-  const token = requestToken(request);
+export function requestCookie(request: Request, name: string): string | null {
+  const prefix = `${name}=`;
+  const value = request.headers.get("cookie")?.split(";").map((part) => part.trim())
+    .find((part) => part.startsWith(prefix))?.slice(prefix.length);
+  return value || null;
+}
+
+function sessionUser(token: string) {
   const user = token && database().prepare(`SELECT users.id, users.email FROM sessions
     JOIN users ON users.id = sessions.user_id WHERE token_hash = ? AND expires_at > ?`)
     .get(digest(token), Date.now());
+  return user ? { id: String(user.id), email: String(user.email) } : null;
+}
+
+function requireSession(token: string | null) {
+  const user = token ? sessionUser(token) : null;
   if (!user) throw new HttpError(401, "Please sign in to continue.");
-  return { id: String(user.id), email: String(user.email) };
+  return user;
+}
+
+export function requireUser(request: Request): { id: string; email: string } {
+  return requireSession(requestToken(request));
+}
+
+export type BrowserSession = { id: string; email: string; sessionHash: string };
+
+export function requireBrowserSession(request: Request): BrowserSession {
+  const token = requestCookie(request, "filetasks_session");
+  const user = requireSession(token);
+  return { ...user, sessionHash: digest(token!) };
 }
 
 function setSessionCookie(response: NextResponse, token: string, request: Request, maxAge = sessionSeconds) {

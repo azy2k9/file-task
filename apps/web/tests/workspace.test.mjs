@@ -747,12 +747,13 @@ afterEach(async () => {
   }
 });
 
-async function request(path, { token, cookie, method = "GET", body, headers = {} } = {}) {
+async function request(path, { token, cookie, method = "GET", body, headers = {}, redirect = "follow" } = {}) {
   return appFetch(path, {
     method,
     headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(cookie ? { Cookie: cookie } : {}),
       ...(body === undefined ? {} : { "Content-Type": "application/json" }), ...headers },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    redirect,
   });
 }
 
@@ -772,7 +773,43 @@ async function runReminderWorker() {
 async function account(email = `person-${crypto.randomUUID()}@example.com`) {
   const response = await request("/api/auth/register", { method: "POST", body: { email, password: "correct-horse-battery" } });
   assert.equal(response.status, 201);
-  return { ...(await response.json()), cookie: response.headers.get("set-cookie").split(";")[0] };
+  return { ...(await response.json()), cookie: responseCookie(response, "filetasks_session") };
+}
+
+function responseCookie(response, name) {
+  const setCookies = response.headers.getSetCookie?.() ?? [response.headers.get("set-cookie") ?? ""];
+  const cookie = setCookies.find((value) => value.startsWith(`${name}=`));
+  assert.ok(cookie, `response should set ${name}`);
+  return cookie.split(";", 1)[0];
+}
+
+function mergeCookies(...cookieHeaders) {
+  const cookies = new Map();
+  for (const header of cookieHeaders) {
+    for (const pair of (header ?? "").split(";")) {
+      const value = pair.trim();
+      if (!value) continue;
+      const separator = value.indexOf("=");
+      if (separator > 0) cookies.set(value.slice(0, separator), value.slice(separator + 1));
+    }
+  }
+  return [...cookies].map(([name, value]) => `${name}=${value}`).join("; ");
+}
+
+async function beginGoogleAuthorization(owner) {
+  const response = await request("/api/calendars/google/connect", { cookie: owner.cookie, redirect: "manual" });
+  assert.equal(response.status, 303);
+  const authorizationUrl = new URL(response.headers.get("location"));
+  const state = authorizationUrl.searchParams.get("state");
+  assert.ok(state);
+  const transactionCookie = responseCookie(response, "filetasks_google_oauth");
+  return {
+    response,
+    authorizationUrl,
+    state,
+    transactionCookie,
+    cookie: mergeCookies(owner.cookie, transactionCookie),
+  };
 }
 
 test("a person can create a Task on one client and view it on another after signing in", async () => {
@@ -1138,17 +1175,110 @@ test("uploaded Files transfer through the fake object store and open from anothe
   assert.equal(storageObjects.size, 0);
 });
 
+test("Google OAuth requires the initiating browser transaction, session, and one-time state", async () => {
+  const attacker = await account();
+  const victim = await account();
+  const stolenFlow = await beginGoogleAuthorization(attacker);
+  const setCookie = stolenFlow.response.headers.getSetCookie?.().find((value) => value.startsWith("filetasks_google_oauth=")) ?? "";
+  assert.match(setCookie, /HttpOnly/i);
+  assert.match(setCookie, /SameSite=Lax/i);
+  assert.match(setCookie, /Path=\/api\/calendars\/google\/callback/i);
+  assert.match(setCookie, /Max-Age=600/i);
+  for (const secret of [attacker.token, "fake-secret", "fake-access", "fake-refresh"]) {
+    assert.equal(stolenFlow.authorizationUrl.href.includes(secret), false);
+  }
+  assert.equal(stolenFlow.authorizationUrl.searchParams.has("nonce"), false);
+
+  const googleTokenRequests = () => providerRequests.filter(({ path }) => path === "/google-token").length;
+  const beforeAttacks = googleTokenRequests();
+  const copiedUrlInVictimBrowser = await request(`/api/calendars/google/callback?state=${encodeURIComponent(stolenFlow.state)}&code=attacker-code`, {
+    cookie: victim.cookie, redirect: "manual",
+  });
+  assert.equal(copiedUrlInVictimBrowser.status, 400);
+  const mismatchedAccount = await request(`/api/calendars/google/callback?state=${encodeURIComponent(stolenFlow.state)}&code=attacker-code`, {
+    cookie: mergeCookies(victim.cookie, stolenFlow.transactionCookie), redirect: "manual",
+  });
+  assert.equal(mismatchedAccount.status, 400);
+  assert.equal(googleTokenRequests(), beforeAttacks, "a copied authorization URL must not exchange an OAuth code");
+  assert.deepEqual((await (await request("/api/calendars", { cookie: victim.cookie })).json()).calendars, []);
+
+  const otherSession = await request("/api/auth/login", { method: "POST", body: {
+    email: attacker.user.email, password: "correct-horse-battery",
+  } });
+  assert.equal(otherSession.status, 200);
+  const otherSessionCookie = responseCookie(otherSession, "filetasks_session");
+  const mismatchedSession = await request(`/api/calendars/google/callback?state=${encodeURIComponent(stolenFlow.state)}&code=attacker-code`, {
+    cookie: mergeCookies(otherSessionCookie, stolenFlow.transactionCookie), redirect: "manual",
+  });
+  assert.equal(mismatchedSession.status, 400, "the callback must use the exact initiating session, even for the same account");
+  assert.equal(googleTokenRequests(), beforeAttacks);
+
+  const connected = await request(`/api/calendars/google/callback?state=${encodeURIComponent(stolenFlow.state)}&code=fake-code`, {
+    cookie: stolenFlow.cookie, redirect: "manual",
+  });
+  assert.equal(connected.status, 303);
+  assert.equal(new URL(connected.headers.get("location")).searchParams.get("calendar"), "google-connected");
+  assert.match(connected.headers.getSetCookie?.().join("; ") ?? "", /Max-Age=0/i);
+  assert.equal(googleTokenRequests(), beforeAttacks + 1);
+
+  const replay = await request(`/api/calendars/google/callback?state=${encodeURIComponent(stolenFlow.state)}&code=fake-code`, {
+    cookie: stolenFlow.cookie, redirect: "manual",
+  });
+  assert.equal(replay.status, 400);
+  assert.equal(googleTokenRequests(), beforeAttacks + 1, "a consumed state cannot be exchanged twice");
+
+  const attackerCalendars = await request("/api/calendars", { cookie: attacker.cookie });
+  const victimCalendars = await request("/api/calendars", { cookie: victim.cookie });
+  const attackerCalendarsText = await attackerCalendars.text();
+  assert.deepEqual(JSON.parse(attackerCalendarsText).calendars.map(({ provider }) => provider), ["google"]);
+  assert.equal(attackerCalendarsText.includes("fake-access"), false, "public connection status must not expose provider tokens");
+  assert.deepEqual((await victimCalendars.json()).calendars, []);
+
+  const cancellation = await beginGoogleAuthorization(victim);
+  const beforeCancellation = googleTokenRequests();
+  const cancelled = await request(`/api/calendars/google/callback?state=${encodeURIComponent(cancellation.state)}&error=access_denied`, {
+    cookie: cancellation.cookie, redirect: "manual",
+  });
+  assert.equal(cancelled.status, 303);
+  assert.equal(new URL(cancelled.headers.get("location")).searchParams.get("calendar"), "google-error");
+  assert.match(cancelled.headers.getSetCookie?.().join("; ") ?? "", /Max-Age=0/i);
+  const cancelledReplay = await request(`/api/calendars/google/callback?state=${encodeURIComponent(cancellation.state)}&code=fake-code`, {
+    cookie: cancellation.cookie, redirect: "manual",
+  });
+  assert.equal(cancelledReplay.status, 400);
+  assert.equal(googleTokenRequests(), beforeCancellation, "a cancelled transaction cannot later be completed");
+
+  const nativeBearerStart = await request("/api/calendars/google/connect", { token: victim.token, redirect: "manual" });
+  assert.equal(nativeBearerStart.status, 401, "native clients must start the web handoff in an authenticated browser");
+  assert.equal(nativeBearerStart.headers.has("location"), false);
+});
+
+test("Google OAuth callback rejects expired browser transactions and clears their cookie", async () => {
+  const owner = await account();
+  const authorization = await beginGoogleAuthorization(owner);
+  const initialClock = new Date(testClock);
+  const before = providerRequests.filter(({ path }) => path === "/google-token").length;
+  try {
+    await advanceTestClock(10 * 60_000 + 1);
+    const expired = await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
+      cookie: authorization.cookie, redirect: "manual",
+    });
+    assert.equal(expired.status, 400);
+    assert.match(expired.headers.getSetCookie?.().join("; ") ?? "", /Max-Age=0/i);
+    assert.equal(providerRequests.filter(({ path }) => path === "/google-token").length, before);
+    assert.deepEqual((await (await request("/api/calendars", { cookie: owner.cookie })).json()).calendars, []);
+  } finally {
+    await setTestClock(initialClock);
+  }
+});
+
 test("Google and Apple Calendar copies sync through fake provider boundaries", async () => {
   const owner = await account();
   const calendarRequestsStart = providerRequests.length;
-  const authorization = await appFetch("/api/calendars/google/connect", {
-    headers: { Authorization: `Bearer ${owner.token}` }, redirect: "manual",
-  });
-  assert.equal(authorization.status, 303);
-  const authUrl = new URL(authorization.headers.get("location"));
-  const state = authUrl.searchParams.get("state");
-  assert.ok(state);
-  assert.equal((await appFetch(`/api/calendars/google/callback?state=${encodeURIComponent(state)}&code=fake-code`, { redirect: "manual" })).status, 303);
+  const authorization = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
+    cookie: authorization.cookie, redirect: "manual",
+  })).status, 303);
 
   const apple = await request("/api/calendars", { token: owner.token, method: "POST", body: {
     username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
@@ -1200,13 +1330,10 @@ test("Google and Apple Calendar copies sync through fake provider boundaries", a
 
 test("scoped recurring Event deletion syncs Google and Apple recurrence exclusions", async () => {
   const owner = await account();
-  const authorization = await appFetch("/api/calendars/google/connect", {
-    headers: { Authorization: `Bearer ${owner.token}` }, redirect: "manual",
-  });
-  const authUrl = new URL(authorization.headers.get("location"));
-  const state = authUrl.searchParams.get("state");
-  assert.ok(state);
-  assert.equal((await appFetch(`/api/calendars/google/callback?state=${encodeURIComponent(state)}&code=fake-code`, { redirect: "manual" })).status, 303);
+  const authorization = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
+    cookie: authorization.cookie, redirect: "manual",
+  })).status, 303);
   assert.equal((await request("/api/calendars", { token: owner.token, method: "POST", body: {
     username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
   } })).status, 201);
@@ -1245,13 +1372,10 @@ test("scoped recurring Event deletion syncs Google and Apple recurrence exclusio
 test("recurring Google exceptions use immutable original starts after moves and retain FileTasks backlinks", async () => {
   const owner = await account();
   const providerRequestsStart = providerRequests.length;
-  const authorization = await appFetch("/api/calendars/google/connect", {
-    headers: { Authorization: `Bearer ${owner.token}` }, redirect: "manual",
-  });
-  const authUrl = new URL(authorization.headers.get("location"));
-  const state = authUrl.searchParams.get("state");
-  assert.ok(state);
-  assert.equal((await appFetch(`/api/calendars/google/callback?state=${encodeURIComponent(state)}&code=fake-code`, { redirect: "manual" })).status, 303);
+  const authorization = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
+    cookie: authorization.cookie, redirect: "manual",
+  })).status, 303);
   assert.equal((await request("/api/calendars", { token: owner.token, method: "POST", body: {
     username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
   } })).status, 201);
