@@ -98,14 +98,13 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         allowLocalNetworkIfPrompted()
         XCTAssertTrue(app.buttons["Account options"].waitForExistence(timeout: 15),
                       "Registration must complete through the installed app. Accessibility hierarchy: \(app.debugDescription)")
+        XCTAssertTrue(app.staticTexts["Your workspace is empty"].waitForExistence(timeout: 30),
+                      "The newly registered workspace should finish loading before opening its menu. Accessibility hierarchy: \(app.debugDescription)")
     }
 
     private func signOutInApp() {
         let accountOptions = app.buttons["Account options"]
         XCTAssertTrue(accountOptions.waitForExistence(timeout: 10))
-        // SwiftUI exposes a labelled wrapper around the toolbar button. The
-        // wrapper may have no accessibility hit point even while it is visible.
-        accountOptions.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         let signOutMenuItem = app.buttons["Sign out"]
         let visibleFrame = NSPredicate { _, _ in
             guard signOutMenuItem.exists else { return false }
@@ -113,9 +112,17 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
             return frame.origin.x.isFinite && frame.origin.y.isFinite && frame.width > 0 && frame.height > 0
                 && self.app.frame.intersects(frame)
         }
-        let menuReady = XCTNSPredicateExpectation(predicate: visibleFrame, object: signOutMenuItem)
-        XCTAssertEqual(XCTWaiter.wait(for: [menuReady], timeout: 15), .completed,
-                       "The Sign out menu item should have a visible frame. Accessibility hierarchy: \(app.debugDescription)")
+        var menuOpened = false
+        for _ in 0..<3 {
+            // SwiftUI exposes a labelled wrapper that can lack a hit point.
+            accountOptions.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+            let menuReady = XCTNSPredicateExpectation(predicate: visibleFrame, object: signOutMenuItem)
+            if XCTWaiter.wait(for: [menuReady], timeout: 5) == .completed {
+                menuOpened = true
+                break
+            }
+        }
+        XCTAssertTrue(menuOpened, "The Sign out menu item should have a visible frame. Accessibility hierarchy: \(app.debugDescription)")
         signOutMenuItem.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
 
         let confirmation = app.sheets["Sign out of FileTasks?"]
