@@ -42,6 +42,9 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("Base URL").performTextClearance()
         compose.onNodeWithText("Base URL").performTextInput(apiUrl)
         compose.onNodeWithText("Save").performClick()
+        waitFor("server settings to finish saving") {
+            compose.onAllNodes(hasText("Server changed. Sign in to continue.")).fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithText("Email").performTextInput(email)
         compose.onNodeWithText("Password").performTextInput(password)
         compose.onNodeWithTag("auth.submit").performClick()
@@ -105,7 +108,7 @@ class RecurringAgendaUiTest {
     private fun waitFor(description: String, condition: () -> Boolean) {
         try {
             compose.waitUntil(30_000, condition)
-        } catch (failure: Exception) {
+        } catch (failure: Throwable) {
             val ui = runCatching { compose.onRoot(useUnmergedTree = true).printToString() }.getOrElse { it.toString() }
             throw AssertionError("Failed while waiting for $description. UI: $ui", failure)
         }
