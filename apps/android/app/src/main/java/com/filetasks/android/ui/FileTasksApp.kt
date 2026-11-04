@@ -55,6 +55,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.input.ImeAction
@@ -62,6 +63,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.filetasks.android.data.AccountUser
+import com.filetasks.android.data.AgendaRefreshResult
 import com.filetasks.android.data.ApiClient
 import com.filetasks.android.data.ApiException
 import com.filetasks.android.data.ItemFields
@@ -76,6 +78,7 @@ import com.filetasks.android.data.TokenStore
 import com.filetasks.android.data.WorkspaceFile
 import com.filetasks.android.data.WorkspaceFileSummary
 import com.filetasks.android.data.WorkspaceItem
+import com.filetasks.android.data.refreshSavedAgenda
 import com.filetasks.android.PushMessagingService
 import com.google.firebase.installations.FirebaseInstallations
 import com.google.firebase.messaging.FirebaseMessaging
@@ -507,16 +510,32 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                     working = true
                     try {
                         val currentToken = token ?: throw IllegalStateException("Sign in to save items.")
-                        val api = ApiClient(apiBaseUrl)
+                        val savedApiUrl = apiBaseUrl
+                        val api = ApiClient(savedApiUrl)
                         val saved = if (target.item == null) {
                             api.createItem(currentToken, fields)
                         } else {
                             api.updateItem(currentToken, target.item, fields)
                         }
-                        workspaceItems = if (target.item == null) {
-                            workspaceItems + saved
-                        } else {
+                        workspaceItems = if (workspaceItems.any { it.id == saved.id }) {
                             workspaceItems.replaceItem(saved)
+                        } else {
+                            workspaceItems + saved
+                        }
+                        // A recurring save can create or update many occurrences.
+                        // Keep the returned item if refreshing the full agenda fails.
+                        when (val result = refreshSavedAgenda(
+                            isCurrentSession = { token == currentToken && apiBaseUrl == savedApiUrl },
+                            fetch = { api.listItems(currentToken) },
+                        )) {
+                            is AgendaRefreshResult.Refreshed -> {
+                                workspaceItems = result.items
+                                errorMessage = null
+                            }
+                            is AgendaRefreshResult.Failed -> {
+                                errorMessage = "Saved, but the agenda could not be refreshed. ${readableError(result.cause)}"
+                            }
+                            AgendaRefreshResult.Stale -> Unit
                         }
                     } catch (failure: Exception) {
                         if (failure is ApiException && failure.statusCode == 401) {
@@ -829,7 +848,7 @@ private fun SignInScreen(
             Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
         }
         Spacer(Modifier.height(18.dp))
-        Button(onClick = onSubmit, modifier = Modifier.fillMaxWidth(), enabled = !isBusy) {
+        Button(onClick = onSubmit, modifier = Modifier.fillMaxWidth().testTag("auth.submit"), enabled = !isBusy) {
             if (isBusy) {
                 CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                 Spacer(Modifier.width(10.dp))
@@ -1003,7 +1022,7 @@ private fun WorkspaceScreen(
                 }
             } else {
                 LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier.fillMaxSize().testTag("agenda.list"),
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(
                         start = 16.dp,
                         end = 16.dp,
@@ -1083,7 +1102,7 @@ private fun WorkspaceItemCard(
     onOpenFile: (WorkspaceFileSummary) -> Unit,
     onRemoveAttachment: (WorkspaceFileSummary) -> Unit,
 ) {
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(modifier = Modifier.fillMaxWidth().testTag("agenda.item.${item.id}")) {
         Row(Modifier.fillMaxWidth().padding(start = 12.dp, top = 12.dp, end = 8.dp, bottom = 8.dp)) {
             if (item.kind == ItemKind.Task) {
                 Checkbox(
@@ -1138,7 +1157,7 @@ private fun WorkspaceItemCard(
                     }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.align(Alignment.End)) {
-                    TextButton(onClick = onEdit, enabled = enabled) { Text("Edit") }
+                    TextButton(onClick = onEdit, enabled = enabled, modifier = Modifier.testTag("agenda.edit.${item.id}")) { Text("Edit") }
                     TextButton(onClick = onDelete, enabled = enabled) { Text("Delete", color = MaterialTheme.colorScheme.error) }
                 }
             }
@@ -1239,7 +1258,7 @@ private fun ItemEditorDialog(
         title = { Text(if (item == null) "Add to your workspace" else "Edit item") },
         text = {
             Column(
-                modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                modifier = Modifier.fillMaxWidth().testTag("item.editor.form").verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1308,7 +1327,7 @@ private fun ItemEditorDialog(
                             weekdays = setOf(weekday)
                             recurrence = RecurrenceRule(1, "weeks", listOf(weekday), RecurrenceEnd("never"))
                         } else recurrence = null
-                    }, enabled = !saving && !isBusy && date.isNotBlank())
+                    }, enabled = !saving && !isBusy && date.isNotBlank(), modifier = Modifier.testTag("item.editor.repeat"))
                     Text("Repeat")
                 }
                 recurrence?.let { rule ->
