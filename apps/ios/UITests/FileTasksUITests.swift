@@ -286,9 +286,18 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
 
     private func replaceText(in field: XCUIElement, with value: String) {
         scrollToHittable(field, toward: .up, message: "The text field should be visible before editing it.")
-        // Place the insertion point after existing text before deleting it.
-        field.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5)).tap()
-        if let currentValue = field.value as? String, !currentValue.isEmpty {
+        let displayedValue = field.value as? String ?? ""
+        let currentValue = displayedValue == field.placeholderValue ? "" : displayedValue
+        // Tap the center of an empty field; tap at the end when replacing text.
+        if currentValue.isEmpty {
+            field.tap()
+        } else {
+            field.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5)).tap()
+        }
+        let focused = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hasKeyboardFocus == true"), object: field)
+        XCTAssertEqual(XCTWaiter.wait(for: [focused], timeout: 10), .completed,
+                       "The text field should receive keyboard focus. Accessibility hierarchy: \(app.debugDescription)")
+        if !currentValue.isEmpty {
             field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: currentValue.count))
         }
         field.typeText(value)
