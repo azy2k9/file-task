@@ -103,11 +103,18 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
     private func signOutInApp() {
         app.buttons["Account options"].tap()
         let signOutMenuItem = app.buttons["Sign out"]
-        XCTAssertTrue(signOutMenuItem.waitForExistence(timeout: 5))
+        let menuReady = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == true AND hittable == true"), object: signOutMenuItem)
+        XCTAssertEqual(XCTWaiter.wait(for: [menuReady], timeout: 15), .completed,
+                       "The Sign out menu item should be available to tap. Accessibility hierarchy: \(app.debugDescription)")
         signOutMenuItem.tap()
 
-        let confirmSignOut = app.buttons["Sign out"]
-        XCTAssertTrue(confirmSignOut.waitForExistence(timeout: 5), "The app should ask before signing out.")
+        let confirmation = app.sheets["Sign out of FileTasks?"]
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 10),
+                      "The app should ask before signing out. Accessibility hierarchy: \(app.debugDescription)")
+        let confirmSignOut = confirmation.buttons["Sign out"]
+        let confirmationReady = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == true AND hittable == true"), object: confirmSignOut)
+        XCTAssertEqual(XCTWaiter.wait(for: [confirmationReady], timeout: 10), .completed,
+                       "The sign-out confirmation should be available to tap. Accessibility hierarchy: \(app.debugDescription)")
         confirmSignOut.tap()
         XCTAssertTrue(app.textFields["Email"].waitForExistence(timeout: 10))
     }
