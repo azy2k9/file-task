@@ -169,18 +169,30 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         scrollToHittable(field, toward: .down, message: "The password field should be visible.")
         field.tap()
         dismissStrongPasswordSuggestionIfShown()
+        ensureKeyboardFocus(field)
 
         // iOS may present its strong-password sheet after the first keystroke.
         // Handle it before typing the remaining characters.
         field.typeText(String(password.prefix(1)))
         dismissStrongPasswordSuggestionIfShown()
         let firstCharacterWasEntered = (field.value as? String)?.count == 1
+        ensureKeyboardFocus(field)
         let remainingPassword = firstCharacterWasEntered ? String(password.dropFirst()) : password
         for character in remainingPassword {
             field.typeText(String(character))
         }
         XCTAssertEqual((field.value as? String)?.count, password.count,
                        "The full password should be entered before submitting the form. Accessibility hierarchy: \(app.debugDescription)")
+    }
+
+    private func ensureKeyboardFocus(_ field: XCUIElement) {
+        let focused = NSPredicate(format: "hasKeyboardFocus == true")
+        if !focused.evaluate(with: field) {
+            field.tap()
+        }
+        let focusReady = XCTNSPredicateExpectation(predicate: focused, object: field)
+        XCTAssertEqual(XCTWaiter.wait(for: [focusReady], timeout: 15), .completed,
+                       "The password field should have keyboard focus before typing. Accessibility hierarchy: \(app.debugDescription)")
     }
 
     private func dismissStrongPasswordSuggestionIfShown() {
