@@ -10,6 +10,7 @@ import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -922,6 +923,7 @@ private fun WorkspaceScreen(
                 ExtendedFloatingActionButton(
                     text = { Text("Add item") }, icon = { Text("+", style = MaterialTheme.typography.titleLarge) },
                     onClick = { if (!isBusy) onCreate() },
+                    modifier = Modifier.testTag("agenda.add"),
                     containerColor = if (isBusy) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.primary,
                     contentColor = if (isBusy) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onPrimary,
                 )
@@ -930,11 +932,9 @@ private fun WorkspaceScreen(
     ) { insets ->
         Column(Modifier.fillMaxSize().padding(insets)) {
             Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 12.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Your workspace", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-                        Text(user.email, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
+                Text("Your workspace", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                Text(user.email, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
                     TextButton(onClick = onRefresh, enabled = !isBusy) { Text("Refresh") }
                     TextButton(onClick = onSettings, enabled = !isBusy) { Text("Server") }
                     TextButton(onClick = onReminderSettings, enabled = !isBusy) { Text("Reminders") }

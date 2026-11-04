@@ -48,7 +48,7 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("Email").performTextInput(email)
         compose.onNodeWithText("Password").performTextInput(password)
         compose.onNodeWithTag("auth.submit").performScrollTo().performClick()
-        waitFor("the signed-in workspace") { compose.onAllNodes(hasText("Add item")).fetchSemanticsNodes().isNotEmpty() }
+        waitFor("the signed-in workspace") { compose.onAllNodes(hasTestTag("agenda.add")).fetchSemanticsNodes().isNotEmpty() }
         waitFor("the initial empty agenda") { compose.onAllNodes(hasText("Nothing here yet")).fetchSemanticsNodes().isNotEmpty() }
 
         createRecurring("Android UI Task", isEvent = false, date = "2026-10-14")
@@ -78,7 +78,7 @@ class RecurringAgendaUiTest {
     private fun items(api: ApiClient, token: String): List<WorkspaceItem> = runBlocking { api.listItems(token) }
 
     private fun createRecurring(title: String, isEvent: Boolean, date: String) {
-        compose.onNodeWithText("Add item").performClick()
+        compose.onNodeWithTag("agenda.add").performClick()
         if (isEvent) compose.onNodeWithText("Event").performClick()
         compose.onNodeWithText("Title").performTextInput(title)
         compose.onNodeWithText("Date (YYYY-MM-DD, optional)").performTextInput(date)
