@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1624,6 +1624,60 @@ test("a person's account and saved items remain available after the server resta
   assert.deepEqual((await response.json()).items, [item]);
   const login = await request("/api/auth/login", { method: "POST", body: { email: owner.user.email, password: "correct-horse-battery" } });
   assert.equal(login.status, 200);
+});
+
+test("Android UI acceptance: recurring agenda updates are visible across clients", {
+  skip: process.env.FILETASKS_RUN_ANDROID_UI_ACCEPTANCE !== "1",
+}, async () => {
+  await setTestClock("2026-10-13T12:00:00.000Z");
+  const email = "android-ui-shared@example.com";
+  const password = "correct-horse-battery";
+  const owner = await account(email);
+  try {
+    await runCommand("./gradlew", [
+      ":app:connectedDebugAndroidTest",
+      "-Pandroid.testInstrumentationRunnerArguments.class=com.filetasks.android.RecurringAgendaUiTest",
+      `-Pandroid.testInstrumentationRunnerArguments.apiUrl=${base}`,
+      `-Pandroid.testInstrumentationRunnerArguments.email=${email}`,
+      `-Pandroid.testInstrumentationRunnerArguments.password=${password}`,
+    ], process.env, join(repoRoot, "apps/android"), { detached: true });
+  } catch (error) {
+    const resultsPath = join(repoRoot, "apps/android/app/build/outputs/androidTest-results/connected");
+    let reports;
+    try {
+      const files = (await readdir(resultsPath, { recursive: true })).filter((file) => file.endsWith(".xml"));
+      reports = (await Promise.all(files.map((file) => readFile(join(resultsPath, file), "utf8")))).join("\n");
+    } catch (reportError) {
+      reports = `Could not read instrumentation reports: ${reportError.message}`;
+    }
+    throw new Error(`${error.message}\nInstrumentation results:\n${reports}\nRecent test server output:\n${logs.slice(-10000)}`, { cause: error });
+  }
+
+  const response = await request("/api/items", { token: owner.token });
+  assert.equal(response.status, 200);
+  const { items } = await response.json();
+  assert.equal(items.filter(({ title }) => title === "Android UI Whole Task").length, 3);
+  assert.equal(items.filter(({ title }) => title === "Android UI Following").length, 2);
+  assert.equal(items.filter(({ title }) => title === "Android UI Event").length, 1);
+
+  uiAcceptanceBrowser = await launchUIAcceptanceBrowser();
+  try {
+    uiAcceptanceContext = await createUIAcceptanceContext(uiAcceptanceBrowser);
+    try {
+      const page = await createUIAcceptancePage(uiAcceptanceContext);
+      await page.goto(base);
+      await page.getByLabel("Email", { exact: true }).fill(email);
+      await page.getByLabel("Password", { exact: true }).fill(password);
+      await page.locator("form").getByRole("button", { name: "Sign in", exact: true }).click();
+      for (const title of ["Android UI Whole Task", "Android UI Following", "Android UI Event"]) {
+        await expect(page.getByRole("heading", { name: title, exact: true }).first()).toBeVisible();
+      }
+    } finally {
+      await closeUIAcceptanceContext();
+    }
+  } finally {
+    await closeUIAcceptanceBrowser();
+  }
 });
 
 test("iOS, Android and web run against one shared account, API and provider fakes", {

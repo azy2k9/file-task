@@ -37,5 +37,38 @@ jobs:
       - uses: android-actions/setup-android@v3
         with:
           packages: platform-tools
-      - run: ./gradlew --no-daemon :app:assembleDebug
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: ./gradlew --no-daemon :app:assembleDebug :app:assembleDebugAndroidTest
         working-directory: apps/android
+      - run: ./gradlew --no-daemon :app:testDebugUnitTest
+        working-directory: apps/android
+      - name: Enable emulator acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install Android emulator image
+        shell: bash
+        run: |
+          df -h "$ANDROID_HOME"
+          image="$ANDROID_HOME/system-images/android-35/default/x86_64/system.img"
+          for attempt in 1 2 3; do
+            if sdkmanager --install 'system-images;android-35;default;x86_64' && test -s "$image"; then
+              exit 0
+            fi
+            echo "Android system image installation failed (attempt $attempt of 3)."
+            df -h "$ANDROID_HOME"
+            if [ "$attempt" -lt 3 ]; then sleep 10; fi
+          done
+          exit 1
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          disable-animations: true
+          script: npm run test:android-ui

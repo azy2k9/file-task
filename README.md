@@ -57,7 +57,9 @@ npm run build
 
 Run the focused real-app iOS Reminder acceptance with `npm run test:ios-ui` on macOS with Xcode, an installed iOS Simulator runtime, and Playwright Chromium (`npx playwright install chromium`). It creates and deletes a blank disposable iPhone Simulator, starts the same temporary API/database, controlled clock, and provider fakes used by the web tests, then drives registration, sign-in, item type changes, Reminder customization, and save/reopen in the SwiftUI app. It also reads the saved items in the web app. Missing macOS, Xcode, or simulator prerequisites fail the command. This focused workflow does not need Android.
 
-CI checks the web application, runs the focused iOS UI acceptance on macOS, and compiles both native projects with their platform SDKs. Native builds require their respective toolchains; a web build does not validate SwiftUI or Android code.
+Run the focused Android recurring-agenda UI acceptance with `npm run test:android-ui` on a fresh, booted emulator with the Android SDK, JDK 17, and Playwright Chromium installed. It uses the shared temporary backend, controlled clock, and provider fakes; creates and edits recurring items through the app; and checks saved values in the browser. See [Android acceptance prerequisites](apps/android/README.md#acceptance-tests).
+
+CI checks the web application, runs the focused iOS and Android UI acceptances, and compiles both native projects with their platform SDKs. Native builds require their respective toolchains; a web build does not validate SwiftUI or Android code.
 
 See [the API contract](docs/api.md) for the shared client interface.
 
