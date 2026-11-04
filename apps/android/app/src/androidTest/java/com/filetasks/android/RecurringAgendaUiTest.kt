@@ -47,7 +47,7 @@ class RecurringAgendaUiTest {
         }
         compose.onNodeWithText("Email").performTextInput(email)
         compose.onNodeWithText("Password").performTextInput(password)
-        compose.onNodeWithTag("auth.submit").performClick()
+        compose.onNodeWithTag("auth.submit").performScrollTo().performClick()
         waitFor("the signed-in workspace") { compose.onAllNodes(hasText("Add item")).fetchSemanticsNodes().isNotEmpty() }
         waitFor("the initial empty agenda") { compose.onAllNodes(hasText("Nothing here yet")).fetchSemanticsNodes().isNotEmpty() }
 
@@ -109,7 +109,9 @@ class RecurringAgendaUiTest {
         try {
             compose.waitUntil(30_000, condition)
         } catch (failure: Throwable) {
-            val ui = runCatching { compose.onRoot(useUnmergedTree = true).printToString() }.getOrElse { it.toString() }
+            val password = InstrumentationRegistry.getArguments().getString("password")
+            val snapshot = runCatching { compose.onRoot(useUnmergedTree = true).printToString() }.getOrElse { it.toString() }
+            val ui = if (password.isNullOrEmpty()) snapshot else snapshot.replace(password, "<redacted>")
             throw AssertionError("Failed while waiting for $description. UI: $ui", failure)
         }
     }
