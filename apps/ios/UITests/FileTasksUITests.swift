@@ -125,7 +125,9 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         XCTAssertTrue(menuOpened, "The Sign out menu item should have a visible frame. Accessibility hierarchy: \(app.debugDescription)")
         signOutMenuItem.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
 
-        let confirmation = app.sheets["Sign out of FileTasks?"]
+        // The compact popover sheet can omit the dialog title from its
+        // accessibility identifier, but it contains the destructive action.
+        let confirmation = app.sheets.containing(.button, identifier: "Sign out").firstMatch
         XCTAssertTrue(confirmation.waitForExistence(timeout: 10),
                       "The app should ask before signing out. Accessibility hierarchy: \(app.debugDescription)")
         let confirmSignOut = confirmation.buttons["Sign out"]
