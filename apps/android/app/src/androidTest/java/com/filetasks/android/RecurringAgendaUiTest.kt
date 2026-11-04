@@ -11,6 +11,7 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.printToString
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.filetasks.android.data.ApiClient
@@ -35,7 +36,7 @@ class RecurringAgendaUiTest {
         val api = ApiClient(apiUrl)
         val token = runBlocking { api.login(email, password).first }
 
-        compose.waitUntil(30_000) { compose.onAllNodes(hasText("Configure API URL")).fetchSemanticsNodes().isNotEmpty() }
+        waitFor("the server configuration button") { compose.onAllNodes(hasText("Configure API URL")).fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("Configure API URL").performClick()
         compose.onNodeWithText("Base URL").performTextClearance()
         compose.onNodeWithText("Base URL").performTextInput(apiUrl)
@@ -43,8 +44,8 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("Email").performTextInput(email)
         compose.onNodeWithText("Password").performTextInput(password)
         compose.onNodeWithTag("auth.submit").performClick()
-        compose.waitUntil(30_000) { compose.onAllNodes(hasText("Add item")).fetchSemanticsNodes().isNotEmpty() }
-        compose.waitUntil(30_000) { compose.onAllNodes(hasText("Nothing here yet")).fetchSemanticsNodes().isNotEmpty() }
+        waitFor("the signed-in workspace") { compose.onAllNodes(hasText("Add item")).fetchSemanticsNodes().isNotEmpty() }
+        waitFor("the initial empty agenda") { compose.onAllNodes(hasText("Nothing here yet")).fetchSemanticsNodes().isNotEmpty() }
 
         createRecurring("Android UI Task", isEvent = false, date = "2026-10-14")
         val task = items(api, token).filter { it.title == "Android UI Task" }.sortedBy { it.scheduledDate }
@@ -82,7 +83,7 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("On date").performScrollTo().performClick()
         compose.onNodeWithText("End date (YYYY-MM-DD)").performScrollTo().performTextInput(LocalDate.parse(date).plusDays(2).toString())
         compose.onNodeWithText("Create").performClick()
-        compose.waitUntil(30_000) { compose.onAllNodes(hasText("Add to your workspace")).fetchSemanticsNodes().isEmpty() }
+        waitFor("the create editor to close") { compose.onAllNodes(hasText("Add to your workspace")).fetchSemanticsNodes().isEmpty() }
     }
 
     private fun edit(item: WorkspaceItem, title: String, scope: String) {
@@ -92,11 +93,20 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("Title").performTextInput(title)
         compose.onNodeWithText(scope).performScrollTo().performClick()
         compose.onNodeWithText("Save").performClick()
-        compose.waitUntil(30_000) { compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty() }
+        waitFor("the edit editor to close") { compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty() }
     }
 
     private fun assertAgendaItem(id: String, title: String) {
         compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.item.$id"))
         compose.onNode(hasTestTag("agenda.item.$id") and hasAnyDescendant(hasText(title))).assertExists()
+    }
+
+    private fun waitFor(description: String, condition: () -> Boolean) {
+        try {
+            compose.waitUntil(30_000, condition)
+        } catch (failure: Exception) {
+            val ui = runCatching { compose.onRoot(useUnmergedTree = true).printToString() }.getOrElse { it.toString() }
+            throw AssertionError("Failed while waiting for $description. UI: $ui", failure)
+        }
     }
 }

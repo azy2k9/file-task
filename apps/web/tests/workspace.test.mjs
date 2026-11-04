@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1642,7 +1642,15 @@ test("Android UI acceptance: recurring agenda updates are visible across clients
       `-Pandroid.testInstrumentationRunnerArguments.password=${password}`,
     ], process.env, join(repoRoot, "apps/android"), { detached: true });
   } catch (error) {
-    throw new Error(`${error.message}\nRecent test server output:\n${logs.slice(-10000)}`, { cause: error });
+    const resultsPath = join(repoRoot, "apps/android/app/build/outputs/androidTest-results/connected");
+    let reports;
+    try {
+      const files = (await readdir(resultsPath, { recursive: true })).filter((file) => file.endsWith(".xml"));
+      reports = (await Promise.all(files.map((file) => readFile(join(resultsPath, file), "utf8")))).join("\n");
+    } catch (reportError) {
+      reports = `Could not read instrumentation reports: ${reportError.message}`;
+    }
+    throw new Error(`${error.message}\nInstrumentation results:\n${reports}\nRecent test server output:\n${logs.slice(-10000)}`, { cause: error });
   }
 
   const response = await request("/api/items", { token: owner.token });
