@@ -267,12 +267,12 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         let unitControl = element(identifier: "itemEditor.reminder.unit.0")
         XCTAssertTrue(unitControl.exists, file: file, line: line)
         let unitValue = ((unitControl.value as? String) ?? unitControl.label).lowercased()
-        XCTAssertTrue(unitValue.contains(unit), "Expected Reminder unit \(unit), got \(unitValue).", file: file, line: line)
+        XCTAssertTrue(unitValue.contains(unit), "Expected Reminder unit \(unit), got \(unitValue). Control: \(unitControl.debugDescription)", file: file, line: line)
 
         let deliveryControl = element(identifier: "itemEditor.reminder.delivery.0")
         XCTAssertTrue(deliveryControl.exists, file: file, line: line)
         let deliveryValue = ((deliveryControl.value as? String) ?? deliveryControl.label).lowercased()
-        XCTAssertTrue(deliveryValue.contains("notification"), "Expected in-app Notification delivery, got \(deliveryValue).", file: file, line: line)
+        XCTAssertTrue(deliveryValue.contains("notification"), "Expected in-app Notification delivery, got \(deliveryValue). Control: \(deliveryControl.debugDescription)", file: file, line: line)
         let timeControl = element(identifier: "itemEditor.reminder.time.0")
         scrollToHittable(timeControl, toward: .down, message: "The Reminder clock-time control should remain visible.", file: file, line: line)
     }

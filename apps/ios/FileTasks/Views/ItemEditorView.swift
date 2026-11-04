@@ -318,6 +318,7 @@ private struct ReminderListEditor: View {
                     if emailAvailable || reminders[index].delivery == .email { Text("Email").tag(ReminderDelivery.email) }
                 }
                 .accessibilityIdentifier("\(accessibilityIdentifierPrefix).delivery.\(index)")
+                .accessibilityValue(reminders[index].delivery == .notification ? "Notification" : "Email")
                 HStack {
                     Stepper("\(reminders[index].amount)", value: Binding(
                         get: { reminders[index].amount },
@@ -337,6 +338,7 @@ private struct ReminderListEditor: View {
                         ForEach(ReminderUnit.allCases) { unit in Text(unit.rawValue).tag(unit) }
                     }
                     .accessibilityIdentifier("\(accessibilityIdentifierPrefix).unit.\(index)")
+                    .accessibilityValue(reminders[index].unit.rawValue)
                 }
                 DatePicker("Clock time", selection: Binding(
                     get: { AgendaDate.time(from: reminders[index].time) ?? Date() },
