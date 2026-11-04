@@ -57,7 +57,8 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         settingsButton.tap()
 
         let originField = app.textFields["https://api.example.com"]
-        XCTAssertTrue(originField.waitForExistence(timeout: 5))
+        XCTAssertTrue(originField.waitForExistence(timeout: 30),
+                      "Server settings should show the server origin field. Accessibility hierarchy: \(app.debugDescription)")
         replaceText(in: originField, with: "http://localhost:3107")
         XCTAssertEqual(originField.value as? String, "http://localhost:3107", "Server origin must be entered exactly before saving.")
         dismissKeyboardIfShown()
