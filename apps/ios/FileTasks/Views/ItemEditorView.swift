@@ -349,15 +349,16 @@ private struct ReminderListEditor: View {
                 ), displayedComponents: .hourAndMinute)
                 .accessibilityIdentifier("\(accessibilityIdentifierPrefix).time.\(index)")
                 Button("Remove Reminder", role: .destructive) {
-                    reminders.remove(at: index)
                     onUserEdit()
+                    reminders.remove(at: index)
                 }
+                .buttonStyle(.borderless)
                 .accessibilityIdentifier("\(accessibilityIdentifierPrefix).remove.\(index)")
             }
         }
         Button("Add Reminder") {
-            reminders.append(ReminderRule(delivery: .notification, amount: 1, unit: .days, time: "09:00"))
             onUserEdit()
+            reminders.append(ReminderRule(delivery: .notification, amount: 1, unit: .days, time: "09:00"))
         }
         .disabled(reminders.count >= 20)
         .accessibilityIdentifier("\(accessibilityIdentifierPrefix).add")
