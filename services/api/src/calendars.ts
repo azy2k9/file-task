@@ -1,6 +1,7 @@
-import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { database } from "./database";
 import { HttpError } from "./http";
+import type { BrowserSession } from "./auth";
 import { listItems, listItemsForCalendarSync } from "./workspace";
 import type { RecurrenceRule } from "./items";
 import { saveItem } from "./workspace";
@@ -9,6 +10,16 @@ import { now, nowMs } from "./clock";
 type Provider = "google" | "apple";
 type Connection = { user_id: string; provider: Provider; account_label: string; access_token: string | null; refresh_token: string | null; calendar_url: string | null; expires_at: number | null };
 type EventItem = ReturnType<typeof listItems>[number];
+type GoogleOAuthTransaction = { user_id: string; nonce_hash: string; session_hash: string; expires_at: number };
+
+export const GOOGLE_OAUTH_TRANSACTION_COOKIE = "filetasks_google_oauth";
+const googleOAuthTransactionLifetimeMs = 10 * 60_000;
+const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
+
+function sameDigest(left: string, right: string) {
+  if (!/^[0-9a-f]{64}$/i.test(left) || !/^[0-9a-f]{64}$/i.test(right)) return false;
+  return timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"));
+}
 
 function googleApiUrl(path: string) {
   const origin = (process.env.FILETASKS_GOOGLE_API_ORIGIN || "https://www.googleapis.com").replace(/\/+$/, "");
@@ -59,26 +70,55 @@ export function calendarConnections(userId: string) {
   return database().prepare("SELECT provider,account_label,connected_at FROM calendar_connections WHERE user_id=? ORDER BY provider").all(userId);
 }
 
-export function createGoogleAuthorization(userId: string) {
+export function createGoogleAuthorization(userId: string, sessionHash: string) {
   const clientId = process.env.GOOGLE_CALENDAR_CLIENT_ID;
   const redirectUri = process.env.GOOGLE_CALENDAR_REDIRECT_URI;
   if (!clientId || !redirectUri) throw new HttpError(503, "Configure Google Calendar OAuth on the server before connecting an account.");
+  if (!/^[0-9a-f]{64}$/i.test(sessionHash)) throw new HttpError(401, "Please sign in to continue.");
   encryptionKey();
   const state = randomBytes(32).toString("base64url");
-  database().prepare("DELETE FROM calendar_oauth_states WHERE expires_at <= ?").run(nowMs());
-  database().prepare("INSERT INTO calendar_oauth_states(state,user_id,expires_at) VALUES(?,?,?)").run(state,userId,nowMs()+10*60_000);
+  const nonce = randomBytes(32).toString("base64url");
+  const expiresAt = nowMs() + googleOAuthTransactionLifetimeMs;
+  const db = database();
+  db.prepare("DELETE FROM calendar_oauth_transactions WHERE expires_at <= ?").run(nowMs());
+  db.prepare(`INSERT INTO calendar_oauth_transactions(state_hash,nonce_hash,session_hash,user_id,expires_at)
+    VALUES(?,?,?,?,?)`).run(sha256(state),sha256(nonce),sessionHash,userId,expiresAt);
   const url = new URL(process.env.FILETASKS_GOOGLE_AUTH_URL || "https://accounts.google.com/o/oauth2/v2/auth");
   url.searchParams.set("client_id", clientId); url.searchParams.set("redirect_uri", redirectUri);
   url.searchParams.set("response_type", "code"); url.searchParams.set("scope", "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly");
   url.searchParams.set("access_type", "offline"); url.searchParams.set("prompt", "consent"); url.searchParams.set("state", state);
-  return url.toString();
+  return { authorizationUrl: url.toString(), nonce };
 }
 
-export async function finishGoogleAuthorization(state: string, code: string) {
+export function consumeGoogleAuthorization(state: string, nonce: string | null, session: BrowserSession) {
+  const invalid = { valid: false as const, clearCookie: false };
+  if (!/^[A-Za-z0-9_-]{43}$/.test(state) || !nonce || !/^[A-Za-z0-9_-]{43}$/.test(nonce)) return invalid;
   const db = database();
-  const stateRow = db.prepare("SELECT user_id FROM calendar_oauth_states WHERE state=? AND expires_at>? ").get(state,nowMs());
-  db.prepare("DELETE FROM calendar_oauth_states WHERE state=?").run(state);
-  if (!stateRow) throw new HttpError(400, "Google Calendar connection expired. Start connecting again.");
+  const stateHash = sha256(state);
+  const transaction = db.prepare(`SELECT user_id,nonce_hash,session_hash,expires_at
+    FROM calendar_oauth_transactions WHERE state_hash=?`).get(stateHash) as GoogleOAuthTransaction | undefined;
+  if (!transaction) return invalid;
+
+  // Check the browser nonce and the exact FileTasks session before consuming the
+  // transaction. A copied authorization URL in another browser cannot complete it.
+  if (!sameDigest(transaction.nonce_hash, sha256(nonce))
+    || !sameDigest(transaction.session_hash, session.sessionHash)
+    || transaction.user_id !== session.id) return invalid;
+
+  const expiresAt = Number(transaction.expires_at);
+  if (expiresAt <= nowMs()) {
+    db.prepare("DELETE FROM calendar_oauth_transactions WHERE state_hash=?").run(stateHash);
+    return { valid: false as const, clearCookie: true };
+  }
+
+  const deleted = db.prepare(`DELETE FROM calendar_oauth_transactions
+    WHERE state_hash=? AND nonce_hash=? AND session_hash=? AND user_id=? AND expires_at>?`)
+    .run(stateHash,transaction.nonce_hash,transaction.session_hash,session.id,nowMs());
+  if (!deleted.changes) return invalid;
+  return { valid: true as const, clearCookie: true, userId: session.id };
+}
+
+export async function finishGoogleAuthorization(userId: string, code: string) {
   const clientId = process.env.GOOGLE_CALENDAR_CLIENT_ID!; const clientSecret = process.env.GOOGLE_CALENDAR_CLIENT_SECRET!;
   const redirectUri = process.env.GOOGLE_CALENDAR_REDIRECT_URI!;
   if (!clientSecret) throw new HttpError(503, "Configure Google Calendar OAuth on the server before connecting an account.");
@@ -89,13 +129,14 @@ export async function finishGoogleAuthorization(state: string, code: string) {
   const calendarResponse = await fetch(googleApiUrl("calendar/v3/calendars/primary"), { headers: { Authorization: `Bearer ${tokens.access_token}` } });
   if (!calendarResponse.ok) throw new HttpError(502, "Could not read the primary Google Calendar.");
   const calendar = await calendarResponse.json() as { id?: string; summary?: string };
-  const previous = db.prepare("SELECT refresh_token FROM calendar_connections WHERE user_id=? AND provider='google'").get(stateRow.user_id);
+  const db = database();
+  const previous = db.prepare("SELECT refresh_token FROM calendar_connections WHERE user_id=? AND provider='google'").get(userId);
   const refreshCipher = tokens.refresh_token ? encrypt(tokens.refresh_token) : (previous?.refresh_token as string | undefined);
   if (!refreshCipher || !calendar.id) throw new HttpError(502, "Google did not provide a reusable calendar connection.");
   db.prepare(`INSERT INTO calendar_connections(user_id,provider,account_label,access_token,refresh_token,calendar_url,connected_at,expires_at)
     VALUES(?,'google',?,?,?,?,?,?) ON CONFLICT(user_id,provider) DO UPDATE SET account_label=excluded.account_label,
     access_token=excluded.access_token,refresh_token=excluded.refresh_token,calendar_url=excluded.calendar_url,
-    connected_at=excluded.connected_at,expires_at=excluded.expires_at`).run(String(stateRow.user_id),calendar.summary ?? "Google Calendar",encrypt(tokens.access_token),refreshCipher,calendar.id,now().toISOString(),nowMs()+Math.max(60,tokens.expires_in ?? 3600)*1000-60_000);
+    connected_at=excluded.connected_at,expires_at=excluded.expires_at`).run(userId,calendar.summary ?? "Google Calendar",encrypt(tokens.access_token),refreshCipher,calendar.id,now().toISOString(),nowMs()+Math.max(60,tokens.expires_in ?? 3600)*1000-60_000);
 }
 
 export async function connectAppleCalendar(userId: string, body: Record<string, unknown>) {

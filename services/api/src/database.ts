@@ -59,8 +59,9 @@ export function database() {
         provider TEXT NOT NULL CHECK(provider IN ('google','apple')), external_id TEXT NOT NULL,
         PRIMARY KEY(user_id,provider,external_id)
       );
-      CREATE TABLE IF NOT EXISTS calendar_oauth_states (
-        state TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at INTEGER NOT NULL
+      CREATE TABLE IF NOT EXISTS calendar_oauth_transactions (
+        state_hash TEXT PRIMARY KEY, nonce_hash TEXT NOT NULL, session_hash TEXT NOT NULL,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS notifications (
         id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -144,6 +145,9 @@ export function database() {
     db.exec("CREATE INDEX IF NOT EXISTS items_series ON items(series_root_id, occurrence_date)");
     const connectionColumns = new Set(db.prepare("PRAGMA table_info(calendar_connections)").all().map((column) => String(column.name)));
     if (!connectionColumns.has("expires_at")) db.exec("ALTER TABLE calendar_connections ADD COLUMN expires_at INTEGER");
+    // OAuth transactions are short-lived. Discard legacy state-only transactions so they cannot
+    // be completed after upgrading to the browser-bound flow.
+    db.exec("DROP TABLE IF EXISTS calendar_oauth_states");
     const copyColumns = new Set(db.prepare("PRAGMA table_info(calendar_copies)").all().map((column) => String(column.name)));
     if (!copyColumns.has("resource_uid")) db.exec("ALTER TABLE calendar_copies ADD COLUMN resource_uid TEXT");
     const attachmentColumns = new Set(db.prepare("PRAGMA table_info(attachments)").all().map((column) => String(column.name)));
