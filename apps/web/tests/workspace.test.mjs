@@ -166,12 +166,13 @@ function escapeXml(value) {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
-function appleCalendarFixture({ uid, date = "20270114", timestamp = "20261013T120000Z", recurrence = null, exceptionUid = uid } = {}) {
+function appleCalendarFixture({ uid, date = "20270114", timestamp = "20261013T120000Z", recurrence = null, exceptionUid = uid, exdate = null } = {}) {
   const lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//FileTasks Test//Calendar//EN", "BEGIN:VEVENT",
     `UID:${uid}`, `DTSTAMP:${timestamp}`, `DTSTART;VALUE=DATE:${date}`, "SUMMARY:Imported calendar event"];
   if (recurrence) lines.push(`RRULE:${recurrence}`);
+  if (exdate) lines.push(exdate);
   lines.push("END:VEVENT");
-  if (recurrence) lines.push("BEGIN:VEVENT", `UID:${exceptionUid}`, `DTSTAMP:${timestamp}`, `RECURRENCE-ID;VALUE=DATE:${date}`,
+  if (recurrence && exceptionUid) lines.push("BEGIN:VEVENT", `UID:${exceptionUid}`, `DTSTAMP:${timestamp}`, `RECURRENCE-ID;VALUE=DATE:${date}`,
     `DTSTART;VALUE=DATE:${date}`, "SUMMARY:Imported calendar exception", "END:VEVENT");
   lines.push("END:VCALENDAR");
   return `${lines.join("\r\n")}\r\n`;
@@ -3101,6 +3102,153 @@ test("Apple ambiguous fallback start remains visibly blocked", async () => {
     await request(`/api/items/${item.id}`,{token:owner.token,method:"PATCH",body:{details:"Changed"}});
     assert.equal(appleEvents.get(path),original);
   } finally { appleEvents.clear(); }
+});
+
+test("Google first-Monday, yearly leap-day, and EXDATE recurrence imports round-trip through Apple", async () => {
+  const owner = await account();
+  const auth = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, { cookie: auth.cookie, redirect: "manual" })).status, 303);
+  assert.equal((await request("/api/calendars", { token: owner.token, method: "POST", body: {
+    username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
+  } })).status, 201);
+  googleEvents.set("first-monday-google", { id:"first-monday-google",summary:"First Monday",start:{date:"2027-01-04"},end:{date:"2027-01-05"},
+    recurrence:["RRULE:FREQ=MONTHLY;BYDAY=1MO;UNTIL=20270301","EXDATE;VALUE=DATE:20270201"] });
+  googleEvents.set("leap-day-google", { id:"leap-day-google",summary:"Leap day",start:{date:"2024-02-29"},end:{date:"2024-03-01"},
+    recurrence:["RRULE:FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29;COUNT=2"] });
+  const previousClock = new Date(testClock);
+  try {
+    await setTestClock("2027-03-01T12:00:00.000Z");
+    const firstSync = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+    assert.equal(firstSync.status, 200, await firstSync.clone().text());
+    let items = (await (await request("/api/items", { token: owner.token })).json()).items;
+    const monday = items.find((item) => item.title === "First Monday" && item.seriesId === item.id);
+    const leap = items.find((item) => item.title === "Leap day" && item.seriesId === item.id);
+    assert.ok(monday && leap);
+    assert.deepEqual(items.filter((item) => item.seriesId === monday.id).map((item) => item.scheduledDate).sort(), ["2027-01-04","2027-03-01"]);
+    assert.deepEqual(items.filter((item) => item.seriesId === leap.id).map((item) => item.scheduledDate).sort(), ["2024-02-29","2028-02-29"],
+      "invalid intervening February 29 candidates must be skipped without consuming COUNT");
+    assert.deepEqual(monday.recurrence.ordinalWeekday,{ordinal:1,weekday:1});
+    assert.equal(monday.calendarSync.find((status) => status.provider === "google")?.state,"supported");
+
+    const file = (await (await request("/api/files", { token: owner.token, method: "POST", body:{name:"Series file",url:"https://example.com/series"} })).json()).file;
+    assert.equal((await request(`/api/files/${file.id}/attachments`,{token:owner.token,method:"POST",body:{itemId:monday.id,scope:"series"}})).status,201);
+    const beforeIds = items.filter((item) => item.seriesId === monday.id).map(({id,scheduledDate}) => [id,scheduledDate]);
+    const projectionEdit = await request(`/api/items/${monday.id}`,{token:owner.token,method:"PATCH",body:{title:"First Monday edited",details:"Keep source rule",scope:"series",
+      recurrence:{interval:1,unit:"months",end:{type:"date",date:"2027-03-01"}}}});
+    assert.equal(projectionEdit.status,200,await projectionEdit.clone().text());
+    const edited = (await projectionEdit.json()).item;
+    assert.deepEqual(edited.recurrence.ordinalWeekday,{ordinal:1,weekday:1},"the native simple projection must retain stored rich BYDAY data");
+    assert.equal(edited.calendarSync.find((status) => status.provider === "google")?.recurrenceEdited,false);
+    items = (await (await request("/api/items",{token:owner.token})).json()).items;
+    assert.deepEqual(items.filter((item) => item.seriesId === monday.id).map(({id,scheduledDate}) => [id,scheduledDate]),beforeIds);
+    assert.ok(items.filter((item) => item.seriesId === monday.id).every((item) => item.files.some(({id}) => id === file.id)));
+
+    const repeated = await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    assert.equal(repeated.status,200,await repeated.clone().text());
+    const repeatedBody=await repeated.json();
+    assert.equal(googleEvents.get("first-monday-google").recurrence[1],"EXDATE;VALUE=DATE:20270201");
+    const appleCopies = [...appleEvents.values()];
+    assert.ok(appleCopies.some((ics) => ics.includes("RRULE:FREQ=MONTHLY;INTERVAL=1;BYDAY=1MO;UNTIL=20270301")
+      && ics.includes("EXDATE;VALUE=DATE:20270201") && ics.includes("SUMMARY:First Monday edited")),appleCopies.join("\n---\n"));
+    assert.ok(appleCopies.some((ics) => ics.includes("RRULE:FREQ=YEARLY;INTERVAL=1;BYMONTH=2;BYMONTHDAY=29;COUNT=2")));
+    assert.deepEqual(repeatedBody.syncLimitations,[]);
+    const changedRule=await request(`/api/items/${leap.id}`,{token:owner.token,method:"PATCH",body:{scope:"series",
+      recurrence:{interval:1,unit:"years",end:{type:"count",count:3}}}});
+    assert.equal(changedRule.status,200,await changedRule.clone().text());
+    assert.equal((await changedRule.json()).item.calendarSync.find((status)=>status.provider==="google")?.recurrenceEdited,true);
+    const retainedRule=[...googleEvents.get("first-monday-google").recurrence];
+    googleEvents.set("first-monday-cancelled-exception",{id:"first-monday-cancelled-exception",recurringEventId:"first-monday-google",
+      originalStartTime:{date:"2027-03-01"},status:"cancelled"});
+    const destructiveSync=await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    assert.equal(destructiveSync.status,200,await destructiveSync.clone().text());
+    assert.deepEqual(googleEvents.get("first-monday-google").recurrence,retainedRule,"a detached provider exception must keep the source recurrence untouched");
+    const limitedRoot=(await (await request(`/api/items/${monday.id}`,{token:owner.token})).json()).item;
+    assert.equal(limitedRoot.calendarSync.find((status)=>status.provider==="google")?.state,"limited");
+    assert.ok((await destructiveSync.json()).syncLimitations.some((entry)=>entry.itemId===monday.id));
+  } finally { await setTestClock(previousClock); googleEvents.clear(); appleEvents.clear(); }
+});
+
+test("monthly fifth weekdays skip nonexistent months and explicit rich recurrence edits apply", async () => {
+  const owner = await account();
+  const auth = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, { cookie: auth.cookie, redirect: "manual" })).status, 303);
+  googleEvents.set("fifth-monday-google", { id:"fifth-monday-google",summary:"Fifth Monday",start:{date:"2024-01-29"},end:{date:"2024-01-30"},
+    recurrence:["RRULE:FREQ=MONTHLY;BYDAY=5MO;COUNT=2"] });
+  try {
+    const sync = await request("/api/calendars/sync", {token:owner.token,method:"POST"});
+    assert.equal(sync.status,200,await sync.clone().text());
+    let items=(await (await request("/api/items",{token:owner.token})).json()).items;
+    const root=items.find((item)=>item.seriesId===item.id && item.scheduledDate==="2024-01-29");
+    assert.ok(root);
+    assert.deepEqual(items.filter((item)=>item.seriesId===root.id).map((item)=>item.scheduledDate).sort(),["2024-01-29","2024-04-29"],
+      "a missing fifth Monday in February must be skipped without consuming COUNT");
+
+    const edit=await request(`/api/items/${root.id}`,{token:owner.token,method:"PATCH",body:{scope:"series",scheduledDate:"2027-01-11",
+      recurrence:{interval:1,unit:"months",ordinalWeekday:{ordinal:2,weekday:1},end:{type:"count",count:2}}}});
+    assert.equal(edit.status,200,await edit.clone().text());
+    const updated=(await edit.json()).item;
+    assert.deepEqual(updated.recurrence.ordinalWeekday,{ordinal:2,weekday:1},"explicit rich fields must be honored");
+    items=(await (await request("/api/items",{token:owner.token})).json()).items;
+    assert.deepEqual(items.filter((item)=>item.seriesId===root.id).map((item)=>item.scheduledDate).sort(),["2027-01-11","2027-02-08"]);
+    assert.equal(googleEvents.get("fifth-monday-google").recurrence[0],"RRULE:FREQ=MONTHLY;BYDAY=5MO;COUNT=2",
+      "the edited recurrence is limited and must not overwrite the original provider rule");
+  } finally { googleEvents.clear(); }
+});
+
+test("Apple first-Monday and leap-day rules with EXDATE import and retain Google copies", async () => {
+  const owner = await account();
+  const auth = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`,{cookie:auth.cookie,redirect:"manual"})).status,303);
+  assert.equal((await request("/api/calendars",{token:owner.token,method:"POST",body:{username:"person@example.com",password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/calendar/`}})).status,201);
+  const mondayPath="/apple/calendar/first-monday-apple.ics";
+  const leapPath="/apple/calendar/leap-day-apple.ics";
+  appleEvents.set(mondayPath,appleCalendarFixture({uid:"first-monday-apple",date:"20270104",recurrence:"FREQ=MONTHLY;BYDAY=1MO;COUNT=3",exdate:"EXDATE;VALUE=DATE:20270201",exceptionUid:null}));
+  appleEvents.set(leapPath,appleCalendarFixture({uid:"leap-day-apple",date:"20240229",recurrence:"FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29;COUNT=2",exceptionUid:null}));
+  const previousClock = new Date(testClock);
+  try {
+    await setTestClock("2027-03-01T12:00:00.000Z");
+    const sync = await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    assert.equal(sync.status,200,await sync.text());
+    const items = (await (await request("/api/items",{token:owner.token})).json()).items;
+    const monday=items.find((item)=>item.title==="Imported calendar event" && item.seriesId===item.id && item.scheduledDate==="2027-01-04" && item.recurrence?.ordinalWeekday);
+    const leap=items.find((item)=>item.seriesId===item.id && item.scheduledDate==="2024-02-29" && item.recurrence?.monthDay===29);
+    assert.ok(monday && leap);
+    assert.deepEqual(monday.recurrence.ordinalWeekday,{ordinal:1,weekday:1});
+    assert.equal(monday.calendarSync.find((status)=>status.provider==="apple")?.state,"supported");
+    assert.equal(items.some((item)=>item.seriesId===monday.id && item.scheduledDate==="2027-02-01"),false,"EXDATE must hide matching occurrence");
+    assert.deepEqual(items.filter((item)=>item.seriesId===leap.id).map((item)=>item.scheduledDate).sort(),["2024-02-29","2028-02-29"]);
+    const beforeIds=items.filter((item)=>item.seriesId===monday.id).map(({id,scheduledDate})=>[id,scheduledDate]);
+    const edit=await request(`/api/items/${monday.id}`,{token:owner.token,method:"PATCH",body:{details:"Edited through FileTasks",scope:"series"}});
+    assert.equal(edit.status,200,await edit.text());
+    const repeated=await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    assert.equal(repeated.status,200,await repeated.text());
+    const refreshed=(await (await request("/api/items",{token:owner.token})).json()).items;
+    assert.deepEqual(refreshed.filter((item)=>item.seriesId===monday.id).map(({id,scheduledDate})=>[id,scheduledDate]),beforeIds);
+    assert.equal(appleEvents.get(mondayPath).includes("RRULE:FREQ=MONTHLY;BYDAY=1MO;COUNT=3"),true);
+    assert.equal(appleEvents.get(mondayPath).includes("EXDATE;VALUE=DATE:20270201"),true);
+    assert.ok([...googleEvents.values()].some((event)=>event.recurrence?.some((line)=>line.includes("BYDAY=1MO"))
+      && event.recurrence?.some((line)=>line.includes("EXDATE;VALUE=DATE:20270201"))));
+    assert.ok([...googleEvents.values()].some((event)=>event.recurrence?.some((line)=>line.includes("BYMONTH=2;BYMONTHDAY=29"))));
+  } finally { await setTestClock(previousClock); googleEvents.clear(); appleEvents.clear(); }
+});
+
+test("details-only series edits preserve Occurrence and Attachment identities", async () => {
+  const owner=await account();
+  const created=await request("/api/items",{token:owner.token,method:"POST",body:{kind:"task",title:"Identity task",details:"Before",scheduledDate:"2026-11-02",
+    recurrence:{interval:1,unit:"weeks",weekdays:[1],end:{type:"count",count:4}}}});
+  const root=(await created.json()).item;
+  let items=(await (await request("/api/items",{token:owner.token})).json()).items.filter((item)=>item.seriesId===root.id).sort((a,b)=>a.occurrenceDate.localeCompare(b.occurrenceDate));
+  const completed=items[2];
+  assert.equal((await request(`/api/items/${completed.id}`,{token:owner.token,method:"PATCH",body:{completed:true,scope:"occurrence"}})).status,200);
+  assert.equal((await request(`/api/items/${items[1].id}?scope=occurrence`,{token:owner.token,method:"DELETE"})).status,204);
+  const file=(await (await request("/api/files",{token:owner.token,method:"POST",body:{name:"Identity file",url:"https://example.com/identity"}})).json()).file;
+  assert.equal((await request(`/api/files/${file.id}/attachments`,{token:owner.token,method:"POST",body:{itemId:root.id,scope:"series"}})).status,201);
+  items=(await (await request("/api/items",{token:owner.token})).json()).items.filter((item)=>item.seriesId===root.id).sort((a,b)=>a.occurrenceDate.localeCompare(b.occurrenceDate));
+  const before=items.map(({id,occurrenceDate,completed,files})=>({id,occurrenceDate,completed,fileIds:files.map(({id})=>id)}));
+  const update=await request(`/api/items/${root.id}`,{token:owner.token,method:"PATCH",body:{title:"Identity task edited",details:"After",scope:"series"}});
+  assert.equal(update.status,200,await update.text());
+  const afterItems=(await (await request("/api/items",{token:owner.token})).json()).items.filter((item)=>item.seriesId===root.id).sort((a,b)=>a.occurrenceDate.localeCompare(b.occurrenceDate));
+  assert.deepEqual(afterItems.map(({id,occurrenceDate,completed,files})=>({id,occurrenceDate,completed,fileIds:files.map(({id})=>id)})),before);
 });
 
 test("oversized imported text and unsupported recurrence preserve provider originals", async () => {

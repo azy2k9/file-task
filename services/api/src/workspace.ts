@@ -62,13 +62,39 @@ function parseRecurrence(value: unknown, scheduledDate: string | null): Recurren
   else throw new HttpError(400, "Choose a valid Recurrence end date or occurrence count.");
   if (normalizedEnd.type === "date" && normalizedEnd.date < scheduledDate) throw new HttpError(400, "The Recurrence end date must be on or after its first Occurrence.");
   let weekdays: number[] | undefined;
+  let ordinalWeekday: RecurrenceRule["ordinalWeekday"];
+  let month: number | undefined;
+  let monthDay: number | undefined;
   if (rule.unit === "weeks") {
     if (!Array.isArray(rule.weekdays) || rule.weekdays.length === 0 || rule.weekdays.some((day) => !Number.isInteger(day) || Number(day) < 0 || Number(day) > 6)) {
       throw new HttpError(400, "Choose at least one weekday for a weekly Recurrence rule.");
     }
     weekdays = [...new Set(rule.weekdays as number[])].sort();
   } else if (rule.weekdays !== undefined) throw new HttpError(400, "Weekday selection is only available for weekly Recurrence rules.");
-  return { interval: Number(rule.interval), unit: rule.unit as RecurrenceRule["unit"], ...(weekdays ? { weekdays } : {}), end: normalizedEnd };
+  if (rule.ordinalWeekday !== undefined) {
+    const ordinal = rule.ordinalWeekday as Record<string, unknown>;
+    if (rule.unit !== "months" || !ordinal || !Number.isInteger(ordinal.ordinal) || ![-5,-4,-3,-2,-1,1,2,3,4,5].includes(Number(ordinal.ordinal))
+      || !Number.isInteger(ordinal.weekday) || Number(ordinal.weekday) < 0 || Number(ordinal.weekday) > 6 || weekdays) {
+      throw new HttpError(400, "Check the monthly weekday Recurrence rule.");
+    }
+    ordinalWeekday = { ordinal:Number(ordinal.ordinal),weekday:Number(ordinal.weekday) };
+  }
+  if (rule.month !== undefined || rule.monthDay !== undefined) {
+    if (rule.unit !== "years" || !Number.isInteger(rule.month) || Number(rule.month) < 1 || Number(rule.month) > 12
+      || !Number.isInteger(rule.monthDay) || Number(rule.monthDay) < 1 || Number(rule.monthDay) > 31 || rule.ordinalWeekday) {
+      throw new HttpError(400, "Check the yearly month and day Recurrence rule.");
+    }
+    month = Number(rule.month); monthDay = Number(rule.monthDay);
+  }
+  return { interval: Number(rule.interval), unit: rule.unit as RecurrenceRule["unit"], ...(weekdays ? { weekdays } : {}),
+    ...(ordinalWeekday ? { ordinalWeekday } : {}), ...(month !== undefined ? { month,monthDay } : {}), end: normalizedEnd };
+}
+
+function sameRecurrenceProjection(a: RecurrenceRule | null, b: RecurrenceRule | null) {
+  if (!a || !b) return a === b;
+  const weekdays = (value: number[] | undefined) => value ? [...new Set(value)].sort((x,y) => x-y) : undefined;
+  return a.interval === b.interval && a.unit === b.unit && JSON.stringify(weekdays(a.weekdays)) === JSON.stringify(weekdays(b.weekdays))
+    && JSON.stringify(a.end) === JSON.stringify(b.end);
 }
 
 function formatDate(date: Date) { return date.toISOString().slice(0, 10); }
@@ -111,7 +137,30 @@ function occurrenceDates(startValue: string, rule: RecurrenceRule, leadDays = 0)
     for (let index = 1; dates.length < (rule.end.type === "count" ? rule.end.count : 10_000); index++) {
       let next: Date;
       if (rule.unit === "days") { next = new Date(start); next.setUTCDate(next.getUTCDate() + index * rule.interval); }
-      else if (rule.unit === "months") next = plusMonths(start, index * rule.interval);
+      else if (rule.unit === "months" && rule.ordinalWeekday) {
+        const monthStart = new Date(Date.UTC(start.getUTCFullYear(),start.getUTCMonth()+index*rule.interval,1));
+        const intendedYear = monthStart.getUTCFullYear();
+        const intendedMonth = monthStart.getUTCMonth();
+        const { ordinal,weekday } = rule.ordinalWeekday;
+        if (ordinal > 0) {
+          monthStart.setUTCDate(1 + ((weekday - monthStart.getUTCDay() + 7) % 7) + (ordinal - 1) * 7);
+        } else {
+          monthStart.setUTCMonth(monthStart.getUTCMonth()+1); monthStart.setUTCDate(0);
+          monthStart.setUTCDate(monthStart.getUTCDate() - ((monthStart.getUTCDay() - weekday + 7) % 7) + (ordinal + 1) * 7);
+        }
+        // A fifth ordinal may not exist. Date setters normalize overflow into an
+        // adjacent month; that candidate must be skipped and must not consume COUNT.
+        if (monthStart.getUTCFullYear() !== intendedYear || monthStart.getUTCMonth() !== intendedMonth) continue;
+        next = monthStart;
+      } else if (rule.unit === "years" && rule.month !== undefined && rule.monthDay !== undefined) {
+        const year = start.getUTCFullYear() + index * rule.interval;
+        if (Date.UTC(year,0,1) > maxDate.getTime()) break;
+        const candidate = new Date(Date.UTC(year,rule.month - 1,rule.monthDay));
+        // RFC recurrence candidates on invalid calendar dates are ignored and do
+        // not consume COUNT.
+        if (candidate.getUTCFullYear() !== year || candidate.getUTCMonth() !== rule.month - 1 || candidate.getUTCDate() !== rule.monthDay) continue;
+        next = candidate;
+      } else if (rule.unit === "months") next = plusMonths(start, index * rule.interval);
       else next = plusMonths(start, index * rule.interval * 12);
       if (next > maxDate) break;
       dates.push(formatDate(next));
@@ -203,17 +252,16 @@ function withFiles(items: WorkspaceItem[], userId: string) {
         limitation = scheduleLimitation;
       }
     }
-    const occurrenceChanged = item.recurrence && Boolean(database().prepare(`SELECT 1 FROM occurrence_exclusions WHERE user_id=? AND series_root_id=?
-      UNION ALL SELECT 1 FROM items WHERE user_id=? AND series_root_id=? AND id<>? AND
+    const importedExcludedDates = new Set<string>(Array.isArray((baseline as { importedExcludedDates?: unknown }).importedExcludedDates)
+      ? (baseline as { importedExcludedDates: string[] }).importedExcludedDates : []);
+    const localExclusion = item.recurrence && database().prepare("SELECT occurrence_date FROM occurrence_exclusions WHERE user_id=? AND series_root_id=?")
+      .all(userId,rootId).some((excluded) => !importedExcludedDates.has(String(excluded.occurrence_date)));
+    const occurrenceChanged = item.recurrence && (localExclusion || Boolean(database().prepare(`SELECT 1 FROM items WHERE user_id=? AND series_root_id=? AND id<>? AND
       (scheduled_date IS NOT occurrence_date OR scheduled_time IS NOT ? OR title IS NOT ? OR details IS NOT ?) LIMIT 1`)
-      .get(userId,rootId,userId,rootId,rootId,item.scheduledTime,item.title,item.details));
+      .get(userId,rootId,rootId,item.scheduledTime,item.title,item.details)));
     if (occurrenceChanged && state === "supported") {
       state = "limited"; limitationCode = "occurrence-edited";
       limitation = "This imported Event has edited or deleted Occurrences. Calendar sync is paused to preserve its original recurrence.";
-    }
-    if (item.recurrence && state === "supported") {
-      state = "limited"; limitationCode = "unsupported-recurrence";
-      limitation = "Imported recurring Events are paused to preserve external exceptions.";
     }
     if (database().prepare("SELECT 1 FROM google_inventory_pending WHERE user_id=? AND item_id=?").get(userId,rootId)) {
       state = "limited"; limitationCode = "inventory-pending";
@@ -284,7 +332,7 @@ export function calendarSyncLimitations(userId: string) {
   const limitations = listItems(userId).flatMap((item) => {
     const limitations = item.calendarSync.filter((status) => status.state === "limited")
       .map((status) => ({ itemId: item.id, title: item.title, provider: status.provider, message: status.limitation ?? "This Event cannot be synchronized safely." }));
-    if (item.recurrence && connectedProviders.has("apple") && item.calendarSync.some((status) => status.provider === "google" && status.state === "supported")) {
+    if (item.recurrence && item.scheduledTime && connectedProviders.has("apple") && item.calendarSync.some((status) => status.provider === "google" && status.state === "supported")) {
       limitations.push({itemId:item.id,title:item.title,provider:"apple",message:"This recurring Event uses a Google timezone rule. Apple export is paused because its daylight-saving behavior cannot be preserved safely yet."});
     }
     return limitations;
@@ -318,8 +366,8 @@ export function listItemsForCalendarSync(userId: string) {
 
 export function getItem(userId: string, id: string) {
   const row = database().prepare(`SELECT i.*, root.recurrence_json AS root_recurrence_json FROM items i
-    LEFT JOIN items root ON root.id=i.series_root_id WHERE i.user_id=? AND i.id=? AND NOT EXISTS(
-      SELECT 1 FROM occurrence_exclusions x WHERE x.user_id=i.user_id AND x.series_root_id=i.series_root_id AND x.occurrence_date=i.occurrence_date)`).get(userId, id);
+    LEFT JOIN items root ON root.id=i.series_root_id WHERE i.user_id=? AND i.id=? AND (i.id=i.series_root_id OR NOT EXISTS(
+      SELECT 1 FROM occurrence_exclusions x WHERE x.user_id=i.user_id AND x.series_root_id=i.series_root_id AND x.occurrence_date=i.occurrence_date))`).get(userId, id);
   if (!row) throw new HttpError(404, "This item could not be found.");
   return withFiles([fromRow(row)], userId)[0];
 }
@@ -339,7 +387,12 @@ function validate(body: Record<string, unknown>, existing?: WorkspaceItem) {
   if (scheduledDate !== null && !validDate(scheduledDate)) throw new HttpError(400, "Choose a valid calendar date.");
   if (scheduledTime !== null && (typeof scheduledTime !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(scheduledTime) || !scheduledDate)) throw new HttpError(400, "A valid time requires a date.");
   if (body.completed !== undefined && (kind !== "task" || typeof body.completed !== "boolean")) throw new HttpError(400, "Only Tasks can be marked complete.");
-  const recurrence = body.recurrence === undefined ? existing?.recurrence ?? null : parseRecurrence(body.recurrence, scheduledDate as string | null);
+  let recurrence = body.recurrence === undefined ? existing?.recurrence ?? null : parseRecurrence(body.recurrence, scheduledDate as string | null);
+  // Existing native clients only round-trip the simple recurrence projection. Keep
+  // the persisted rich pattern when that projection has not actually changed.
+  const recurrenceBody = body.recurrence && typeof body.recurrence === "object" ? body.recurrence as Record<string,unknown> : null;
+  const includesRichRule = recurrenceBody && ["ordinalWeekday","month","monthDay"].some((key) => Object.hasOwn(recurrenceBody,key));
+  if (body.recurrence !== undefined && !includesRichRule && existing?.recurrence && recurrence && sameRecurrenceProjection(existing.recurrence,recurrence)) recurrence = existing.recurrence;
   const reminders = body.reminders === undefined ? existing?.reminders ?? [] : parseReminders(body.reminders);
   const now = new Date().toISOString();
   return { id: existing?.id ?? randomUUID(), kind: kind as "task" | "event", title: title.trim(), details, scheduledDate: scheduledDate as string | null,
@@ -403,9 +456,11 @@ export function saveItem(userId: string, body: Record<string, unknown>, id?: str
     }
     const wholeSeries = scope === "series" || (scope === "following" && id === series);
     const root = db.prepare("SELECT scheduled_date FROM items WHERE user_id=? AND id=?").get(userId,series);
-    const remindersOnly = scope === "series" && body.scheduledDate === undefined && body.scheduledTime === undefined && body.recurrence === undefined;
-    const seriesStart = remindersOnly ? String(root?.scheduled_date ?? item.scheduledDate) : item.scheduledDate;
-    const dates = wholeSeries && item.recurrence && seriesStart
+    const scheduleUnchanged = item.scheduledDate === existing?.scheduledDate && item.scheduledTime === existing?.scheduledTime;
+    const recurrenceUnchanged = sameRecurrence(existing?.recurrence ?? null,item.recurrence);
+    const preservesOccurrenceIdentity = scope === "series" && scheduleUnchanged && recurrenceUnchanged;
+    const seriesStart = preservesOccurrenceIdentity ? String(root?.scheduled_date ?? item.scheduledDate) : item.scheduledDate;
+    const dates = wholeSeries && !preservesOccurrenceIdentity && item.recurrence && seriesStart
       ? occurrenceDates(seriesStart, item.recurrence, reminderLeadDays(JSON.stringify(item.reminders)))
       : [];
     if (dates.length > 0) {

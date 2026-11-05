@@ -34,6 +34,10 @@ export interface WorkspaceItem {
 export type ReminderRule = { delivery: "notification" | "email"; amount: number; unit: "minutes" | "hours" | "days" | "weeks" | "months"; time: string };
 export type RecurrenceRule = {
   interval: number; unit: "days" | "weeks" | "months" | "years"; weekdays?: number[];
+  /** RFC BYDAY ordinal for a monthly rule, such as the first Monday. */
+  ordinalWeekday?: { ordinal: number; weekday: number };
+  /** RFC BYMONTH and BYMONTHDAY pair for a yearly rule. */
+  month?: number; monthDay?: number;
   end: { type: "never" } | { type: "date"; date: string } | { type: "count"; count: number };
 };
 export type ItemInput = Pick<WorkspaceItem, "kind" | "title" | "details" | "scheduledDate" | "scheduledTime"> & {
@@ -45,6 +49,9 @@ export function sameRecurrence(a: RecurrenceRule | null, b: RecurrenceRule | nul
   const canonical = (rule: RecurrenceRule | null) => rule === null ? null : {
     interval:rule.interval, unit:rule.unit,
     ...(rule.weekdays ? {weekdays:[...new Set(rule.weekdays)].sort((x,y) => x-y)} : {}), end:rule.end,
+    ...(rule.ordinalWeekday ? {ordinalWeekday:rule.ordinalWeekday} : {}),
+    ...(rule.month !== undefined ? {month:rule.month} : {}),
+    ...(rule.monthDay !== undefined ? {monthDay:rule.monthDay} : {}),
   };
   return JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
 }
