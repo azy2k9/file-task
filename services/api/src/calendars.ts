@@ -35,6 +35,7 @@ type ImportMetadataInput = {
   limitationMessage?: string;
   sourcePayload?: Record<string, unknown>;
   sourceIcs?: string;
+  excludedDates?: string[];
 };
 type ImportMetadataRow = {
   user_id: string;
@@ -503,7 +504,9 @@ function googleWritableExtras(metadata: ImportMetadataRow | null) {
 function rruleFor(rule: NonNullable<EventItem["recurrence"]>, dateOnly = false, untilUsesZulu = true) {
   const freq = { days: "DAILY", weeks: "WEEKLY", months: "MONTHLY", years: "YEARLY" }[rule.unit];
   const parts = [`FREQ=${freq}`,`INTERVAL=${rule.interval}`];
-  if (rule.weekdays?.length) parts.push(`BYDAY=${rule.weekdays.map((day) => ["SU","MO","TU","WE","TH","FR","SA"][day]).join(",")}`);
+  if (rule.ordinalWeekday) parts.push(`BYDAY=${rule.ordinalWeekday.ordinal}${["SU","MO","TU","WE","TH","FR","SA"][rule.ordinalWeekday.weekday]}`);
+  else if (rule.weekdays?.length) parts.push(`BYDAY=${rule.weekdays.map((day) => ["SU","MO","TU","WE","TH","FR","SA"][day]).join(",")}`);
+  if (rule.month !== undefined && rule.monthDay !== undefined) parts.push(`BYMONTH=${rule.month}`,`BYMONTHDAY=${rule.monthDay}`);
   if (rule.end.type === "count") parts.push(`COUNT=${rule.end.count}`);
   if (rule.end.type === "date") parts.push(`UNTIL=${compactDate(rule.end.date)}${dateOnly ? "" : `T235959${untilUsesZulu ? "Z" : ""}`}`);
   return parts.join(";");
@@ -559,7 +562,13 @@ function safeToSyncImportedEvent(userId: string, item: EventItem, destination: P
 
 function importedOccurrenceChanges(userId: string, item: EventItem, events: EventItem[]) {
   if (!item.calendarSync.length || !item.recurrence) return false;
-  return calendarExclusions(userId,item.id).length > 0 || events.some((occurrence) => occurrence.seriesId === item.id && occurrence.id !== item.id
+  const importedExclusions = new Set<string>();
+  for (const row of database().prepare("SELECT baseline_json FROM calendar_import_metadata WHERE user_id=? AND item_id=?").all(userId,item.id)) {
+    const baseline = JSON.parse(String(row.baseline_json)) as {importedExcludedDates?:unknown};
+    if (Array.isArray(baseline.importedExcludedDates)) for (const date of baseline.importedExcludedDates) if (typeof date === "string") importedExclusions.add(date);
+  }
+  const hasLocalExclusion = calendarExclusions(userId,item.id).some((date) => !importedExclusions.has(date));
+  return hasLocalExclusion || events.some((occurrence) => occurrence.seriesId === item.id && occurrence.id !== item.id
     && (occurrence.scheduledDate !== occurrence.occurrenceDate || occurrence.scheduledTime !== item.scheduledTime
       || occurrence.title !== item.title || occurrence.details !== item.details));
 }
@@ -716,6 +725,7 @@ function recordImportMetadata(userId: string, provider: Provider, externalId: st
     userId,provider,externalId,itemId,metadata.accountId,metadata.sourcePayload ? JSON.stringify(metadata.sourcePayload) : null,
     metadata.sourceIcs ?? null,JSON.stringify(metadata.timing),JSON.stringify({
       scheduledDate: baseline.scheduledDate, scheduledTime: baseline.scheduledTime, recurrence: baseline.recurrence, title: baseline.title, details: baseline.details,
+      ...(metadata.excludedDates?.length ? { importedExcludedDates: metadata.excludedDates } : {}),
     }),metadata.state,metadata.limitationCode ?? null,metadata.limitationMessage ?? null,now().toISOString(),scope);
 }
 
@@ -834,7 +844,9 @@ function parseGoogleTiming(event: Record<string, unknown>) {
 
 function recurrenceFromRRule(input: string | null, startDate: string): RecurrenceRule | null {
   if (!input) return null;
-  const ruleText = input.replace(/^RRULE:/i,""); const values = Object.fromEntries(ruleText.split(";").map((part) => { const index=part.indexOf("="); return index<0?[part,""]:[part.slice(0,index).toUpperCase(),part.slice(index+1)]; }));
+  const ruleText = input.replace(/^RRULE:/i,""); const pairs = ruleText.split(";").map((part) => { const index=part.indexOf("="); return index<0?[part.toUpperCase(),""]:[part.slice(0,index).toUpperCase(),part.slice(index+1).toUpperCase()]; });
+  if (pairs.some(([key]) => !key) || new Set(pairs.map(([key]) => key)).size !== pairs.length) return null;
+  const values = Object.fromEntries(pairs);
   const units: Record<string,RecurrenceRule["unit"]> = { DAILY:"days",WEEKLY:"weeks",MONTHLY:"months",YEARLY:"years" };
   const unit = units[values.FREQ]; if (!unit) return null;
   const interval = Number(values.INTERVAL ?? 1); if (!Number.isInteger(interval) || interval < 1 || interval > 100) return null;
@@ -842,10 +854,18 @@ function recurrenceFromRRule(input: string | null, startDate: string): Recurrenc
   if (values.COUNT && Number.isInteger(Number(values.COUNT))) end = { type:"count",count:Number(values.COUNT) };
   else if (values.UNTIL) { const match=values.UNTIL.match(/^(\d{4})(\d{2})(\d{2})/); if (match) end = { type:"date",date:`${match[1]}-${match[2]}-${match[3]}` }; }
   const dayNumbers: Record<string,number> = { SU:0,MO:1,TU:2,WE:3,TH:4,FR:5,SA:6 };
-  const weekdays = unit === "weeks" ? (values.BYDAY ? values.BYDAY.split(",").map((day: string) => dayNumbers[day.slice(-2)]).filter((day: number | undefined): day is number => day !== undefined) : [new Date(`${startDate}T00:00:00Z`).getUTCDay()]) : undefined;
+  const ordinalMatch = unit === "months" ? values.BYDAY?.match(/^([+-]?[1-5])(SU|MO|TU|WE|TH|FR|SA)$/) : null;
+  const ordinalWeekday = ordinalMatch ? { ordinal:Number(ordinalMatch[1]),weekday:dayNumbers[ordinalMatch[2]] } : undefined;
+  const weekdays = unit === "weeks" ? (values.BYDAY ? values.BYDAY.split(",").map((day: string) => dayNumbers[day]).filter((day: number | undefined): day is number => day !== undefined) : [new Date(`${startDate}T00:00:00Z`).getUTCDay()]) : undefined;
+  const month = unit === "years" && /^\d{1,2}$/.test(values.BYMONTH ?? "") ? Number(values.BYMONTH) : undefined;
+  const monthDay = unit === "years" && /^\d{1,2}$/.test(values.BYMONTHDAY ?? "") ? Number(values.BYMONTHDAY) : undefined;
+  if ((values.BYDAY && unit === "months" && !ordinalWeekday)
+    || (unit === "years" && (values.BYMONTH !== undefined || values.BYMONTHDAY !== undefined)
+      && (month === undefined || month < 1 || month > 12 || monthDay === undefined || monthDay < 1 || monthDay > 31))) return null;
   if (end.type === "count" && (end.count < 1 || end.count > 10_000)) return null;
-  if (end.type === "date" && end.date < startDate) return null;
-  return { interval,unit,...(weekdays?.length ? {weekdays} : {}),end };
+  if (end.type === "date" && (!validDate(end.date) || end.date < startDate)) return null;
+  return { interval,unit,...(weekdays?.length ? {weekdays} : {}),...(ordinalWeekday ? {ordinalWeekday} : {}),
+    ...(month !== undefined && monthDay !== undefined ? {month,monthDay} : {}),end };
 }
 
 function recurrenceSupport(input: string | null, startDate: string) {
@@ -856,13 +876,19 @@ function recurrenceSupport(input: string | null, startDate: string) {
     return index < 0 ? [part.toUpperCase(),""] : [part.slice(0,index).toUpperCase(),part.slice(index+1).toUpperCase()];
   });
   const values = Object.fromEntries(parts);
-  const allowed = new Set(["FREQ","INTERVAL","COUNT","UNTIL","BYDAY"]);
+  const allowed = new Set(["FREQ","INTERVAL","COUNT","UNTIL","BYDAY","BYMONTH","BYMONTHDAY"]);
   const weeklyDays = values.BYDAY?.split(",") ?? [];
   const simpleDays = weeklyDays.every((day: string) => /^(SU|MO|TU|WE|TH|FR|SA)$/.test(day));
+  const monthlyDay = !values.BYDAY || /^[+-]?[1-5](SU|MO|TU|WE|TH|FR|SA)$/.test(values.BYDAY);
+  const validYearlyPair = values.FREQ !== "YEARLY" || ((!values.BYMONTH && !values.BYMONTHDAY)
+    || (/^\d{1,2}$/.test(values.BYMONTH ?? "") && Number(values.BYMONTH) >= 1 && Number(values.BYMONTH) <= 12
+      && /^\d{1,2}$/.test(values.BYMONTHDAY ?? "") && Number(values.BYMONTHDAY) >= 1 && Number(values.BYMONTHDAY) <= 31));
   const simpleUntil = !values.UNTIL || /^\d{8}$/.test(values.UNTIL);
-  const supported = parts.every(([key]) => allowed.has(key)) && Boolean(values.FREQ)
+  const supported = parts.every(([key]) => allowed.has(key)) && new Set(parts.map(([key]) => key)).size === parts.length && Boolean(values.FREQ)
     && !(values.COUNT && values.UNTIL) && simpleUntil
-    && (!values.BYDAY || (values.FREQ === "WEEKLY" && simpleDays))
+    && (!values.BYMONTH || values.FREQ === "YEARLY") && (!values.BYMONTHDAY || values.FREQ === "YEARLY")
+    && (!values.BYDAY || (values.FREQ === "WEEKLY" && simpleDays) || (values.FREQ === "MONTHLY" && monthlyDay))
+    && (values.FREQ !== "YEARLY" || validYearlyPair) && !(values.FREQ === "MONTHLY" && (values.BYMONTH || values.BYMONTHDAY))
     && !(values.COUNT && !/^\d+$/.test(values.COUNT));
   if (!supported) return { recurrence:null, state:"limited" as const,
     limitationCode:"unsupported-recurrence", limitationMessage:"This imported Event uses a Recurrence rule FileTasks cannot represent yet. Its original calendar data is preserved and sync is paused." };
@@ -870,6 +896,45 @@ function recurrenceSupport(input: string | null, startDate: string) {
   if (input && !recurrence) return { recurrence:null, state:"limited" as const,
     limitationCode:"unsupported-recurrence", limitationMessage:"This imported Event uses a Recurrence rule FileTasks cannot represent yet. Its original calendar data is preserved and sync is paused." };
   return { recurrence, state:"supported" as const };
+}
+
+function isIssue20Recurrence(rule: RecurrenceRule | null) {
+  return Boolean(rule?.ordinalWeekday || (rule?.unit === "years" && rule.month !== undefined && rule.monthDay !== undefined));
+}
+
+function googleExclusionDates(lines: string[], event: {start?:{date?:string;dateTime?:string;timeZone?:string}}) {
+  const exclusions = lines.filter((line) => /^EXDATE(?:;[^:]*)?:/i.test(line));
+  if (!exclusions.length) return [] as string[];
+  const allDay = typeof event.start?.date === "string";
+  const sourceStart = event.start?.dateTime?.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/i);
+  const sourceZone = event.start?.timeZone ?? (sourceStart?.[3]?.toUpperCase() === "Z" ? "UTC" : undefined);
+  if (!allDay && (!sourceStart || !sourceZone || !validTimeZone(sourceZone))) return null;
+  const dates: string[] = [];
+  for (const line of exclusions) {
+    const match = line.match(/^EXDATE(?:;([^:]*))?:(.*)$/i);
+    if (!match) return null;
+    const params = Object.fromEntries((match[1] ?? "").split(";").filter(Boolean).map((part) => {
+      const index=part.indexOf("="); return index < 0 ? [part.toUpperCase(),""] : [part.slice(0,index).toUpperCase(),part.slice(index+1).replace(/^"|"$/g,"")];
+    }));
+    if (allDay) {
+      if (params.VALUE?.toUpperCase() !== "DATE" || params.TZID) return null;
+      for (const value of match[2].split(",")) {
+        const dateMatch=value.match(/^(\d{4})(\d{2})(\d{2})$/); if (!dateMatch) return null;
+        const date=`${dateMatch[1]}-${dateMatch[2]}-${dateMatch[3]}`; if (!validDate(date)) return null; dates.push(date);
+      }
+    } else {
+      if (params.VALUE || (params.TZID ? params.TZID !== sourceZone : sourceZone !== "UTC")) return null;
+      for (const value of match[2].split(",")) {
+        const valueMatch=value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z?)$/i); if (!valueMatch) return null;
+        const date=`${valueMatch[1]}-${valueMatch[2]}-${valueMatch[3]}`;
+        const time=`${valueMatch[4]}:${valueMatch[5]}:${valueMatch[6]}`;
+        if (!validDate(date) || time !== sourceStart![2] || (sourceZone === "UTC" && valueMatch[7].toUpperCase() !== "Z")
+          || (sourceZone !== "UTC" && valueMatch[7])) return null;
+        dates.push(date);
+      }
+    }
+  }
+  return [...new Set(dates)];
 }
 
 function importEvent(userId: string, title: string, details: string, date: string, time: string | null, recurrence: RecurrenceRule | null = null) {
@@ -900,6 +965,9 @@ function importEventWithIdentity(
     if (sourceMetadata) {
       const persisted = getItem(userId,itemId);
       recordImportMetadata(userId,provider,externalId,itemId,scope,persisted,sourceMetadata);
+    }
+    for (const excludedDate of sourceMetadata?.excludedDates ?? []) {
+      db.prepare("INSERT OR IGNORE INTO occurrence_exclusions(user_id,series_root_id,occurrence_date) VALUES(?,?,?)").run(userId,itemId,excludedDate);
     }
     if (activeConnection) assertActiveScope(activeConnection);
     db.exec("RELEASE calendar_import");
@@ -978,10 +1046,13 @@ async function importGoogleEvents(connection: Connection) {
         const identity = db.prepare("SELECT source_account_id FROM calendar_import_metadata WHERE user_id=? AND provider='google' AND external_id=? AND connection_scope_id=? AND EXISTS (SELECT 1 FROM calendar_imports i WHERE i.user_id=calendar_import_metadata.user_id AND i.provider=calendar_import_metadata.provider AND i.external_id=calendar_import_metadata.external_id AND i.item_id=calendar_import_metadata.item_id AND i.connection_scope_id=calendar_import_metadata.connection_scope_id)").get(connection.user_id,event.id,connection.connection_scope_id);
         if (!identity || identity.source_account_id !== accountId) continue;
         const timing = parseGoogleTiming(event);
-        const recurrence = event.recurrence !== undefined && (!Array.isArray(event.recurrence) || event.recurrence.length > 0);
-        if (timing.state === "limited" || recurrence) {
+        const originalPayload = database().prepare("SELECT source_payload_json FROM calendar_import_metadata WHERE user_id=? AND provider='google' AND external_id=? AND connection_scope_id=?")
+          .get(connection.user_id,event.id,connection.connection_scope_id);
+        const originalRecurrence = originalPayload?.source_payload_json ? (JSON.parse(String(originalPayload.source_payload_json)) as {recurrence?:unknown}).recurrence : undefined;
+        const recurrenceChanged = JSON.stringify(event.recurrence ?? null) !== JSON.stringify(originalRecurrence ?? null);
+        if (timing.state === "limited" || recurrenceChanged) {
           db.prepare(`UPDATE calendar_import_metadata SET state='limited', limitation_code=?, limitation_message=? WHERE user_id=? AND provider='google' AND source_account_id=? AND external_id=? AND connection_scope_id=?`)
-            .run(recurrence ? "unsupported-recurrence" : (timing.limitationCode ?? "unsupported-timing"), recurrence ? "Imported recurring Events are paused to preserve external exceptions." : (timing.limitationMessage ?? "Google Event timing cannot be verified."), connection.user_id,accountId,event.id,connection.connection_scope_id);
+            .run(recurrenceChanged ? "unsupported-recurrence" : (timing.limitationCode ?? "unsupported-timing"), recurrenceChanged ? "The Google recurrence changed outside FileTasks. Its original Calendar representation is preserved and sync is paused." : (timing.limitationMessage ?? "Google Event timing cannot be verified."), connection.user_id,accountId,event.id,connection.connection_scope_id);
         }
         else {
           db.prepare(`UPDATE calendar_import_metadata SET state='supported', limitation_code=NULL, limitation_message=NULL WHERE user_id=? AND provider='google' AND source_account_id=? AND external_id=? AND connection_scope_id=? AND limitation_code='missing-source'`)
@@ -998,16 +1069,22 @@ async function importGoogleEvents(connection: Connection) {
       const recurrenceLine = recurrenceLines.find((line) => line.toUpperCase().startsWith("RRULE:")) ?? null;
       const recurrenceInfo = recurrenceSupport(recurrenceLine,date);
       const timingInfo = parseGoogleTiming(event);
-      const recurrenceHasExtras = (event.recurrence !== undefined && (!Array.isArray(event.recurrence) || !event.recurrence.every((line: unknown) => typeof line === "string"))) || recurrenceLines.length > (recurrenceLine ? 1 : 0)
-        || recurrenceLines.filter((line) => line.toUpperCase().startsWith("RRULE:")).length > 1;
+      const excludedDates = googleExclusionDates(recurrenceLines,event);
+      const recurrenceHasExtras = (event.recurrence !== undefined && (!Array.isArray(event.recurrence) || !event.recurrence.every((line: unknown) => typeof line === "string")))
+        || recurrenceLines.some((line) => !/^(?:RRULE|EXDATE)(?:;[^:]*)?:/i.test(line))
+        || recurrenceLines.filter((line) => line.toUpperCase().startsWith("RRULE:")).length > 1
+        || (recurrenceLines.some((line) => /^EXDATE(?:;[^:]*)?:/i.test(line)) && excludedDates === null)
+        || (recurrenceLines.some((line) => /^EXDATE(?:;[^:]*)?:/i.test(line)) && !recurrenceLine);
       const textLimited = (event.summary?.length ?? 0) > 200 || details.length > 10_000;
-      const state = timingInfo.state === "limited" || recurrenceInfo.state === "limited" || recurrenceLines.length > 0 || recurrenceHasExtras || textLimited ? "limited" : "supported";
+      const recurrenceOutsideIssue20 = Boolean(recurrenceInfo.recurrence && !isIssue20Recurrence(recurrenceInfo.recurrence));
+      const state = timingInfo.state === "limited" || recurrenceInfo.state === "limited" || recurrenceHasExtras || recurrenceOutsideIssue20 || textLimited ? "limited" : "supported";
       const limitationMessage = timingInfo.state === "limited" ? timingInfo.limitationMessage
         : recurrenceInfo.state === "limited" ? recurrenceInfo.limitationMessage
-          : recurrenceLines.length > 0 ? "Imported recurring Events are paused to preserve external exceptions." : recurrenceHasExtras ? "This imported Event has recurrence exceptions or rules FileTasks cannot represent yet. Its original Google Event is preserved and sync is paused." : textLimited ? "This imported Event has text longer than FileTasks can display. Its original Google Event is preserved and sync is paused." : undefined;
+          : recurrenceOutsideIssue20 ? "This imported recurring Event uses a Recurrence pattern outside the supported subset. Its original Calendar data is preserved and sync is paused."
+          : recurrenceHasExtras ? "This imported Event has recurrence exceptions or rules FileTasks cannot represent yet. Its original Google Event is preserved and sync is paused." : textLimited ? "This imported Event has text longer than FileTasks can display. Its original Google Event is preserved and sync is paused." : undefined;
       const sourceMetadata: ImportMetadataInput = {
-        accountId,timing:timingInfo.timing,state,
-        ...(state === "limited" ? { limitationCode:timingInfo.state === "limited" ? timingInfo.limitationCode : textLimited ? "unsupported-text" : "unsupported-recurrence",limitationMessage } : {}),
+        accountId,timing:timingInfo.timing,state,...(excludedDates ? {excludedDates} : {}),
+        ...(state === "limited" ? { limitationCode:timingInfo.state === "limited" ? timingInfo.limitationCode : textLimited && !recurrenceOutsideIssue20 ? "unsupported-text" : "unsupported-recurrence",limitationMessage } : {}),
         sourcePayload:event,
       };
       importEventWithIdentity(connection.user_id,"google",event.id,connection.connection_scope_id,event.summary ?? "Untitled Event",details,date,time,recurrenceInfo.recurrence,undefined,sourceMetadata,connection);
@@ -1097,6 +1174,33 @@ function parseIcsDateProperty(property: ReturnType<typeof icsPropertyEntry>) {
   return { kind:"timed" as const,date,time,zone,utc:match[7].toUpperCase()==="Z" };
 }
 
+function appleExclusionDates(rootText: string, start: NonNullable<ReturnType<typeof parseIcsDateProperty>>) {
+  const lines = unfoldedIcsLines(rootText).filter((line) => /^EXDATE(?:;[^:]*)?:/i.test(line));
+  const dates: string[] = [];
+  for (const line of lines) {
+    const property = icsPropertyEntry(`${line}\r\n`,"EXDATE");
+    const separator=line.indexOf(":");
+    if (!property || separator < 0) return null;
+    if (start.kind === "allDay") {
+      if (property.params.VALUE?.toUpperCase() !== "DATE" || property.params.TZID) return null;
+      for (const value of property.value.split(",")) {
+        const parsed=parseIcsDateProperty({...property,value});
+        if (!parsed || parsed.kind !== "allDay") return null;
+        dates.push(parsed.date);
+      }
+    } else {
+      if (!start.zone) return null;
+      if (start.utc ? (property.params.TZID || property.params.VALUE) : (property.params.TZID !== start.zone || property.params.VALUE)) return null;
+      for (const value of property.value.split(",")) {
+        const parsed=parseIcsDateProperty({...property,value});
+        if (!parsed || parsed.kind !== "timed" || parsed.time !== start.time || parsed.zone !== start.zone || parsed.utc !== start.utc) return null;
+        dates.push(parsed.date);
+      }
+    }
+  }
+  return [...new Set(dates)];
+}
+
 function parseAppleTiming(ics: string) {
   const lines = unfoldedIcsLines(ics);
   const events = [] as string[][];
@@ -1119,7 +1223,9 @@ function parseAppleTiming(ics: string) {
   const rootText = root.join("\r\n");
   const recurrenceInput = icsProperty(rootText,"RRULE");
   const recurrenceInfo = recurrenceSupport(recurrenceInput, start.date);
-  const hasExceptions = events.length > 1 || /^(?:EXDATE|RDATE)(?:;[^:]*)?:/im.test(rootText)
+  const excludedDates = appleExclusionDates(rootText,start);
+  const hasExceptions = events.length > 1 || /^(?:RDATE|EXRULE)(?:;[^:]*)?:/im.test(rootText) || excludedDates === null
+    || (!recurrenceInput && /^EXDATE(?:;[^:]*)?:/im.test(rootText))
     || events.some((event) => event.some((line) => /^RECURRENCE-ID(?:;[^:]*)?:/i.test(line)));
   const duplicateSingleton = ["DTSTART","DTEND","DURATION","RRULE"].some((name) =>
     root.filter((line) => new RegExp(`^${name}(?:;[^:]*)?:`,"i").test(line)).length > 1)
@@ -1131,17 +1237,18 @@ function parseAppleTiming(ics: string) {
     ? { code:"malformed-event",message:"This imported Event has duplicate or conflicting timing or recurrence properties. Its original Apple Event is preserved and sync is paused." }
     : hasExceptions
     ? { code:"unsupported-recurrence",message:"This imported Event has recurrence exceptions FileTasks cannot represent yet. Its original Apple Event is preserved and sync is paused." }
-    : recurrenceInfo.state === "limited" ? { code:recurrenceInfo.limitationCode!,message:recurrenceInfo.limitationMessage! } : null;
+    : recurrenceInfo.state === "limited" ? { code:recurrenceInfo.limitationCode!,message:recurrenceInfo.limitationMessage! }
+      : recurrenceInfo.recurrence && !isIssue20Recurrence(recurrenceInfo.recurrence) ? {code:"unsupported-recurrence",message:"This imported recurring Event uses a Recurrence pattern outside the supported subset. Its original Calendar data is preserved and sync is paused."} : null;
   if (start.kind === "allDay" && !endEntry && !root.some((line) => /^DURATION(?:;[^:]*)?:/i.test(line))) {
     const timing = { kind:"allDay",startDate:start.date,endDate:plusOneDay(start.date),dayCount:1 } satisfies ProviderTiming;
     if (commonUnsupported) return { timing,state:"limited" as const,limitationCode:commonUnsupported.code,limitationMessage:commonUnsupported.message };
-    return { timing,state:"supported" as const,recurrence:recurrenceInfo.recurrence };
+    return { timing,state:"supported" as const,recurrence:recurrenceInfo.recurrence,excludedDates };
   }
   if (start.kind === "allDay" && end?.kind === "allDay" && end.date > start.date) {
     const dayCount = Math.round((Date.parse(`${end.date}T00:00:00Z`)-Date.parse(`${start.date}T00:00:00Z`))/86_400_000);
     const timing = { kind:"allDay",startDate:start.date,endDate:end.date,dayCount } satisfies ProviderTiming;
     if (commonUnsupported) return { timing,state:"limited" as const,limitationCode:commonUnsupported.code,limitationMessage:commonUnsupported.message };
-    return { timing,state:"supported" as const,recurrence:recurrenceInfo.recurrence };
+    return { timing,state:"supported" as const,recurrence:recurrenceInfo.recurrence,excludedDates };
   }
   if (start.kind === "timed" && end?.kind === "timed" && start.zone === end.zone && validTimeZone(start.zone ?? "")) {
     const startInstant = instantForTiming(start.date,start.time,start.zone,start.utc ? 0 : undefined);
@@ -1153,13 +1260,19 @@ function parseAppleTiming(ics: string) {
         startOffsetMinutes:start.utc ? 0 : startOffset,endOffsetMinutes:end.utc ? 0 : endOffset,durationMs:endInstant-startInstant,
         ...(start.utc ? {startUtc:true} : {}),...(end.utc ? {endUtc:true} : {}) } satisfies ProviderTiming;
       if (commonUnsupported) return { timing,state:"limited" as const,limitationCode:commonUnsupported.code,limitationMessage:commonUnsupported.message };
-      return { timing,state:"supported" as const,recurrence:recurrenceInfo.recurrence };
+      return { timing,state:"supported" as const,recurrence:recurrenceInfo.recurrence,excludedDates };
     }
   }
   const timing: ProviderTiming = start.kind === "timed" ? {kind:"timed",startDate:start.date,endDate:end?.date ?? start.date,startTime:start.time,...(end?.kind === "timed" ? {endTime:end.time} : {}),...(start.zone ? {startZone:start.zone} : {})}
     : {kind:"allDay",startDate:start.date,endDate:end?.date ?? start.date};
   return { timing,state:"limited" as const,limitationCode:"unsupported-timing",
     limitationMessage:"This imported Event has a floating, missing, or unsupported timezone or end time. Its original Apple Event is preserved and sync is paused." };
+}
+
+function appleRecurrenceProperties(ics: string) {
+  const event = firstEventLines(ics);
+  if (!event) return null;
+  return event.lines.slice(event.start+1,event.end).filter((line) => /^(?:RRULE|EXDATE|EXRULE|RDATE)(?:;[^:]*)?:/i.test(line));
 }
 
 function directAppleEventComponents(ics: string) {
@@ -1250,6 +1363,14 @@ function appleFileTasksRepresentationMatches(connection: Connection, itemId: str
   return previous?.representation_json === actualSignature;
 }
 
+function appleStoredRepresentationMatches(userId: string, itemId: string, scope: string, href: string, ics: string) {
+  const actual = appleRepresentationSignature(ics);
+  if (!actual) return false;
+  const previous = database().prepare(`SELECT representation_json FROM apple_copy_representation_baselines
+    WHERE user_id=? AND item_id=? AND connection_scope_id=? AND external_id=?`).get(userId,itemId,scope,href) as {representation_json:string} | undefined;
+  return previous?.representation_json === actual;
+}
+
 async function importAppleEvents(connection: Connection, verified: Set<string>) {
   assertActiveScope(connection);
   if (!connection.connection_scope_id) throw new Error("Missing connection scope");
@@ -1316,13 +1437,18 @@ async function importAppleEvents(connection: Connection, verified: Set<string>) 
       const description = icsProperty(ics,"DESCRIPTION") ?? "";
       const recurrence = "recurrence" in timingInfo ? timingInfo.recurrence : recurrenceSupport(icsProperty(ics,"RRULE"),timingInfo.timing.startDate).recurrence;
       const textLimited = summary.length > 200 || description.length > 10_000;
+      const importedSourceIcs = database().prepare("SELECT source_ics FROM calendar_import_metadata WHERE user_id=? AND provider='apple' AND external_id=? AND connection_scope_id=?")
+        .get(connection.user_id,uid,connection.connection_scope_id)?.source_ics;
+      const unchangedSourceRecurrence = typeof importedSourceIcs === "string" && timingInfo.state === "supported"
+        && JSON.stringify(appleRecurrenceProperties(importedSourceIcs)) === JSON.stringify(appleRecurrenceProperties(ics));
       const generatedRepresentation = mappedAtHref && !textLimited && (timingInfo.state === "limited" || Boolean(recurrence))
-        && appleFileTasksRepresentationMatches(connection,String(mappedAtHref.item_id),uid,ics,resourceUrl);
+        && (appleFileTasksRepresentationMatches(connection,String(mappedAtHref.item_id),uid,ics,resourceUrl)
+          || appleStoredRepresentationMatches(connection.user_id,String(mappedAtHref.item_id),connection.connection_scope_id!,resourceUrl,ics));
       if (generatedRepresentation) {
         clearDestinationLimit(mappedAtHref.item_id);
         verified.add(String(mappedAtHref.item_id));
       }
-      else if (timingInfo.state === "limited" || recurrence || textLimited) {
+      else if (timingInfo.state === "limited" || ((Boolean(recurrence) || /^EXDATE(?:;[^:]*)?:/im.test(ics)) && !unchangedSourceRecurrence) || textLimited) {
         const code = textLimited ? "unsupported-text" : recurrence ? "unsupported-recurrence" : timingInfo.limitationCode;
         const message = textLimited ? "This imported Event has text longer than FileTasks can display. Sync is paused." : recurrence ? "Imported recurring Events are paused to preserve external exceptions." : timingInfo.limitationMessage;
         if (mappedAtHref && database().prepare("SELECT 1 FROM items WHERE user_id=? AND id=?").get(connection.user_id,mappedAtHref.item_id)) {
@@ -1352,6 +1478,7 @@ async function importAppleEvents(connection: Connection, verified: Set<string>) 
     const recurrence = "recurrence" in timingInfo ? timingInfo.recurrence : recurrenceSupport(icsProperty(ics,"RRULE"),date).recurrence;
     const sourceMetadata: ImportMetadataInput = {
       accountId:connection.calendar_url,timing:timingInfo.timing,state:summary.length > 200 || description.length > 10_000 ? "limited" : timingInfo.state,
+      ...("excludedDates" in timingInfo && timingInfo.excludedDates ? {excludedDates:timingInfo.excludedDates} : {}),
       ...(timingInfo.state === "limited" ? { limitationCode:timingInfo.limitationCode,limitationMessage:timingInfo.limitationMessage } : {}),
       ...(summary.length > 200 || description.length > 10_000 ? { limitationCode:"unsupported-text",limitationMessage:"This imported Event has text longer than FileTasks can display. Its original Apple Event is preserved and sync is paused." } : {}),
       sourceIcs:ics,
@@ -1714,7 +1841,7 @@ async function syncApple(connection: Connection, events: EventItem[], missingHre
       reportSyncLimitation(limits,item,"apple","The connected Apple account changed after this Event was imported. Sync is paused to protect the original Calendar copy.");
       continue;
     }
-    if (metadata?.provider === "google" && item.recurrence) {
+    if (metadata?.provider === "google" && item.recurrence && item.scheduledTime) {
       reportSyncLimitation(limits,item,"apple","This recurring Event uses a Google timezone rule. Apple export is paused because its daylight-saving behavior cannot be preserved safely yet.");
       continue;
     }
