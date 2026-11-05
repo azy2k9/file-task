@@ -57,6 +57,9 @@ class RecurringAgendaUiTest {
         task.forEach { assertAgendaItem(it.id, it.title) }
 
         createRecurring("Android UI Event", isEvent = true, date = "2026-10-18")
+        waitFor("the saved Event's Calendar failure status") {
+            compose.onAllNodes(hasText("Calendar sync failed. Your Event is saved in FileTasks and will be retried.")).fetchSemanticsNodes().isNotEmpty()
+        }
         val event = items(api, token).filter { it.title == "Android UI Event" }.sortedBy { it.scheduledDate }
         assertEquals("The UI-created Event must have three Occurrences", 3, event.size)
         event.forEach { assertAgendaItem(it.id, it.title) }

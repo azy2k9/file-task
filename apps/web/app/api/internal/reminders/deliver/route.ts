@@ -1,5 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { processDueReminders } from "@api/notifications";
+import { processDueCalendarSyncs } from "@api/calendars";
 
 export const runtime = "nodejs";
 
@@ -13,8 +14,13 @@ export async function POST(request: Request) {
     return Response.json({ error: "Worker authentication required." }, { status: 401, headers: { "Cache-Control": "no-store" } });
   }
   try {
-    const result = await processDueReminders();
-    return Response.json(result, { headers: { "Cache-Control": "no-store" } });
+    const [reminderResult, calendarResult] = await Promise.allSettled([processDueReminders(),processDueCalendarSyncs()]);
+    if (reminderResult.status === "rejected" || calendarResult.status === "rejected") {
+      throw new Error("Worker processing failed.");
+    }
+    const reminders = reminderResult.value;
+    const calendarSync = calendarResult.value;
+    return Response.json({ ...reminders, calendarSync }, { headers: { "Cache-Control": "no-store" } });
   } catch {
     return Response.json({ error: "Reminder processing failed." }, { status: 500, headers: { "Cache-Control": "no-store" } });
   }

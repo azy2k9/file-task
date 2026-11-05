@@ -1,12 +1,17 @@
 import { requireUser } from "@api/auth";
 import { calendarConnections, connectAppleCalendar } from "@api/calendars";
+import { calendarSyncDeliveryStatus } from "@api/calendar-sync-state";
 import { calendarSyncLimitations } from "@api/workspace";
 import { endpoint, json, readBody } from "@api/http";
 
 export const runtime = "nodejs";
 export const GET = endpoint(async (request) => {
   const userId = requireUser(request).id;
-  return json({ calendars: calendarConnections(userId), syncLimitations: calendarSyncLimitations(userId) });
+  return json({
+    calendars: calendarConnections(userId),
+    syncLimitations: calendarSyncLimitations(userId),
+    syncDelivery: calendarSyncDeliveryStatus(userId),
+  });
 });
 export const POST = endpoint(async (request) => {
   const user = requireUser(request);

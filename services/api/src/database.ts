@@ -64,6 +64,17 @@ export function database() {
         calendar_url TEXT, connected_at TEXT NOT NULL, credential_generation_id TEXT NOT NULL,
         PRIMARY KEY(user_id, provider)
       );
+      CREATE TABLE IF NOT EXISTS calendar_sync_state (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL CHECK(provider IN ('google','apple')),
+        generation INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL CHECK(state IN ('pending','failed','synced')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER,
+        last_attempt_at INTEGER,
+        last_error TEXT,
+        PRIMARY KEY(user_id,provider)
+      );
       CREATE TABLE IF NOT EXISTS calendar_copies (
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         provider TEXT NOT NULL CHECK(provider IN ('google','apple')),
@@ -150,6 +161,7 @@ export function database() {
       );
       CREATE INDEX IF NOT EXISTS items_owner ON items(user_id);
       CREATE INDEX IF NOT EXISTS reminder_deliveries_pending ON reminder_deliveries(status,next_attempt_at);
+      CREATE INDEX IF NOT EXISTS calendar_sync_state_due ON calendar_sync_state(state,next_attempt_at);
       CREATE TABLE IF NOT EXISTS files (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

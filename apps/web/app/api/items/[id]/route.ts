@@ -2,7 +2,7 @@ import { requireUser } from "@api/auth";
 import { endpoint, json, readBody } from "@api/http";
 import { HttpError } from "@api/http";
 import { deleteItem, getItem, saveItem } from "@api/workspace";
-import { excludeDeletedCalendarImports, syncCalendars } from "@api/calendars";
+import { excludeDeletedCalendarImports, syncCalendarsAfterMutation } from "@api/calendars";
 export const runtime = "nodejs";
 type Context = { params: Promise<{ id: string }> };
 export async function GET(request: Request, context: Context) {
@@ -14,7 +14,7 @@ export async function PATCH(request: Request, context: Context) {
   return endpoint(async (request) => {
     const user = requireUser(request);
     const item = saveItem(user.id, await readBody(request), id);
-    if (item.kind === "event") await syncCalendars(user.id);
+    if (item.kind === "event") await syncCalendarsAfterMutation(user.id);
     return json({ item });
   })(request);
 }
@@ -29,7 +29,7 @@ export async function DELETE(request: Request, context: Context) {
     }
     excludeDeletedCalendarImports(user.id,id);
     deleteItem(user.id, id, scope);
-    if (item.kind === "event") await syncCalendars(user.id);
+    if (item.kind === "event") await syncCalendarsAfterMutation(user.id);
     return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
   })(request);
 }

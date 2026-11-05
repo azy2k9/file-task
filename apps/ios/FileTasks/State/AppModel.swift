@@ -13,6 +13,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var reminderSettingsLoadError: String?
     @Published private(set) var hasRegisteredPushDevice = false
     @Published private(set) var pushDeviceRevoked = false
+    @Published private(set) var calendarSyncDelivery: [CalendarSyncDeliveryStatus] = []
+    @Published private(set) var calendarSyncNotice: String?
     @Published private(set) var isRestoring = true
     @Published private(set) var isAuthenticating = false
     @Published private(set) var isLoadingItems = false
@@ -32,6 +34,8 @@ final class AppModel: ObservableObject {
     private var fileRevision = 0
     private var refreshRequestID = 0
     private var reminderSettingsRequestID = 0
+    private var calendarDeliveryRequestID = 0
+    private var calendarNoticeVersion = 0
     private var authenticationAttemptID: UUID?
 
     init(settings: APISettings, tokenStore: KeychainTokenStore = KeychainTokenStore()) {
@@ -141,6 +145,9 @@ final class AppModel: ObservableObject {
             guard isCurrent(context) else { throw APIClientError.sessionChanged }
             upsert(saved)
             errorMessage = nil
+            if draft.kind == .event {
+                await refreshCalendarSyncDelivery(using: context, outcome: .saved)
+            }
         } catch {
             handle(error, for: context)
             throw error
@@ -274,6 +281,9 @@ final class AppModel: ObservableObject {
             items.removeAll { $0.id == item.id }
             itemRevision += 1
             await refreshItems(using: context)
+            if item.kind == .event {
+                await refreshCalendarSyncDelivery(using: context, outcome: .deleted)
+            }
             errorMessage = nil
         } catch {
             handle(error, for: context)
@@ -460,6 +470,68 @@ final class AppModel: ObservableObject {
             }
             handle(error, for: context)
         }
+        await refreshCalendarSyncDelivery(using: context)
+    }
+
+    func refreshCalendarSyncDelivery() async {
+        guard user != nil else { return }
+        do {
+            await refreshCalendarSyncDelivery(using: try currentContext())
+        } catch {
+            // Calendar delivery status must never turn a committed local mutation into an error.
+        }
+    }
+
+    private enum CalendarMutationOutcome {
+        case saved
+        case deleted
+    }
+
+    private func refreshCalendarSyncDelivery(
+        using context: SessionContext,
+        outcome: CalendarMutationOutcome? = nil
+    ) async {
+        guard isCurrent(context) else { return }
+        calendarDeliveryRequestID += 1
+        let requestID = calendarDeliveryRequestID
+        do {
+            let statuses = try await APIClient(baseURL: context.baseURL).calendarSyncDelivery(token: context.token)
+            guard isCurrent(context), calendarDeliveryRequestID == requestID else { return }
+            calendarSyncDelivery = statuses
+            if statuses.isEmpty {
+                guard let outcome else {
+                    calendarSyncNotice = nil
+                    calendarNoticeVersion += 1
+                    return
+                }
+                let version = calendarNoticeVersion + 1
+                calendarNoticeVersion = version
+                calendarSyncNotice = outcome == .deleted ? "Deleted from FileTasks." : "Saved to FileTasks."
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    guard let self, self.calendarNoticeVersion == version else { return }
+                    self.calendarSyncNotice = nil
+                }
+                return
+            }
+            let failed = statuses.contains { $0.state == "failed" }
+            let retryNote = failed ? " The last attempt failed; another retry is scheduled." : ""
+            switch outcome {
+            case .saved:
+                calendarSyncNotice = "Calendar sync pending. Your Event is saved in FileTasks and will be retried." + retryNote
+            case .deleted:
+                calendarSyncNotice = "Calendar removal pending. Your Event was deleted from FileTasks and will be retried." + retryNote
+            case .none:
+                calendarSyncNotice = "Calendar changes are pending. Your Events are saved in FileTasks and will be retried." + retryNote
+            }
+            calendarNoticeVersion += 1
+        } catch {
+            guard isCurrent(context), calendarDeliveryRequestID == requestID, let outcome else { return }
+            calendarNoticeVersion += 1
+            calendarSyncNotice = outcome == .deleted
+                ? "Deleted from FileTasks. Calendar removal status is not available yet."
+                : "Saved to FileTasks. Calendar sync status is not available yet."
+        }
     }
 
     private func currentContext() throws -> SessionContext {
@@ -487,10 +559,14 @@ final class AppModel: ObservableObject {
         isLoadingReminderSettings = false
         reminderSettingsLoadError = nil
         reminderSettingsRequestID += 1
+        calendarDeliveryRequestID += 1
+        calendarNoticeVersion += 1
         hasRegisteredPushDevice = UserDefaults.standard.string(forKey: pushDeviceKey(for: user.id)) != nil
         pushDeviceRevoked = UserDefaults.standard.bool(forKey: pushDeviceRevokedKey(for: user.id))
         isLoadingItems = false
         errorMessage = nil
+        calendarSyncDelivery = []
+        calendarSyncNotice = nil
         return SessionContext(generation: sessionGeneration, token: token, baseURL: baseURL)
     }
 
@@ -536,9 +612,13 @@ final class AppModel: ObservableObject {
         isLoadingReminderSettings = false
         reminderSettingsLoadError = nil
         reminderSettingsRequestID += 1
+        calendarDeliveryRequestID += 1
+        calendarNoticeVersion += 1
         hasRegisteredPushDevice = false
         pushDeviceRevoked = false
         errorMessage = nil
+        calendarSyncDelivery = []
+        calendarSyncNotice = nil
     }
 
     private func upsert(_ item: WorkspaceItem) {

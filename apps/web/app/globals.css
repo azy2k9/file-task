@@ -779,6 +779,17 @@ button:disabled {
 .calendar-event-notice strong { color: #634515; }
 .calendar-event-hint { margin: 7px 0 0; color: #63796d; font-size: 11px; line-height: 1.5; }
 
+.calendar-delivery-notice {
+  margin: 0 0 18px;
+  padding: 12px 14px;
+  border: 1px solid #ead4b2;
+  border-radius: 10px;
+  background: #fff9ed;
+  color: #765527;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .item-card-complete .item-title {
   color: #77857a;
   text-decoration: line-through;

@@ -91,6 +91,12 @@ struct WorkspaceView: View {
         NavigationStack {
             workspaceList
         }
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                if !Task.isCancelled { await model.refreshCalendarSyncDelivery() }
+            }
+        }
     }
 
     private var workspaceList: some View {
@@ -110,6 +116,15 @@ struct WorkspaceView: View {
     private var baseWorkspaceList: some View {
         List {
             sectionPicker
+            if let notice = model.calendarSyncNotice {
+                Section {
+                    Text(notice)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("calendar.sync.delivery.status")
+                }
+                .listRowBackground(Color.yellow.opacity(0.12))
+            }
             workspaceSectionContent
         }
         .listStyle(.insetGrouped)

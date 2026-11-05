@@ -3,6 +3,7 @@ import { importedScheduleLimitation } from "./calendars";
 import { randomUUID } from "node:crypto";
 import type { CalendarSyncStatus, RecurrenceRule, ReminderRule, WorkspaceFileSummary, WorkspaceItem } from "./items";
 import { database } from "./database";
+import { enqueueCalendarSync } from "./calendar-sync-state";
 import { now } from "./clock";
 import { HttpError } from "./http";
 import { itemReminderDefaults, reminderSettings } from "./reminder-settings";
@@ -400,7 +401,7 @@ function validate(body: Record<string, unknown>, existing?: WorkspaceItem) {
     recurrence, reminders, createdAt: existing?.createdAt ?? now, updatedAt: now };
 }
 
-export function saveItem(userId: string, body: Record<string, unknown>, id?: string) {
+function saveItemInTransaction(userId: string, body: Record<string, unknown>, id?: string) {
   const db = database();
   const existing = id ? getItem(userId, id) : undefined;
   const item = validate(body, existing);
@@ -511,7 +512,21 @@ export function saveItem(userId: string, body: Record<string, unknown>, id?: str
   return getItem(userId, id);
 }
 
-export function deleteItem(userId: string, id: string, scope?: unknown) {
+export function saveItem(userId: string, body: Record<string, unknown>, id?: string) {
+  const db = database();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const item = saveItemInTransaction(userId, body, id);
+    if (item.kind === "event") enqueueCalendarSync(userId);
+    db.exec("COMMIT");
+    return item;
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* Preserve the mutation error. */ }
+    throw error;
+  }
+}
+
+function deleteItemInTransaction(userId: string, id: string, scope?: unknown) {
   const db = database();
   const item = getItem(userId, id);
   if (!item.seriesId) {
@@ -551,4 +566,18 @@ export function deleteItem(userId: string, id: string, scope?: unknown) {
   db.prepare("UPDATE items SET recurrence_json=?,updated_at=? WHERE user_id=? AND id=?")
     .run(JSON.stringify(shortened), new Date().toISOString(), userId, rootId);
   db.prepare("DELETE FROM items WHERE user_id=? AND series_root_id=? AND occurrence_date>=?").run(userId, rootId, selectedDate);
+}
+
+export function deleteItem(userId: string, id: string, scope?: unknown) {
+  const db = database();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const item = getItem(userId,id);
+    deleteItemInTransaction(userId,id,scope);
+    if (item.kind === "event") enqueueCalendarSync(userId);
+    db.exec("COMMIT");
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* Preserve the mutation error. */ }
+    throw error;
+  }
 }

@@ -7,6 +7,14 @@ import { calendarSyncLimitations, getItem, listItems, listItemsForCalendarSync }
 import type { RecurrenceRule } from "./items";
 import { saveItem } from "./workspace";
 import { now, nowMs } from "./clock";
+import {
+  beginCalendarSync,
+  calendarSyncDeliveryStatus,
+  completeCalendarSync,
+  dueCalendarSyncUsers,
+  failCalendarSync,
+  type CalendarSyncProvider,
+} from "./calendar-sync-state";
 
 type Provider = "google" | "apple";
 type Connection = { connection_scope_id: string | null; credential_generation_id: string; user_id: string; provider: Provider; account_label: string; access_token: string | null; refresh_token: string | null; calendar_url: string | null; expires_at: number | null };
@@ -1884,7 +1892,7 @@ async function syncApple(connection: Connection, events: EventItem[], missingHre
   }
 }
 
-export async function syncCalendars(userId: string) {
+async function performCalendarSync(userId: string, exportProviders?: ReadonlySet<Provider>) {
   const connections = database().prepare("SELECT * FROM calendar_connections WHERE user_id=?").all(userId) as Connection[];
   if (!connections.length) return { synced: [], message: "Connect a calendar first." };
   const synced: string[] = [];
@@ -1911,6 +1919,7 @@ export async function syncCalendars(userId: string) {
   }
   const eventCount = listItemsForCalendarSync(userId).filter((item) => item.kind === "event").length;
   for (const connection of [...connections].sort((a,b) => Number(a.provider === "google") - Number(b.provider === "google"))) {
+    if (exportProviders && !exportProviders.has(connection.provider)) continue;
     assertActiveScope(connection);
     const events = listItemsForCalendarSync(userId).filter((item) => item.kind === "event");
     if (connection.provider === "google") await syncGoogle(connection,events,limitations,verifiedAppleItems);
@@ -1922,4 +1931,53 @@ export async function syncCalendars(userId: string) {
   for (const limitation of calendarSyncLimitations(userId)) syncLimitations.set(`${limitation.itemId}:${limitation.provider}`,limitation);
   for (const [key,limitation] of limitations) syncLimitations.set(key,limitation);
   return { synced, eventCount, syncLimitations:[...syncLimitations.values()] };
+}
+
+export async function syncCalendars(userId: string, providers?: readonly CalendarSyncProvider[]) {
+  const selectedProviders = providers === undefined ? undefined : new Set<Provider>(providers);
+  const generations = beginCalendarSync(userId,providers);
+  try {
+    const result = await performCalendarSync(userId,selectedProviders);
+    const failedDeletionProviders = new Set((result.syncLimitations ?? [])
+      .filter((limitation) => limitation.title === "Deleted Event")
+      .map((limitation) => limitation.provider as CalendarSyncProvider));
+    for (const generation of generations) {
+      if (failedDeletionProviders.has(generation.provider)) failCalendarSync(userId,generation);
+      else completeCalendarSync(userId,generation);
+    }
+    return { ...result, syncDelivery: calendarSyncDeliveryStatus(userId) };
+  } catch (error) {
+    for (const generation of generations) failCalendarSync(userId,generation);
+    throw error;
+  }
+}
+
+export async function syncCalendarsAfterMutation(userId: string) {
+  try {
+    await syncCalendars(userId);
+  } catch {
+    // Event data and its retry state were committed before provider sync started.
+  }
+}
+
+export async function processDueCalendarSyncs() {
+  const dueRows = dueCalendarSyncUsers();
+  const dueByUser = new Map<string,Set<CalendarSyncProvider>>();
+  for (const { userId,provider } of dueRows) {
+    const providers = dueByUser.get(userId) ?? new Set<CalendarSyncProvider>();
+    providers.add(provider);
+    dueByUser.set(userId,providers);
+  }
+  let completed = 0;
+  let failed = 0;
+  for (const [userId,providers] of dueByUser) {
+    try {
+      await syncCalendars(userId,[...providers]);
+      if (calendarSyncDeliveryStatus(userId).some((status) => providers.has(status.provider))) failed++;
+      else completed++;
+    } catch {
+      failed++;
+    }
+  }
+  return { attempted: dueByUser.size, completed, failed };
 }

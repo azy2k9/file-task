@@ -7,6 +7,7 @@ import FilesView from "./files-view";
 type Account = { id: string; email: string };
 type ReminderSettings = { taskReminders: ReminderRule[]; eventReminders: ReminderRule[]; pushEnabled: boolean; emailEnabled: boolean; pushAvailable: boolean; emailAvailable: boolean };
 type InAppNotification = { id: string; itemId: string; title: string; scheduledAt: string; readAt: string | null };
+type CalendarSyncDelivery = { provider: "google" | "apple"; state: "pending" | "failed"; attempts: number; nextAttemptAt: string | null; lastAttemptAt: string | null; lastError: string | null };
 type View = "agenda" | "task" | "event" | "files";
 type AuthMode = "login" | "register";
 type Draft = {
@@ -828,8 +829,11 @@ export default function Page() {
   const [reminderSettings, setReminderSettings] = useState<ReminderSettings>({ taskReminders: [], eventReminders: [], pushEnabled: false, emailEnabled: false, pushAvailable: false, emailAvailable: false });
   const [notifications, setNotifications] = useState<InAppNotification[]>([]);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [calendarDeliveryNotice, setCalendarDeliveryNotice] = useState<string | null>(null);
   const identityVersion = useRef(0);
   const itemRequestVersion = useRef(0);
+  const calendarDeliveryRequestVersion = useRef(0);
+  const calendarDeliveryNoticeVersion = useRef(0);
   const signedInRef = useRef(false);
   const mutationLock = useRef(false);
   const signingOutLock = useRef(false);
@@ -869,6 +873,7 @@ export default function Page() {
         void loadFilesCount(version);
         void loadReminderSettings(version);
         void loadNotifications(version);
+        void loadCalendarDelivery(version);
       } catch {
         if (!mounted || identityVersion.current !== version) return;
         setAuthError("Could not reach FileTasks. Please check your connection and sign in.");
@@ -948,6 +953,49 @@ export default function Page() {
     } catch { /* The agenda remains available when notification lookup is offline. */ }
   }
 
+  async function loadCalendarDelivery(version: number, outcome?: "saved" | "deleted") {
+    if (!signedInRef.current || identityVersion.current !== version || signingOutLock.current) return;
+    const requestVersion = ++calendarDeliveryRequestVersion.current;
+    try {
+      const response = await fetch("/api/calendars", { credentials: "same-origin", cache: "no-store" });
+      if (identityVersion.current !== version || calendarDeliveryRequestVersion.current !== requestVersion) return;
+      if (response.status === 401) {
+        expireSession(version, "Your session has expired. Please sign in again.");
+        return;
+      }
+      if (!response.ok) throw new Error("Calendar sync status is temporarily unavailable.");
+      const result = await response.json() as { syncDelivery?: CalendarSyncDelivery[] };
+      if (identityVersion.current !== version || calendarDeliveryRequestVersion.current !== requestVersion) return;
+      const statuses = result.syncDelivery ?? [];
+      const failed = statuses.some((status) => status.state === "failed");
+      const retryText = failed ? " The last attempt failed; another retry is scheduled." : "";
+      if (statuses.length > 0) {
+        const message = outcome === "deleted"
+          ? `Calendar removal pending. Your Event was deleted from FileTasks and will be retried.${retryText}`
+          : outcome === "saved"
+            ? `Calendar sync pending. Your Event is saved in FileTasks and will be retried.${retryText}`
+            : `Calendar changes are pending. Your Events are saved in FileTasks and will be retried.${retryText}`;
+        setCalendarDeliveryNotice(message);
+        calendarDeliveryNoticeVersion.current += 1;
+      } else if (outcome) {
+        const noticeVersion = ++calendarDeliveryNoticeVersion.current;
+        setCalendarDeliveryNotice(outcome === "deleted" ? "Deleted from FileTasks." : "Saved to FileTasks.");
+        window.setTimeout(() => {
+          if (calendarDeliveryNoticeVersion.current === noticeVersion) setCalendarDeliveryNotice(null);
+        }, 5000);
+      } else {
+        setCalendarDeliveryNotice(null);
+        calendarDeliveryNoticeVersion.current += 1;
+      }
+    } catch {
+      if (identityVersion.current === version && calendarDeliveryRequestVersion.current === requestVersion && outcome) {
+        setCalendarDeliveryNotice(outcome === "deleted"
+          ? "Deleted from FileTasks. Calendar removal status is not available yet."
+          : "Saved to FileTasks. Calendar sync status is not available yet.");
+      }
+    }
+  }
+
   function expireSession(version: number, message: string) {
     if (identityVersion.current !== version) return;
     identityVersion.current += 1;
@@ -965,6 +1013,9 @@ export default function Page() {
     setItemsLoading(false);
     setEditor(null);
     setDeleteTarget(null);
+    setCalendarDeliveryNotice(null);
+    calendarDeliveryRequestVersion.current += 1;
+    calendarDeliveryNoticeVersion.current += 1;
   }
 
   useEffect(() => {
@@ -975,6 +1026,7 @@ export default function Page() {
         void loadItems(version);
         void loadFilesCount(version);
         void loadNotifications(version);
+        void loadCalendarDelivery(version);
       }
     };
     window.addEventListener("focus", refresh);
@@ -1013,6 +1065,9 @@ export default function Page() {
       signedInRef.current = true;
       setAccount(result.user);
       setItems([]);
+      setCalendarDeliveryNotice(null);
+      calendarDeliveryRequestVersion.current += 1;
+      calendarDeliveryNoticeVersion.current += 1;
       setFilesCount(0);
       setFocusFileId(null);
       setNotifications([]);
@@ -1025,6 +1080,7 @@ export default function Page() {
       void loadFilesCount(version);
       void loadReminderSettings(version);
       void loadNotifications(version);
+      void loadCalendarDelivery(version);
     } catch {
       setAuthError("Could not reach FileTasks. Check your connection and try again.");
     } finally {
@@ -1147,8 +1203,11 @@ export default function Page() {
     setMutation(null);
   }
 
-  function refreshAfterMutation(version: number) {
-    window.setTimeout(() => void loadItems(version), 0);
+  function refreshAfterMutation(version: number, outcome?: "saved" | "deleted") {
+    window.setTimeout(() => {
+      void loadItems(version);
+      void loadCalendarDelivery(version, outcome);
+    }, 0);
   }
 
   async function saveDraft(event: FormEvent<HTMLFormElement>) {
@@ -1195,6 +1254,7 @@ export default function Page() {
         result.item,
       ]));
       setLastUpdated(new Date());
+      if (editor.kind === "event") void loadCalendarDelivery(version, "saved");
       setEditor(null);
       setEditorError(null);
       restoreFocus();
@@ -1260,7 +1320,7 @@ export default function Page() {
         return;
       }
       setItems((current) => current.filter((item) => item.id !== target.id));
-      refreshAfterMutation(version);
+      refreshAfterMutation(version, target.kind === "event" ? "deleted" : undefined);
       setLastUpdated(new Date());
       setDeleteTarget(null);
       setDeleteError(null);
@@ -1403,6 +1463,8 @@ export default function Page() {
               </button>
             </div>}
           </header>
+
+          {calendarDeliveryNotice && <div className="calendar-delivery-notice" role="status" aria-live="polite">{calendarDeliveryNotice}</div>}
 
           <div className="list-toolbar">
             <div className="view-heading">
