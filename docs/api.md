@@ -43,6 +43,7 @@ PATCH preserves omitted fields. Send explicit nulls to remove date/time; send bo
   "files": [],
   "recurrence": null,
   "reminders": [],
+  "calendarSync": [],
   "seriesId": null,
   "isOccurrence": false,
   "createdAt": "2026-10-12T12:00:00.000Z",
@@ -51,6 +52,8 @@ PATCH preserves omitted fields. Send explicit nulls to remove date/time; send bo
 ```
 
 Events have `completed: null`; Tasks have a boolean. Lists contain only the authenticated account's items, ordered by date and time, with undated items last. Requests for another person's item return 404. Clients refresh through GET to observe changes saved by other clients.
+
+Imported Events include `calendarSync` entries with the source provider, whether synchronization is `supported` or `limited`, whether the FileTasks schedule or Recurrence rule differs from its import baseline, and a limitation message when sync is paused. Provider payloads and raw iCalendar data remain private. The Event `scheduledDate` and `scheduledTime` contract remains local wall-clock input; provider duration and timezone are retained separately.
 
 ## Files and Attachments
 
@@ -84,18 +87,18 @@ Uploaded bytes move directly between the client and Cloudflare R2. The client fi
 | POST | `/api/devices/push` | `{platform:"web"|"ios"|"android",token}` | 201 `{device:{id,platform,createdAt}}` |
 | DELETE | `/api/devices/push/{id}` | — | 204; revokes this device registration |
 | POST | `/api/internal/reminders/deliver` | — | 200 `{attempted,sent,failed}`; worker-only |
-| GET | `/api/calendars` | — | 200 `{calendars}` |
+| GET | `/api/calendars` | — | 200 `{calendars,syncLimitations}` |
 | GET | `/api/calendars/google/connect` | Browser session cookie | Sets a short-lived transaction cookie and redirects to Google OAuth |
 | GET | `/api/calendars/google/callback` | Google OAuth `state` and `code` query | Redirects back to the app after a verified transaction; rejects replayed, expired, or mismatched transactions |
 | POST | `/api/calendars` | `{username,password,calendarUrl?}` | 201 Apple CalDAV connection |
-| POST | `/api/calendars/sync` | — | 200 `{synced,eventCount}` |
+| POST | `/api/calendars/sync` | — | 200 `{synced,eventCount,syncLimitations}` |
 | DELETE | `/api/calendars/{google|apple}` | — | 204 |
 
-Calendar credentials are encrypted at rest. Set `FILETASKS_CALENDAR_ENCRYPTION_KEY` to a private 32-byte base64 or hex key. Google requires OAuth client ID, secret, and callback URL settings. Apple Calendar uses an Apple ID app-specific password; CalDAV discovery runs from iCloud unless a calendar collection URL is supplied. Sync imports Events once, then FileTasks is authoritative: external edits are replaced by FileTasks values and missing Calendar copies are recreated. Configure `FILETASKS_PUBLIC_URL` or `FILETASKS_ORIGIN` for backlinks, and `FILETASKS_TIME_ZONE` for Google timed Event copies.
+Calendar credentials are encrypted at rest. Set `FILETASKS_CALENDAR_ENCRYPTION_KEY` to a private 32-byte base64 or hex key. Google requires OAuth client ID, secret, and callback URL settings. Apple Calendar uses an Apple ID app-specific password; CalDAV discovery runs from iCloud unless a calendar collection URL is supplied. Imported Events keep an account- and provider-specific source payload or raw iCalendar resource, normalized provider timing, and a FileTasks schedule baseline in an additive metadata table. When the schedule is unchanged, sync preserves the imported provider start and end exactly; a simple local schedule edit keeps the original duration and timezone when they can be resolved safely. External edits to supported details are replaced by FileTasks values, and missing supported copies are recreated. Unsupported timing or Recurrence representations stay in the source metadata and are not exported to either connected provider; the API and browser show a sync limitation instead of simplifying them. Legacy imported Events without retained source metadata are marked limited during the next sync. Configure `FILETASKS_PUBLIC_URL` or `FILETASKS_ORIGIN` for backlinks, and `FILETASKS_TIME_ZONE` for new Google timed Event copies.
 
 Google Calendar connection starts with a top-level browser navigation to `/api/calendars/google/connect` while the intended FileTasks account is signed in. The server sets a 10-minute, HttpOnly, SameSite=Lax transaction cookie (Secure on HTTPS), and stores only hashes of the OAuth state, cookie nonce, and initiating session. The callback must present that cookie and the same active FileTasks session and account; it consumes a valid transaction once. Expired, replayed, cancelled, or mismatched transactions cannot connect a calendar. Copying the Google authorization URL into another browser does not transfer the transaction cookie, so OAuth state alone never selects the FileTasks account. The callback response is not cacheable and suppresses referrers because Google sends its authorization code and state in the callback URL.
 
-Native clients do not need a Google authorization endpoint. A native screen opens the FileTasks web app (`/`) in the system browser without adding the native bearer token, Google tokens, or provider credentials to the URL or browser request. The user signs in through the normal web flow if needed, verifies the displayed FileTasks account is the intended one, then uses the web Connect Google Calendar control. The browser transaction is bound to that web session. The native app must not try to complete the flow by sending its bearer token to `/api/calendars/google/connect`; bearer-only starts are rejected. After the browser redirects back to FileTasks, the user returns to the native app, which reads status through `GET /api/calendars` using its normal bearer authentication. The browser and native app must be signed in to the same FileTasks account for that status to match. No app-specific callback or token handoff is used; native calendar screens are handled separately. The public calendar status response remains account-scoped and unchanged.
+Native clients do not need a Google authorization endpoint. A native screen opens the FileTasks web app (`/`) in the system browser without adding the native bearer token, Google tokens, or provider credentials to the URL or browser request. The user signs in through the normal web flow if needed, verifies the displayed FileTasks account is the intended one, then uses the web Connect Google Calendar control. The browser transaction is bound to that web session. The native app must not try to complete the flow by sending its bearer token to `/api/calendars/google/connect`; bearer-only starts are rejected. After the browser redirects back to FileTasks, the user returns to the native app, which reads status through `GET /api/calendars` using its normal bearer authentication. The browser and native app must be signed in to the same FileTasks account for that status to match. No app-specific callback or token handoff is used; native calendar screens are handled separately. Calendar connections and sync limitations in the public status response remain account-scoped.
 
 Reminder delivery runs in the background; reading Notifications does not trigger delivery. Schedule the worker endpoint every minute and send `Authorization: Bearer $FILETASKS_REMINDER_WORKER_SECRET`. Configure `FILETASKS_EMAIL_DELIVERY_URL` and/or `FILETASKS_PUSH_DELIVERY_URL` to enable those methods; settings responses include `emailAvailable` and `pushAvailable`, and unavailable methods cannot be enabled. Optional adapter bearer tokens use `FILETASKS_EMAIL_DELIVERY_TOKEN` and `FILETASKS_PUSH_DELIVERY_TOKEN`. Endpoints must use HTTPS except for localhost development.
 

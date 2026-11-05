@@ -761,6 +761,24 @@ button:disabled {
   -webkit-line-clamp: 2;
 }
 
+.calendar-event-notice {
+  display: grid;
+  gap: 5px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid #ead4b2;
+  border-radius: 8px;
+  background: #fff9ed;
+  color: #765527;
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.calendar-event-notice p { margin: 0; }
+.calendar-event-notice strong { color: #634515; }
+.calendar-event-hint { margin: 7px 0 0; color: #63796d; font-size: 11px; line-height: 1.5; }
+
 .item-card-complete .item-title {
   color: #77857a;
   text-decoration: line-through;
