@@ -482,7 +482,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private enum CalendarMutationOutcome {
+    private enum CalendarMutationOutcome: Equatable {
         case saved
         case deleted
     }
@@ -515,14 +515,24 @@ final class AppModel: ObservableObject {
                 return
             }
             let failed = statuses.contains { $0.state == "failed" }
-            let retryNote = failed ? " The last attempt failed; another retry is scheduled." : ""
+            let disconnected = statuses.contains { $0.connected != true }
+            let retryNote = disconnected
+                ? failed
+                    ? " Reconnect the disconnected calendar to retry."
+                    : " Reconnect the disconnected calendar to resume retries."
+                : failed
+                    ? " The last attempt failed; another retry is scheduled."
+                    : ""
+            let deliveryState = disconnected && failed ? "failed" : "pending"
             switch outcome {
             case .saved:
-                calendarSyncNotice = "Calendar sync pending. Your Event is saved in FileTasks and will be retried." + retryNote
+                calendarSyncNotice = "Calendar sync \(deliveryState). Your Event is saved in FileTasks\(disconnected ? "." : " and will be retried.")" + retryNote
             case .deleted:
-                calendarSyncNotice = "Calendar removal pending. Your Event was deleted from FileTasks and will be retried." + retryNote
+                calendarSyncNotice = "Calendar removal \(deliveryState). Your Event was deleted from FileTasks\(disconnected ? "." : " and will be retried.")" + retryNote
             case .none:
-                calendarSyncNotice = "Calendar changes are pending. Your Events are saved in FileTasks and will be retried." + retryNote
+                calendarSyncNotice = disconnected && failed
+                    ? "Calendar sync failed. Your Events are saved in FileTasks." + retryNote
+                    : "Calendar changes are pending. Your Events are saved in FileTasks\(disconnected ? "." : " and will be retried.")" + retryNote
             }
             calendarNoticeVersion += 1
         } catch {

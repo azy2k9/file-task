@@ -947,7 +947,7 @@ function googleExclusionDates(lines: string[], event: {start?:{date?:string;date
 
 function importEvent(userId: string, title: string, details: string, date: string, time: string | null, recurrence: RecurrenceRule | null = null) {
   const item = saveItem(userId,{ kind: "event", title: title.slice(0,200) || "Untitled Event", details: details.slice(0,10_000), scheduledDate: date, scheduledTime: time,
-    ...(recurrence ? { recurrence } : {}) });
+    ...(recurrence ? { recurrence } : {}) }, undefined, { enqueueCalendarSync: false });
   return item.id;
 }
 

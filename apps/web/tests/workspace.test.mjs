@@ -26,6 +26,7 @@ let deliveryRequests = [];
 let deliveredKeys = new Set();
 let failNextEmail = 0;
 let failNextGoogleRequest = null;
+let failNextAppleRequest = null;
 let loseNextGooglePostResponse = false;
 let googleInventoryBarrier = null;
 let providerRequests = [];
@@ -413,6 +414,7 @@ async function startDeliveryFakeDuringSetup(setup) {
   deliveredKeys = new Set();
   failNextEmail = 0;
   failNextGoogleRequest = null;
+  failNextAppleRequest = null;
   providerRequests = [];
   storageRequests = [];
   storageObjects = new Map();
@@ -546,6 +548,12 @@ async function startDeliveryFakeDuringSetup(setup) {
       }
     }
     if (url.pathname.startsWith("/apple/")) {
+      if (failNextAppleRequest?.path === url.pathname && failNextAppleRequest.method === request.method) {
+        const { status = 503 } = failNextAppleRequest;
+        failNextAppleRequest = null;
+        response.writeHead(status).end();
+        return;
+      }
       if (request.method === "PROPFIND") {
         response.writeHead(207, { "Content-Type": "application/xml" }).end("<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:propstat><d:prop><d:resourcetype><c:calendar/></d:resourcetype></d:prop></d:propstat></d:response></d:multistatus>");
         return;
@@ -1572,6 +1580,7 @@ test("Event mutations survive Calendar delivery failures and retry durably throu
   const other = await account();
   const priorGoogleEvents = googleEvents;
   const initialClock = new Date(testClock);
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
   googleEvents = new Map();
   failNextGoogleRequest = null;
   try {
@@ -1579,6 +1588,9 @@ test("Event mutations survive Calendar delivery failures and retry durably throu
     assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
       cookie: authorization.cookie, redirect: "manual",
     })).status, 303);
+    assert.equal((await request("/api/calendars", { token: owner.token, method: "POST", body: {
+      username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
+    } })).status, 201);
 
     const googleCollection = "/google/calendar/v3/calendars/primary/events";
     failNextGoogleRequest = { method: "POST", path: googleCollection, status: 503 };
@@ -1591,8 +1603,13 @@ test("Event mutations survive Calendar delivery failures and retry durably throu
     assert.equal((await (await request(`/api/items/${created.id}`, { token: owner.token })).json()).item.title,
       "Locally saved during Google outage");
     const failedCreateStatus = (await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery;
-    assert.equal(failedCreateStatus.some((entry) => entry.provider === "google" && entry.state === "failed"), true,
-      "the account must see durable Google delivery failure status");
+    const failedCreate = failedCreateStatus.find((entry) => entry.provider === "google");
+    assert.equal(failedCreate?.state, "failed", "the account must see durable Google delivery failure status");
+    assert.ok(failedCreate.attempts >= 1);
+    assert.ok(Number.isFinite(Date.parse(failedCreate.nextAttemptAt)));
+    assert.ok(Number.isFinite(Date.parse(failedCreate.lastAttemptAt)));
+    assert.match(failedCreate.lastError, /Calendar sync failed/i);
+    assert.equal(failedCreate.connected, true);
     assert.deepEqual((await (await request("/api/calendars", { token: other.token })).json()).syncDelivery, [],
       "another account must not see this delivery status");
 
@@ -1613,19 +1630,28 @@ test("Event mutations survive Calendar delivery failures and retry durably throu
     "successful retry should clear pending delivery status");
 
     const copyId = copied.id;
-    failNextGoogleRequest = { method: "PUT", path: `${googleCollection}/${copyId}`, status: 503 };
+    const appleCopyUrl = db.prepare("SELECT external_id FROM calendar_copies WHERE user_id=? AND item_id=? AND provider='apple'")
+      .get(owner.user.id, created.id)?.external_id;
+    assert.ok(appleCopyUrl, "the successful create should also retain an Apple copy mapping");
+    const appleCopyPath = new URL(appleCopyUrl).pathname;
+    failNextAppleRequest = { method: "PUT", path: appleCopyPath, status: 503 };
     const updatedResponse = await request(`/api/items/${created.id}`, { token: owner.token, method: "PATCH", body: { title: "Edited while Google is down" } });
     assert.equal(updatedResponse.status, 200, "Calendar delivery must not turn a committed Event update into an HTTP failure");
     assert.equal((await (await request(`/api/items/${created.id}`, { token: owner.token })).json()).item.title, "Edited while Google is down");
-    assert.equal(failNextGoogleRequest, null, "the injected Google update failure must be exercised");
+    assert.equal(failNextAppleRequest, null, "the injected Apple update failure must be exercised");
     assert.equal((await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery
-      .some((entry) => entry.provider === "google" && entry.state === "failed"), true);
+      .some((entry) => entry.provider === "apple" && entry.state === "failed"), true);
     assert.equal(googleEvents.get(copyId).summary, "Locally saved during Google outage",
-      "the failed provider write must not change remote details");
+      "the failed Apple delivery should not mutate an untouched Google copy");
+    assert.match(appleEvents.get(appleCopyPath), /SUMMARY:Locally saved during Google outage/,
+      "the failed Apple write must not change remote details");
 
     await advanceTestClock(60_000);
     assert.equal((await runReminderWorker()).status, 200);
     assert.equal(googleEvents.get(copyId).summary, "Edited while Google is down");
+    assert.match(appleEvents.get(appleCopyPath), /SUMMARY:Edited while Google is down/);
+    assert.equal((await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery
+      .some((entry) => entry.provider === "apple"), false, "the worker should clear failed Apple delivery status");
 
     failNextGoogleRequest = { method: "DELETE", path: `${googleCollection}/${copyId}`, status: 503 };
     const deletedResponse = await request(`/api/items/${created.id}`, { token: owner.token, method: "DELETE" });
@@ -1634,6 +1660,8 @@ test("Event mutations survive Calendar delivery failures and retry durably throu
     assert.equal((await request(`/api/items/${created.id}`, { token: owner.token })).status, 404,
       "the Event must be deleted locally even while its Calendar copy remains");
     assert.equal(googleEvents.has(copyId), true, "failed remote deletion must retain the provider copy for retry");
+    assert.equal(db.prepare("SELECT external_id FROM calendar_copies WHERE user_id=? AND item_id=? AND provider='google'")
+      .get(owner.user.id, created.id)?.external_id, copyId, "failed remote deletion must retain the mapping for retry");
     assert.equal((await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery
       .some((entry) => entry.provider === "google" && entry.state === "failed"), true,
     "the failed deletion must remain visible after the Event row is gone");
@@ -1643,12 +1671,16 @@ test("Event mutations survive Calendar delivery failures and retry durably throu
     await advanceTestClock(60_000);
     assert.equal((await runReminderWorker()).status, 200, "the worker should retry the deletion after restart");
     assert.equal(googleEvents.has(copyId), false, "the worker should remove the retained Google copy");
+    assert.equal(db.prepare("SELECT external_id FROM calendar_copies WHERE user_id=? AND item_id=? AND provider='google'")
+      .get(owner.user.id, created.id), undefined, "successful retry should remove the stale mapping");
     assert.deepEqual((await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery, [],
       "successful deletion retry should clear delivery status");
   } finally {
     failNextGoogleRequest = null;
+    failNextAppleRequest = null;
     googleEvents = priorGoogleEvents;
     await setTestClock(initialClock);
+    db.close();
   }
 });
 
@@ -1707,7 +1739,9 @@ test("Google reconnect to the same concrete calendar preserves copy timing and m
     const source = { id: "same-calendar-source", summary: "Same calendar timing", start: { dateTime: "2027-03-28T01:30:00+00:00", timeZone: "Europe/London" }, end: { dateTime: "2027-03-28T03:00:00+01:00", timeZone: "Europe/London" } };
     googleEvents.set(source.id, structuredClone(source));
     assert.equal((await connect("fake-code")).status, 303);
-    assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+    const initialSync = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+    const initialSyncBody = await initialSync.text();
+    assert.equal(initialSync.status, 200, `${initialSyncBody}\n${logs.slice(-6000)}`);
     const item = (await (await request("/api/items", { token: owner.token })).json()).items.find((entry) => entry.title === source.summary);
     assert.ok(item);
     const before = db.prepare(`SELECT c.external_id,c.connection_scope_id,m.timing_json,conn.credential_generation_id,conn.access_token,conn.refresh_token
@@ -2318,7 +2352,7 @@ test("Calendar sync is account-scoped and is a safe no-op before a provider is c
   assert.deepEqual((await (await request("/api/calendars", { token: owner.token })).json()).calendars, []);
   const response = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { synced: [], message: "Connect a calendar first." });
+  assert.deepEqual(await response.json(), { synced: [], message: "Connect a calendar first.", syncDelivery: [] });
   assert.equal((await request("/api/calendars", { method: "POST", body: { username: "a@example.com", password: "secret" } })).status, 401);
 });
 
@@ -2510,7 +2544,8 @@ test("browser Event saves and deletions remain local when Google delivery fails"
     await page.getByLabel(/^Date\b/).fill("2027-02-12");
     await page.getByRole("button", { name: "Save Event", exact: true }).click();
     await expect(page.getByRole("heading", { name: "Browser committed Event", exact: true })).toBeVisible();
-    await expect(page.getByRole("status")).toContainText(/Calendar sync pending\. Your Event is saved in FileTasks and will be retried\. The last attempt failed; another retry is scheduled\./i);
+    await expect(page.getByRole("status").filter({ hasText: "Calendar sync pending." }))
+      .toContainText(/Calendar sync pending\. Your Event is saved in FileTasks and will be retried\. The last attempt failed; another retry is scheduled\./i);
     assert.equal(failNextGoogleRequest, null, "the browser save should exercise the injected provider failure");
     const saved = (await (await request("/api/items", { token: owner.token })).json()).items
       .find((item) => item.title === "Browser committed Event");
@@ -2525,7 +2560,8 @@ test("browser Event saves and deletions remain local when Google delivery fails"
     await page.getByRole("button", { name: "Delete Browser committed Event", exact: true }).click();
     await page.getByRole("button", { name: "Delete", exact: true }).click();
     await expect(page.getByRole("heading", { name: "Browser committed Event", exact: true })).toHaveCount(0);
-    await expect(page.getByRole("status")).toContainText(/Calendar removal pending\. Your Event was deleted from FileTasks and will be retried\. The last attempt failed; another retry is scheduled\./i);
+    await expect(page.getByRole("status").filter({ hasText: "Calendar removal pending." }))
+      .toContainText(/Calendar removal pending\. Your Event was deleted from FileTasks and will be retried\. The last attempt failed; another retry is scheduled\./i);
     assert.equal(failNextGoogleRequest, null, "the browser deletion should exercise the injected provider failure");
     assert.equal((await request(`/api/items/${saved.id}`, { token: owner.token })).status, 404,
       "another client should observe the completed local deletion");

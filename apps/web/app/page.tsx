@@ -7,7 +7,7 @@ import FilesView from "./files-view";
 type Account = { id: string; email: string };
 type ReminderSettings = { taskReminders: ReminderRule[]; eventReminders: ReminderRule[]; pushEnabled: boolean; emailEnabled: boolean; pushAvailable: boolean; emailAvailable: boolean };
 type InAppNotification = { id: string; itemId: string; title: string; scheduledAt: string; readAt: string | null };
-type CalendarSyncDelivery = { provider: "google" | "apple"; state: "pending" | "failed"; attempts: number; nextAttemptAt: string | null; lastAttemptAt: string | null; lastError: string | null };
+type CalendarSyncDelivery = { provider: "google" | "apple"; state: "pending" | "failed"; attempts: number; nextAttemptAt: string | null; lastAttemptAt: string | null; lastError: string | null; connected?: boolean };
 type View = "agenda" | "task" | "event" | "files";
 type AuthMode = "login" | "register";
 type Draft = {
@@ -968,13 +968,23 @@ export default function Page() {
       if (identityVersion.current !== version || calendarDeliveryRequestVersion.current !== requestVersion) return;
       const statuses = result.syncDelivery ?? [];
       const failed = statuses.some((status) => status.state === "failed");
-      const retryText = failed ? " The last attempt failed; another retry is scheduled." : "";
+      const disconnected = statuses.some((status) => status.connected !== true);
+      const retryText = disconnected
+        ? failed
+          ? " Reconnect the disconnected calendar to retry."
+          : " Reconnect the disconnected calendar to resume retries."
+        : failed
+          ? " The last attempt failed; another retry is scheduled."
+          : "";
       if (statuses.length > 0) {
+        const statusText = disconnected && failed ? "failed" : "pending";
         const message = outcome === "deleted"
-          ? `Calendar removal pending. Your Event was deleted from FileTasks and will be retried.${retryText}`
+          ? `Calendar removal ${statusText}. Your Event was deleted from FileTasks${disconnected ? "." : " and will be retried."}${retryText}`
           : outcome === "saved"
-            ? `Calendar sync pending. Your Event is saved in FileTasks and will be retried.${retryText}`
-            : `Calendar changes are pending. Your Events are saved in FileTasks and will be retried.${retryText}`;
+            ? `Calendar sync ${statusText}. Your Event is saved in FileTasks${disconnected ? "." : " and will be retried."}${retryText}`
+            : disconnected && failed
+              ? `Calendar sync failed. Your Events are saved in FileTasks.${retryText}`
+              : `Calendar changes are pending. Your Events are saved in FileTasks${disconnected ? "." : " and will be retried."}${retryText}`;
         setCalendarDeliveryNotice(message);
         calendarDeliveryNoticeVersion.current += 1;
       } else if (outcome) {

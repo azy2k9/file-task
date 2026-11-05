@@ -31,6 +31,16 @@ data class WorkspaceItem(
     val isOccurrence: Boolean = false,
 )
 
+data class CalendarSyncDeliveryStatus(
+    val provider: String,
+    val state: String,
+    val attempts: Int,
+    val nextAttemptAt: String?,
+    val lastAttemptAt: String?,
+    val lastError: String?,
+    val connected: Boolean,
+)
+
 data class ReminderRule(val delivery: String, val amount: Int, val unit: String, val time: String)
 data class RecurrenceEnd(val type: String, val date: String? = null, val count: Int? = null)
 data class RecurrenceRule(val interval: Int, val unit: String, val weekdays: List<Int>?, val end: RecurrenceEnd)
@@ -227,6 +237,30 @@ class ApiClient(rawBaseUrl: String) {
     suspend fun deleteItem(token: String, item: WorkspaceItem, scope: String? = null) = withContext(Dispatchers.IO) {
         request("DELETE", "/api/items/${pathSegment(item.id)}${scope?.let { "?scope=${pathSegment(it)}" }.orEmpty()}", token = token)
         Unit
+    }
+
+    suspend fun calendarSyncDelivery(token: String): List<CalendarSyncDeliveryStatus> = withContext(Dispatchers.IO) {
+        val response = request("GET", "/api/calendars", token = token)
+        val statuses = response.optJSONArray("syncDelivery") ?: return@withContext emptyList()
+        buildList {
+            for (index in 0 until statuses.length()) {
+                val entry = statuses.optJSONObject(index) ?: continue
+                val provider = entry.optString("provider")
+                val state = entry.optString("state")
+                if (provider !in setOf("google", "apple") || state !in setOf("pending", "failed")) continue
+                add(
+                    CalendarSyncDeliveryStatus(
+                        provider = provider,
+                        state = state,
+                        attempts = entry.optInt("attempts"),
+                        nextAttemptAt = entry.optString("nextAttemptAt").takeUnless { it.isBlank() || it == "null" },
+                        lastAttemptAt = entry.optString("lastAttemptAt").takeUnless { it.isBlank() || it == "null" },
+                        lastError = entry.optString("lastError").takeUnless { it.isBlank() || it == "null" },
+                        connected = entry.optBoolean("connected"),
+                    ),
+                )
+            }
+        }
     }
 
     private fun request(

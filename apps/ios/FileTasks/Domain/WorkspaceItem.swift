@@ -116,6 +116,7 @@ struct CalendarSyncDeliveryStatus: Codable, Equatable, Identifiable {
     let nextAttemptAt: String?
     let lastAttemptAt: String?
     let lastError: String?
+    let connected: Bool?
 
     var id: String { provider }
 }

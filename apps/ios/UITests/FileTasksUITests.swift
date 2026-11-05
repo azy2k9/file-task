@@ -20,7 +20,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         createEventBySwitchingFromTask(title: "UI Runner Event Default")
         assertReminder(amount: 3, unit: "weeks")
         saveCurrentItem()
-        assertCalendarDeliveryNotice("Calendar sync failed. Your Event is saved in FileTasks and will be retried.")
+        assertCalendarDeliveryNotice("Calendar sync pending. Your Event is saved in FileTasks and will be retried. The last attempt failed; another retry is scheduled.")
 
         openItem("UI Runner Event Default")
         assertReminder(amount: 3, unit: "weeks")

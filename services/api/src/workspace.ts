@@ -512,16 +512,26 @@ function saveItemInTransaction(userId: string, body: Record<string, unknown>, id
   return getItem(userId, id);
 }
 
-export function saveItem(userId: string, body: Record<string, unknown>, id?: string) {
+export function saveItem(
+  userId: string,
+  body: Record<string, unknown>,
+  id?: string,
+  options: { enqueueCalendarSync?: boolean } = {},
+) {
   const db = database();
-  db.exec("BEGIN IMMEDIATE");
+  // SAVEPOINT composes with the import transaction, while still making the
+  // local Event write and retry intent atomic for normal API mutations.
+  db.exec("SAVEPOINT save_item_mutation");
   try {
     const item = saveItemInTransaction(userId, body, id);
-    if (item.kind === "event") enqueueCalendarSync(userId);
-    db.exec("COMMIT");
+    if (item.kind === "event" && options.enqueueCalendarSync !== false) enqueueCalendarSync(userId);
+    db.exec("RELEASE SAVEPOINT save_item_mutation");
     return item;
   } catch (error) {
-    try { db.exec("ROLLBACK"); } catch { /* Preserve the mutation error. */ }
+    try {
+      db.exec("ROLLBACK TO SAVEPOINT save_item_mutation");
+      db.exec("RELEASE SAVEPOINT save_item_mutation");
+    } catch { /* Preserve the mutation error. */ }
     throw error;
   }
 }
@@ -570,14 +580,17 @@ function deleteItemInTransaction(userId: string, id: string, scope?: unknown) {
 
 export function deleteItem(userId: string, id: string, scope?: unknown) {
   const db = database();
-  db.exec("BEGIN IMMEDIATE");
+  db.exec("SAVEPOINT delete_item_mutation");
   try {
     const item = getItem(userId,id);
     deleteItemInTransaction(userId,id,scope);
     if (item.kind === "event") enqueueCalendarSync(userId);
-    db.exec("COMMIT");
+    db.exec("RELEASE SAVEPOINT delete_item_mutation");
   } catch (error) {
-    try { db.exec("ROLLBACK"); } catch { /* Preserve the mutation error. */ }
+    try {
+      db.exec("ROLLBACK TO SAVEPOINT delete_item_mutation");
+      db.exec("RELEASE SAVEPOINT delete_item_mutation");
+    } catch { /* Preserve the mutation error. */ }
     throw error;
   }
 }
