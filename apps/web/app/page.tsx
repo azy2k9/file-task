@@ -368,6 +368,12 @@ function ItemCard({
         </div>
         <h3 className="item-title">{item.title}</h3>
         {item.details && <p className="item-details">{item.details}</p>}
+        {item.calendarSync.some((status) => status.state === "limited") && <div className="calendar-event-notice" role="status">
+          {item.calendarSync.filter((status) => status.state === "limited").map((status) => <p key={status.provider}><strong>{status.provider === "google" ? "Google" : "Apple"} Calendar sync paused.</strong> {status.limitation}</p>)}
+        </div>}
+        {!item.calendarSync.some((status) => status.state === "limited") && item.calendarSync.some((status) => status.scheduleEdited)
+          && <p className="calendar-event-hint">Timing changed in FileTasks. The imported duration and timezone are preserved when syncing.</p>}
+        {item.calendarSync.find((status) => status.location)?.location && <p className="item-details">Location: {item.calendarSync.find((status) => status.location)?.location}</p>}
         {item.files.length > 0 && <div className="item-files" aria-label={`Files attached to ${item.title}`}>
           {item.files.map((file) => <button className="item-file-link" type="button" key={file.id} onClick={() => onViewFile(file.id)}>▤ {file.name}</button>)}
         </div>}
@@ -457,6 +463,11 @@ function ItemDialog({
       </div>
       <form className="editor-form" onSubmit={onSubmit}>
         {error && <p className="form-error" role="alert">{error}</p>}
+        {editor.item?.calendarSync.some((status) => status.state === "limited") && <div className="calendar-event-notice" role="status">
+          {editor.item.calendarSync.filter((status) => status.state === "limited").map((status) => <p key={status.provider}><strong>{status.provider === "google" ? "Google" : "Apple"} Calendar sync paused.</strong> {status.limitation}</p>)}
+        </div>}
+        {editor.item && !editor.item.calendarSync.some((status) => status.state === "limited") && editor.item.calendarSync.some((status) => status.scheduleEdited)
+          && <p className="calendar-event-hint">Timing changed in FileTasks. The imported duration and timezone are preserved when syncing.</p>}
         <label className="field-label" htmlFor="item-title">Title</label>
         <input
           id="item-title"
@@ -598,6 +609,7 @@ function ReminderSettingsDialog({ initial, accountId, onClose, onSave }: {
   const [calendarError, setCalendarError] = useState<string | null>(null);
   const [calendarBusy, setCalendarBusy] = useState(false);
   const [calendars, setCalendars] = useState<{ provider: "google" | "apple"; account_label: string }[]>([]);
+  const [calendarSyncLimitations, setCalendarSyncLimitations] = useState<{itemId:string;title:string;provider:"google"|"apple";message:string}[]>([]);
   const [appleUsername, setAppleUsername] = useState("");
   const [applePassword, setApplePassword] = useState("");
   const [appleCalendarUrl, setAppleCalendarUrl] = useState("");
@@ -606,7 +618,11 @@ function ReminderSettingsDialog({ initial, accountId, onClose, onSave }: {
     const dialog = dialogRef.current;
     if (dialog && !dialog.open) dialog.showModal();
     void fetch("/api/calendars", { credentials: "same-origin", cache: "no-store" }).then(async (response) => {
-      if (response.ok) setCalendars(((await response.json()) as { calendars: { provider: "google" | "apple"; account_label: string }[] }).calendars);
+      if (response.ok) {
+        const result = await response.json() as {calendars:{provider:"google"|"apple";account_label:string}[];syncLimitations?:{itemId:string;title:string;provider:"google"|"apple";message:string}[]};
+        setCalendars(result.calendars);
+        setCalendarSyncLimitations(result.syncLimitations ?? []);
+      }
     }).catch(() => undefined);
     return () => { if (dialog?.open) dialog.close(); };
   }, []);
@@ -632,16 +648,23 @@ function ReminderSettingsDialog({ initial, accountId, onClose, onSave }: {
       const response = await fetch(path, { credentials: "same-origin", ...init });
       if (!response.ok) throw new Error(await errorFromResponse(response, "Calendar action failed."));
       if (response.status !== 204) {
-        const result = await response.json() as { calendars?: { provider: "google" | "apple"; account_label: string }[]; synced?: string[]; message?: string };
+        const result = await response.json() as { calendars?: { provider: "google" | "apple"; account_label: string }[]; synced?: string[]; message?: string; syncLimitations?:{itemId:string;title:string;provider:"google"|"apple";message:string}[] };
         if (result.calendars) setCalendars(result.calendars);
-        else if (result.synced) setCalendarError(`Synced ${result.synced.join(" and ")} Calendar${result.synced.length === 1 ? "" : "s"}.`);
+        if (result.syncLimitations) setCalendarSyncLimitations(result.syncLimitations);
+        if (result.synced) setCalendarError(`Synced ${result.synced.join(" and ")} Calendar${result.synced.length === 1 ? "" : "s"}.${result.syncLimitations?.length ? ` ${result.syncLimitations.length} Event sync limitation${result.syncLimitations.length === 1 ? "" : "s"}.` : ""}`);
         else {
           const refreshed = await fetch("/api/calendars", { credentials: "same-origin", cache: "no-store" });
-          if (refreshed.ok) setCalendars(((await refreshed.json()) as { calendars: { provider: "google" | "apple"; account_label: string }[] }).calendars);
+          if (refreshed.ok) {
+            const status = await refreshed.json() as {calendars:{provider:"google"|"apple";account_label:string}[];syncLimitations?:{itemId:string;title:string;provider:"google"|"apple";message:string}[]};
+            setCalendars(status.calendars); setCalendarSyncLimitations(status.syncLimitations ?? []);
+          }
         }
       } else {
         const refreshed = await fetch("/api/calendars", { credentials: "same-origin", cache: "no-store" });
-        if (refreshed.ok) setCalendars(((await refreshed.json()) as { calendars: { provider: "google" | "apple"; account_label: string }[] }).calendars);
+        if (refreshed.ok) {
+          const status = await refreshed.json() as {calendars:{provider:"google"|"apple";account_label:string}[];syncLimitations?:{itemId:string;title:string;provider:"google"|"apple";message:string}[]};
+          setCalendars(status.calendars); setCalendarSyncLimitations(status.syncLimitations ?? []);
+        }
       }
     } catch (failure) { setCalendarError(failure instanceof Error ? failure.message : "Calendar action failed."); }
     finally { setCalendarBusy(false); }
@@ -660,6 +683,9 @@ function ReminderSettingsDialog({ initial, accountId, onClose, onSave }: {
       <section className="calendar-settings" aria-labelledby="calendar-settings-title">
         <div className="calendar-settings-title"><div><p className="eyebrow">CONNECTED CALENDARS</p><h3 id="calendar-settings-title">Sync Calendar</h3></div><button className="button button-secondary" type="button" disabled={calendarBusy} onClick={() => void updateCalendar("/api/calendars/sync", { method: "POST" })}>{calendarBusy ? "Syncing…" : "Sync Calendar"}</button></div>
         {calendars.map((calendar) => <div className="calendar-connection" key={calendar.provider}><span>{calendar.provider === "google" ? "Google Calendar" : "Apple Calendar"} · {calendar.account_label}</span><button className="button button-quiet" type="button" disabled={calendarBusy} onClick={() => void updateCalendar(`/api/calendars/${calendar.provider}`, { method: "DELETE" })}>Disconnect</button></div>)}
+        {calendarSyncLimitations.length > 0 && <div className="calendar-event-notice" aria-label="Calendar sync limitations">
+          {calendarSyncLimitations.map((limitation) => <p key={`${limitation.itemId}:${limitation.provider}`}><strong>{limitation.title} · {limitation.provider === "google" ? "Google" : "Apple"} Calendar:</strong> {limitation.message}</p>)}
+        </div>}
         {!calendars.some((calendar) => calendar.provider === "google") && <button className="button button-secondary" type="button" disabled={calendarBusy} onClick={() => window.location.assign("/api/calendars/google/connect")}>Connect Google Calendar</button>}
         {!calendars.some((calendar) => calendar.provider === "apple") && <div className="apple-calendar-connect">
           <label className="field-label" htmlFor="apple-calendar-user">Apple ID</label><input id="apple-calendar-user" type="email" autoComplete="username" value={appleUsername} disabled={calendarBusy} onChange={(event) => setAppleUsername(event.target.value)} />

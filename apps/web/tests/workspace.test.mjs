@@ -26,14 +26,19 @@ let deliveryRequests = [];
 let deliveredKeys = new Set();
 let failNextEmail = 0;
 let failNextGoogleRequest = null;
+let loseNextGooglePostResponse = false;
+let googleInventoryBarrier = null;
 let providerRequests = [];
 let storageRequests = [];
 let storageObjects = new Map();
+let googleEventPages = null;
 let googleEvents = new Map();
+let googleCalendarId = "primary";
 let googleInstances = new Map();
 let googleExceptions = new Map();
 let googleInstanceRequests = [];
 let appleEvents = new Map();
+let omittedAppleReports = new Set();
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
 const nextBin = createRequire(import.meta.url).resolve("next/dist/bin/next");
@@ -100,6 +105,7 @@ function validAppleCalendar(ics) {
   if (lines[0] !== "BEGIN:VCALENDAR" || lines.at(-1) !== "END:VCALENDAR") return false;
 
   let currentEvent = null;
+  let nested = 0;
   let events = [];
   const calendarProperties = [];
   for (const line of lines.slice(1, -1)) {
@@ -107,11 +113,13 @@ function validAppleCalendar(ics) {
       if (currentEvent) return false;
       currentEvent = [];
     } else if (line === "END:VEVENT") {
-      if (!currentEvent) return false;
+      if (!currentEvent || nested) return false;
       events.push(currentEvent);
       currentEvent = null;
-    } else if (/^(?:BEGIN|END):/i.test(line)) return false;
-    else if (currentEvent) currentEvent.push(line);
+    } else if (currentEvent && /^BEGIN:/i.test(line)) nested++;
+    else if (currentEvent && /^END:/i.test(line) && nested > 0) nested--;
+    else if (/^(?:BEGIN|END):/i.test(line)) return false;
+    else if (currentEvent && nested === 0) currentEvent.push(line);
     else calendarProperties.push(line);
   }
   if (currentEvent || !events.length) return false;
@@ -407,6 +415,7 @@ async function startDeliveryFakeDuringSetup(setup) {
   providerRequests = [];
   storageRequests = [];
   storageObjects = new Map();
+  googleEventPages = null;
   googleEvents = new Map();
   googleInstances = new Map();
   googleExceptions = new Map();
@@ -440,7 +449,7 @@ async function startDeliveryFakeDuringSetup(setup) {
     }
     const isJson = request.headers["content-type"]?.includes("application/json");
     const body = isJson && bodyText ? JSON.parse(bodyText) : {};
-    providerRequests.push({ path: url.pathname, method: request.method, body, text: bodyText });
+    providerRequests.push({ path: url.pathname, method: request.method, body, text: bodyText, query: url.search, headers: request.headers });
     const idempotencyKey = request.headers["idempotency-key"];
     deliveryRequests.push({ path: request.url, body, idempotencyKey });
     if (failNextGoogleRequest?.path === url.pathname && failNextGoogleRequest.method === request.method) {
@@ -455,17 +464,33 @@ async function startDeliveryFakeDuringSetup(setup) {
       return;
     }
     if (url.pathname === "/google-token") {
-      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ access_token: "fake-access", refresh_token: "fake-refresh", expires_in: 3600 }));
+      const authorizationCode = new URLSearchParams(bodyText).get("code");
+      const tokens = authorizationCode === "reconnect-code"
+        ? { access_token: "reconnected-access", refresh_token: "reconnected-refresh", expires_in: 3600 }
+        : { access_token: "fake-access", refresh_token: "fake-refresh", expires_in: 3600 };
+      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(tokens));
       return;
     }
     if (url.pathname === "/google/calendar/v3/calendars/primary") {
-      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ id: "primary", summary: "Fake Google Calendar" }));
+      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ id: googleCalendarId, summary: "Fake Google Calendar" }));
       return;
     }
-    if (url.pathname.startsWith("/google/calendar/v3/calendars/primary/events")) {
+    if (url.pathname.startsWith(`/google/calendar/v3/calendars/${googleCalendarId}/events`) || url.pathname.startsWith("/google/calendar/v3/calendars/primary/events")) {
       const parts = url.pathname.split("/");
       const eventId = parts[parts.length - 1] === "events" || parts.at(-1) === "instances" ? null : parts.at(-1);
       if (request.method === "GET" && url.pathname.endsWith("/events")) {
+        if (googleInventoryBarrier) {
+          const barrier = googleInventoryBarrier;
+          if (++barrier.arrivals === 2) barrier.release();
+          barrier.arrived?.();
+          await barrier.ready;
+        }
+        if (googleEventPages) {
+          const page = googleEventPages[url.searchParams.get("pageToken") ?? "first"];
+          if (page?.status) { response.writeHead(page.status).end(); return; }
+          response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(page));
+          return;
+        }
         response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ items: [...googleEvents.values()] }));
         return;
       }
@@ -482,6 +507,14 @@ async function startDeliveryFakeDuringSetup(setup) {
         response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ items }));
         return;
       }
+      if (request.method === "GET" && eventId) {
+        const event = googleEvents.get(eventId);
+        if (!event) {
+          response.writeHead(404).end(); return;
+        }
+        response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(event));
+        return;
+      }
       if (request.method === "DELETE") {
         googleEvents.delete(eventId);
         response.writeHead(204).end();
@@ -489,7 +522,9 @@ async function startDeliveryFakeDuringSetup(setup) {
       }
       if (request.method === "PUT" || request.method === "PATCH") {
         if (!googleEvents.has(eventId)) {
-          if (!googleInstances.has(eventId)) { response.writeHead(404).end(); return; }
+          if (!googleInstances.has(eventId)) {
+            response.writeHead(404).end(); return;
+          }
           googleExceptions.set(eventId, { ...body, id: eventId });
           googleInstances.set(eventId, { ...googleInstances.get(eventId), ...body, id: eventId });
           response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ id: eventId }));
@@ -500,8 +535,11 @@ async function startDeliveryFakeDuringSetup(setup) {
         return;
       }
       if (request.method === "POST") {
-        const id = `google-${crypto.randomUUID()}`;
+        if ((body.conferenceData && url.searchParams.get("conferenceDataVersion") !== "1") || (body.attachments && url.searchParams.get("supportsAttachments") !== "true")) { response.writeHead(400).end(); return; }
+        const id = body.id ?? `google-${crypto.randomUUID()}`;
+        if (googleEvents.has(id)) { response.writeHead(409).end(); return; }
         googleEvents.set(id, { ...body, id });
+        if (loseNextGooglePostResponse) { loseNextGooglePostResponse = false; response.writeHead(200, { "Content-Type": "application/json" }).end("{"); return; }
         response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ id }));
         return;
       }
@@ -513,10 +551,16 @@ async function startDeliveryFakeDuringSetup(setup) {
       }
       if (request.method === "REPORT") {
         const calendarPath = url.pathname.endsWith("/") ? url.pathname : `${url.pathname}/`;
-        const resources = [...appleEvents.entries()].filter(([path]) => path.startsWith(calendarPath));
+        const resources = [...appleEvents.entries()].filter(([path]) => path.startsWith(calendarPath) && !omittedAppleReports.has(path));
         const entries = resources.map(([path, calendarData], index) => `<d:response><d:href>${escapeXml(path)}</d:href><d:propstat><d:prop><d:getetag>"apple-${index + 1}"</d:getetag><c:calendar-data>${escapeXml(calendarData)}</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`).join("");
         response.writeHead(207, { "Content-Type": "application/xml; charset=utf-8" })
           .end(`<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">${entries}</d:multistatus>`);
+        return;
+      }
+      if (request.method === "GET") {
+        const resource = appleEvents.get(url.pathname);
+        if (resource === undefined) response.writeHead(404).end();
+        else response.writeHead(200, { "Content-Type": "text/calendar" }).end(resource);
         return;
       }
       if (request.method === "PUT") {
@@ -529,6 +573,7 @@ async function startDeliveryFakeDuringSetup(setup) {
           return;
         }
         const existed = appleEvents.has(url.pathname);
+        if (request.headers["if-none-match"] === "*" && existed) { response.writeHead(412).end(); return; }
         appleEvents.set(url.pathname, bodyText);
         response.writeHead(existed ? 204 : 201).end();
         return;
@@ -1478,6 +1523,283 @@ test("Google and Apple Calendar copies sync through fake provider boundaries", a
   assert.equal(calendarRequests.some(({ method }) => method === "DELETE"), true);
 });
 
+test("Google DELETE failure preserves mapping and retries on sync", async () => {
+  const owner = await account();
+  const auth = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, { cookie: auth.cookie, redirect: "manual" })).status, 303);
+  const create = async (title) => (await (await request("/api/items", { token: owner.token, method: "POST", body: { kind: "event", title, scheduledDate: "2027-01-14" } })).json()).item;
+  const event = await create("Delete failure");
+  const other = await create("Unrelated event");
+  const [copyId] = [...googleEvents.entries()].find(([, copy]) => copy.extendedProperties.private.filetasksItemId === event.id);
+  const path = `/google/calendar/v3/calendars/primary/events/${copyId}`;
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  try {
+    const mapping = () => db.prepare("SELECT * FROM calendar_copies WHERE user_id=? AND item_id=?").all(owner.user.id, event.id);
+    const before = mapping();
+    assert.equal(before.length, 1);
+    failNextGoogleRequest = { method: "DELETE", path, status: 500 };
+    await request(`/api/items/${event.id}`, { token: owner.token, method: "DELETE" });
+    assert.deepEqual(mapping(), before);
+    assert.equal(googleEvents.has(copyId), true);
+    const [otherId, otherCopy] = [...googleEvents.entries()].find(([, copy]) => copy.extendedProperties.private.filetasksItemId === other.id);
+    googleEvents.set(otherId, { ...otherCopy, summary: "External change" });
+    failNextGoogleRequest = { method: "DELETE", path, status: 500 };
+    const failed = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+    const result = await failed.json();
+    assert.equal(failNextGoogleRequest, null, "the fake DELETE failure was exercised");
+    assert.deepEqual(mapping(), before);
+    assert.equal(googleEvents.has(copyId), true);
+    assert.equal(googleEvents.get(otherId).summary, "Unrelated event");
+    assert.ok(result.syncLimitations.some((limitation) => limitation.itemId === event.id && limitation.provider === "google" && /could not be removed/i.test(limitation.message)), "sync must visibly report the provider failure");
+    assert.ok(!result.synced?.includes("google"), "failed provider must not be reported as synced");
+    assert.deepEqual(mapping(), before);
+    assert.equal(googleEvents.has(copyId), true);
+    assert.ok([...googleEvents.values()].some((copy) => copy.extendedProperties.private.filetasksItemId === other.id));
+    const retry = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+    assert.equal(retry.status, 200);
+    assert.ok((await retry.json()).synced.includes("google"));
+    assert.equal(googleEvents.has(copyId), false);
+    assert.equal(mapping().length, 0);
+  } finally {
+    failNextGoogleRequest = null;
+    db.close();
+  }
+});
+
+test("Google reconnect collision preserves old mapping and unrelated events", async () => {
+  const owner = await account();
+  const connect = async () => {
+    const auth = await beginGoogleAuthorization(owner);
+    return request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, { cookie: auth.cookie, redirect: "manual" });
+  };
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  try {
+    googleCalendarId = "identity-a";
+    assert.equal((await connect()).status, 303);
+    const created = await request("/api/items", { token: owner.token, method: "POST", body: { kind: "event", title: "Original connection event", scheduledDate: "2027-01-14" } });
+    assert.equal(created.status, 201);
+    const event = (await created.json()).item;
+    const [id, copy] = [...googleEvents.entries()][0];
+    const mappingBefore = db.prepare("SELECT * FROM calendar_copies WHERE user_id=? AND item_id=?").all(owner.user.id, event.id);
+    const scopeBefore = db.prepare("SELECT connection_scope_id FROM calendar_connections WHERE user_id=? AND provider='google'").get(owner.user.id).connection_scope_id;
+    assert.equal(mappingBefore.length, 1);
+    const unrelated = { ...copy, summary: "Unrelated B event", description: "Unrelated event" };
+    googleEvents = new Map([[id, structuredClone(unrelated)]]);
+    googleCalendarId = "identity-b";
+    assert.equal((await connect()).status, 303);
+    const scopeAfter = db.prepare("SELECT connection_scope_id FROM calendar_connections WHERE user_id=? AND provider='google'").get(owner.user.id).connection_scope_id;
+    assert.notEqual(scopeAfter, scopeBefore, "a different resolved Google calendar must rotate the scope");
+    const sync = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+    assert.deepEqual(googleEvents.get(id), unrelated);
+    const edited = await request(`/api/items/${event.id}`, { token: owner.token, method: "PATCH", body: { title: "Edited original", scope: "series" } });
+    assert.deepEqual(googleEvents.get(id), unrelated);
+    const deleted = await request(`/api/items/${event.id}`, { token: owner.token, method: "DELETE" });
+    assert.deepEqual(googleEvents.get(id), unrelated);
+    const newEvent = await request("/api/items", { token: owner.token, method: "POST", body: { kind: "event", title: "New connection event", scheduledDate: "2027-01-15" } });
+    assert.equal(sync.status, 200);
+    assert.equal(edited.status, 200);
+    assert.equal(deleted.status, 204);
+    assert.equal(newEvent.status, 201);
+    assert.deepEqual(db.prepare("SELECT * FROM calendar_copies WHERE user_id=? AND item_id=?").all(owner.user.id, event.id), mappingBefore);
+    assert.ok([...googleEvents.values()].some((value) => value.summary === "New connection event"));
+  } finally {
+    db.close();
+    googleCalendarId = "primary";
+    googleEvents.clear();
+  }
+});
+
+test("Google reconnect to the same concrete calendar preserves copy timing and mapping", async () => {
+  const owner = await account();
+  const connect = async (code) => {
+    const auth = await beginGoogleAuthorization(owner);
+    return request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=${code}`, { cookie: auth.cookie, redirect: "manual" });
+  };
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  try {
+    googleCalendarId = "same-calendar-id";
+    const source = { id: "same-calendar-source", summary: "Same calendar timing", start: { dateTime: "2027-03-28T01:30:00+00:00", timeZone: "Europe/London" }, end: { dateTime: "2027-03-28T03:00:00+01:00", timeZone: "Europe/London" } };
+    googleEvents.set(source.id, structuredClone(source));
+    assert.equal((await connect("fake-code")).status, 303);
+    assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+    const item = (await (await request("/api/items", { token: owner.token })).json()).items.find((entry) => entry.title === source.summary);
+    assert.ok(item);
+    const before = db.prepare(`SELECT c.external_id,c.connection_scope_id,m.timing_json,conn.credential_generation_id,conn.access_token,conn.refresh_token
+      FROM calendar_copies c JOIN calendar_import_metadata m ON m.user_id=c.user_id AND m.item_id=c.item_id
+      JOIN calendar_connections conn ON conn.user_id=c.user_id AND conn.provider=c.provider
+      WHERE c.user_id=? AND c.item_id=? AND c.provider='google'`).get(owner.user.id,item.id);
+    assert.ok(before);
+    assert.equal(before.external_id, source.id);
+    assert.equal((await connect("reconnect-code")).status, 303);
+    const after = db.prepare(`SELECT c.external_id,c.connection_scope_id,m.timing_json,conn.credential_generation_id,conn.access_token,conn.refresh_token
+      FROM calendar_copies c JOIN calendar_import_metadata m ON m.user_id=c.user_id AND m.item_id=c.item_id
+      JOIN calendar_connections conn ON conn.user_id=c.user_id AND conn.provider=c.provider
+      WHERE c.user_id=? AND c.item_id=? AND c.provider='google'`).get(owner.user.id,item.id);
+    assert.equal(after.external_id, before.external_id);
+    assert.equal(after.connection_scope_id, before.connection_scope_id);
+    assert.equal(after.timing_json, before.timing_json);
+    assert.notEqual(after.credential_generation_id, before.credential_generation_id);
+    assert.notEqual(after.access_token, before.access_token);
+    assert.notEqual(after.refresh_token, before.refresh_token);
+    db.prepare("UPDATE calendar_connections SET expires_at=0 WHERE user_id=? AND provider='google'").run(owner.user.id);
+    const refreshResponse = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+    assert.equal(refreshResponse.status, 200, await refreshResponse.text());
+    const afterRefresh = db.prepare("SELECT credential_generation_id,access_token FROM calendar_connections WHERE user_id=? AND provider='google'").get(owner.user.id);
+    assert.equal(afterRefresh.credential_generation_id, after.credential_generation_id, "token refresh preserves the credential generation");
+    assert.notEqual(afterRefresh.access_token, after.access_token, "token refresh replaces the cached access token");
+  } finally {
+    db.close();
+    googleCalendarId = "primary";
+    googleEvents.clear();
+  }
+});
+
+test("Google sync started before same-calendar reconnect cannot commit", async () => {
+  const owner = await account();
+  const connect = async (code) => {
+    const auth = await beginGoogleAuthorization(owner);
+    return request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=${code}`, { cookie: auth.cookie, redirect: "manual" });
+  };
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  let release;
+  let arrive;
+  const ready = new Promise((resolve) => { release = resolve; });
+  const arrived = new Promise((resolve) => { arrive = resolve; });
+  try {
+    googleCalendarId = "race-calendar-id";
+    const created = await request("/api/items", { token: owner.token, method: "POST", body: { kind: "event", title: "Wait for sync", scheduledDate: "2027-04-14" } });
+    assert.equal(created.status, 201);
+    const item = (await created.json()).item;
+    assert.equal((await connect("fake-code")).status, 303);
+    googleInventoryBarrier = { arrivals: 0, ready, release, arrived: arrive };
+    const inFlight = request("/api/calendars/sync", { token: owner.token, method: "POST" });
+    await arrived;
+    assert.equal((await connect("reconnect-code")).status, 303);
+    release();
+    const response = await inFlight;
+    assert.equal(response.status, 409);
+    assert.equal(db.prepare("SELECT 1 FROM calendar_copies WHERE user_id=? AND provider='google' AND item_id=?").get(owner.user.id,item.id), undefined);
+    assert.equal(googleEvents.size, 0, "the stale run must stop before creating a provider copy");
+  } finally {
+    release?.();
+    googleInventoryBarrier = null;
+    db.close();
+    googleCalendarId = "primary";
+    googleEvents.clear();
+  }
+});
+
+test("Apple Calendar reconnect keeps Calendar copy identity scoped to its connection", async () => {
+  const owner = await account();
+  const connect = (name) => request("/api/calendars", { token: owner.token, method: "POST", body: {
+    username: `${name}@example.com`, password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/${name}/`,
+  } });
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  try {
+    assert.equal((await connect("identity-a")).status, 201);
+    const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "event", title: "Original connection event", scheduledDate: "2027-01-14",
+    } });
+    assert.equal(created.status, 201);
+    const event = (await created.json()).item;
+    const pathA = [...appleEvents.keys()].find((path) => path.startsWith("/apple/identity-a/"));
+    assert.ok(pathA);
+    const pathB = pathA.replace("/identity-a/", "/identity-b/");
+    const unrelated = appleEvents.get(pathA).replace("SUMMARY:Original connection event", "SUMMARY:Unrelated B event").replace(/^URL:.*\r?\n/m, "");
+    appleEvents.set(pathB, unrelated);
+    const mappingBefore = db.prepare("SELECT * FROM calendar_copies WHERE user_id=? AND item_id=?").all(owner.user.id, event.id);
+    const connectionBefore = db.prepare("SELECT connection_scope_id,credential_generation_id FROM calendar_connections WHERE user_id=? AND provider='apple'").get(owner.user.id);
+    assert.equal(mappingBefore.length, 1);
+    assert.equal((await connect("identity-b")).status, 201);
+    const connectionAfter = db.prepare("SELECT connection_scope_id,credential_generation_id FROM calendar_connections WHERE user_id=? AND provider='apple'").get(owner.user.id);
+    assert.notEqual(connectionAfter.connection_scope_id, connectionBefore.connection_scope_id);
+    assert.notEqual(connectionAfter.credential_generation_id, connectionBefore.credential_generation_id);
+    const sync = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+    const afterSync = appleEvents.get(pathB);
+    const edited = await request(`/api/items/${event.id}`, { token: owner.token, method: "PATCH", body: { title: "Edited original", scope: "series" } });
+    const afterEdit = appleEvents.get(pathB);
+    const deleted = await request(`/api/items/${event.id}`, { token: owner.token, method: "DELETE" });
+    const afterDelete = appleEvents.get(pathB);
+    const newEvent = await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "event", title: "New connection event", scheduledDate: "2027-01-15",
+    } });
+    const mappingAfter = db.prepare("SELECT * FROM calendar_copies WHERE user_id=? AND item_id=?").all(owner.user.id, event.id);
+    assert.equal(sync.status, 200);
+    assert.equal(edited.status, 200);
+    assert.equal(deleted.status, 204);
+    assert.equal(newEvent.status, 201);
+    assert.equal(afterSync, unrelated, "sync must preserve the unrelated B event");
+    assert.equal(afterEdit, unrelated, "editing the old Event must preserve the unrelated B event");
+    assert.equal(afterDelete, unrelated, "deleting the old Event must preserve the unrelated B event");
+    assert.deepEqual(mappingAfter, mappingBefore, "the old connection mapping must survive");
+    assert.ok([...appleEvents.entries()].some(([path, value]) => path.startsWith("/apple/identity-b/") && value.includes("SUMMARY:New connection event")));
+  } finally {
+    db.close();
+    for (const path of appleEvents.keys()) if (path.startsWith("/apple/identity-a/") || path.startsWith("/apple/identity-b/")) appleEvents.delete(path);
+  }
+});
+
+test("imported provider timing survives sync, edits, and unsupported representations", async () => {
+  const owner = await account();
+  const authorization = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, { cookie: authorization.cookie, redirect: "manual" })).status, 303);
+  const samples = [
+    { id:"timed-short",summary:"Short",start:{dateTime:"2027-03-14T01:55:00-05:00",timeZone:"America/New_York"},end:{dateTime:"2027-03-14T03:05:00-04:00",timeZone:"America/New_York"},location:"Room A" },
+    { id:"timed-long",summary:"Long",start:{dateTime:"2027-01-14T22:00:00+05:30"},end:{dateTime:"2027-01-16T02:00:00+05:30"} },
+    { id:"all-days",summary:"Days",start:{date:"2027-01-14"},end:{date:"2027-01-18"} },
+    { id:"unsupported",summary:"Unsupported",start:{dateTime:"2027-01-14T12:00:00"},end:{dateTime:"2027-01-14T13:00:00"} },
+  ];
+  try {
+    for (const sample of samples) googleEvents.set(sample.id, structuredClone(sample));
+    const sync = await request("/api/calendars/sync", { token:owner.token,method:"POST" });
+    assert.equal(sync.status,200);
+    assert.ok((await sync.json()).syncLimitations.some((entry) => entry.title === "Unsupported"));
+    for (const sample of samples) {
+      assert.deepEqual(googleEvents.get(sample.id).start,sample.start);
+      assert.deepEqual(googleEvents.get(sample.id).end,sample.end);
+    }
+    assert.equal(googleEvents.get("timed-short").location,"Room A");
+    const items = (await (await request("/api/items",{token:owner.token})).json()).items;
+    const short = items.find((item) => item.title === "Short");
+    assert.equal(short.scheduledTime,"01:55");
+    assert.equal(short.calendarSync[0].scheduleEdited,false);
+    assert.equal((await request(`/api/items/${short.id}`,{token:owner.token,method:"PATCH",body:{scheduledDate:"2027-03-15",scheduledTime:"09:00"}})).status,200);
+    assert.equal(googleEvents.get("timed-short").start.dateTime,"2027-03-15T09:00:00-04:00");
+    assert.equal(googleEvents.get("timed-short").end.dateTime,"2027-03-15T09:10:00-04:00");
+    assert.equal((await (await request(`/api/items/${short.id}`,{token:owner.token})).json()).item.calendarSync[0].scheduleEdited,true);
+    assert.equal((await request(`/api/items/${short.id}`,{token:owner.token,method:"PATCH",body:{scheduledDate:null,scheduledTime:null}})).status,200);
+    assert.ok(googleEvents.has("timed-short"));
+  } finally { googleEvents.clear(); }
+
+  const appleOwner = await account();
+  assert.equal((await request("/api/calendars",{token:appleOwner.token,method:"POST",body:{username:"person@example.com",password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/calendar/`}})).status,201);
+  const fixtures = [
+    ["short", "DTSTART;TZID=America/New_York:20270314T015500\r\nDTEND;TZID=America/New_York:20270314T030500"],
+    ["long", "DTSTART:20270114T220000Z\r\nDTEND:20270116T020000Z"],
+    ["days", "DTSTART;VALUE=DATE:20270114\r\nDTEND;VALUE=DATE:20270118"],
+    ["floating", "DTSTART:20270114T120000\r\nDTEND:20270114T130000"],
+  ];
+  try {
+    for (const [name,timing] of fixtures) appleEvents.set(`/apple/calendar/${name}.ics`, `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//FileTasks Test//Calendar//EN\r\nBEGIN:VEVENT\r\nUID:${name}\r\nDTSTAMP:20261013T120000Z\r\n${timing}\r\nSUMMARY:${name}\r\nLOCATION:Room B\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n`);
+    const originals = new Map(appleEvents);
+    const sync = await request("/api/calendars/sync",{token:appleOwner.token,method:"POST"});
+    assert.equal(sync.status,200);
+    assert.ok((await sync.json()).syncLimitations.some((entry) => entry.title === "floating"));
+    for (const [name,timing] of fixtures) {
+      const value = appleEvents.get(`/apple/calendar/${name}.ics`);
+      assert.ok(value.includes(timing));
+      assert.ok(value.includes("LOCATION:Room B"));
+    }
+    assert.equal(appleEvents.get("/apple/calendar/floating.ics"),originals.get("/apple/calendar/floating.ics"));
+    const items = (await (await request("/api/items",{token:appleOwner.token})).json()).items;
+    const short = items.find((item) => item.title === "short");
+    assert.equal((await request(`/api/items/${short.id}`,{token:appleOwner.token,method:"PATCH",body:{scheduledDate:"2027-03-15",scheduledTime:"09:00"}})).status,200);
+    assert.ok(appleEvents.get("/apple/calendar/short.ics").includes("DTEND;TZID=America/New_York:20270315T091000"));
+    assert.equal((await request("/api/calendars/sync",{token:appleOwner.token,method:"POST"})).status,200);
+    assert.equal(appleEvents.size,4);
+  } finally { appleEvents.clear(); }
+});
+
 test("calendar import identity failures roll back Events and recurrence series at the public sync boundary", async () => {
   const owner = await account();
   const authorization = await beginGoogleAuthorization(owner);
@@ -1619,6 +1941,54 @@ test("Apple Calendar keeps all-day recurrence exceptions in one valid Calendar r
   assert.equal(appleEvents.size, 1);
   assert.equal((await request(`/api/items/${root.id}?scope=series`, { token: owner.token, method: "DELETE" })).status, 204);
   assert.equal(appleEvents.size, 0);
+});
+
+test("Apple Calendar blocks recurrence changes that differ from the mapped FileTasks Event", async () => {
+  const owner = await account();
+  assert.equal((await request("/api/calendars", { token: owner.token, method: "POST", body: {
+    username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
+  } })).status, 201);
+  const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "Mapped recurrence safeguard", scheduledDate: "2027-01-14",
+    recurrence: { interval: 1, unit: "weeks", weekdays: [4], end: { type: "date", date: "2027-02-01" } },
+  } });
+  assert.equal(created.status, 201);
+  const root = (await created.json()).item;
+  const [path, original] = [...appleEvents.entries()][0];
+  const external = original.replace("RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=TH;UNTIL=20270201", "RRULE:FREQ=DAILY;INTERVAL=2");
+  assert.notEqual(external, original);
+  try {
+    appleEvents.set(path, external);
+    assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+    assert.equal(appleEvents.get(path), external, "an externally changed recurrence must be preserved");
+    const calendar = await (await request("/api/calendars", { token: owner.token })).json();
+    assert.ok(calendar.syncLimitations.some((entry) => entry.itemId === root.id && entry.provider === "apple"),
+      "a differing recurrence must remain visibly limited");
+  } finally { appleEvents.clear(); }
+});
+
+test("Apple direct verification accepts an omitted FileTasks recurrence representation", async () => {
+  const owner = await account();
+  assert.equal((await request("/api/calendars", { token: owner.token, method: "POST", body: {
+    username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
+  } })).status, 201);
+  const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "Omitted FileTasks recurrence", scheduledDate: "2027-01-14",
+    recurrence: { interval: 1, unit: "weeks", weekdays: [4], end: { type: "date", date: "2027-02-01" } },
+  } });
+  assert.equal(created.status, 201);
+  const root = (await created.json()).item;
+  const [path] = [...appleEvents.entries()][0];
+  try {
+    omittedAppleReports.add(path);
+    assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+    const update = await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: { title: "Updated omitted recurrence", scope: "series" } });
+    assert.equal(update.status, 200, await update.text());
+    assert.match(appleEvents.get(path), /^SUMMARY:Updated omitted recurrence\r?$/m);
+    const updated = (await (await request(`/api/items/${root.id}`, { token: owner.token })).json()).item;
+    assert.ok(!updated.calendarSync.some(status => status.provider === "apple" && status.state === "limited"));
+    assert.ok(providerRequests.some(entry => entry.method === "GET" && entry.path === path));
+  } finally { omittedAppleReports.delete(path); appleEvents.clear(); }
 });
 
 test("recurring Google exceptions use immutable original starts after moves and retain FileTasks backlinks", async () => {
@@ -2374,3 +2744,820 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, save/re
     await closeUIAcceptanceBrowser();
   }
 });
+
+test("imported series normalization and splits retain export safeguards", async () => {
+  const owner = await account();
+  const authorization = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, { cookie:authorization.cookie, redirect:"manual" })).status,303);
+  const source = { id:"split-provenance", summary:"Split provenance", start:{dateTime:"2027-01-13T09:00:00-05:00",timeZone:"America/New_York"}, end:{dateTime:"2027-01-13T11:30:00-05:00",timeZone:"America/New_York"}, recurrence:["RRULE:FREQ=WEEKLY;BYDAY=WE,MO;COUNT=5"] };
+  try {
+    googleEvents.set(source.id,structuredClone(source));
+    assert.equal((await request("/api/calendars/sync",{token:owner.token,method:"POST"})).status,200);
+    const items = (await (await request("/api/items",{token:owner.token})).json()).items;
+    const root = items.find((item) => item.title === source.summary && item.recurrence);
+    assert.equal(root.calendarSync[0].state,"limited");
+    assert.equal(root.calendarSync[0].recurrenceEdited,false);
+    const later = items.find((item) => item.seriesId === root.id && item.id !== root.id);
+    const patch = await request(`/api/items/${later.id}`,{token:owner.token,method:"PATCH",body:{title:"Split later",scope:"following"}});
+    assert.equal(patch.status,200);
+    assert.equal((await patch.json()).item.calendarSync[0].limitationCode,"imported-series-split");
+    const loaded = (await (await request(`/api/items/${later.id}`,{token:owner.token})).json()).item;
+    assert.equal(loaded.calendarSync[0].state,"limited");
+    assert.ok((await (await request("/api/calendars",{token:owner.token})).json()).syncLimitations.some((entry) => entry.itemId === later.id));
+    assert.equal(googleEvents.size,1);
+    assert.deepEqual(googleEvents.get(source.id).start,source.start);
+    assert.deepEqual(googleEvents.get(source.id).end,source.end);
+  } finally { googleEvents.clear(); }
+});
+
+test("generated split Occurrences remain blocked after detaching across providers", async () => {
+  googleEvents.clear(); appleEvents.clear();
+  const owner = await account(); const auth = await beginGoogleAuthorization(owner);
+  await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`,{cookie:auth.cookie,redirect:"manual"});
+  await request("/api/calendars",{token:owner.token,method:"POST",body:{username:"person@example.com",password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/calendar/`}});
+  const source = {id:"generated-split",summary:"Generated split",start:{date:"2027-01-01"},end:{date:"2027-01-03"},recurrence:["RRULE:FREQ=DAILY;COUNT=3"]};
+  try {
+    googleEvents.set(source.id,structuredClone(source));
+    await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    const preservedCopy = structuredClone(googleEvents.get(source.id));
+    let items = (await (await request("/api/items",{token:owner.token})).json()).items;
+    const root = items.find((item) => item.title === source.summary && item.id === item.seriesId);
+    const later = items.find((item) => item.seriesId === root.id && item.id !== root.id);
+    const recurrence = {...root.recurrence,end:{type:"count",count:7}};
+    assert.equal((await request(`/api/items/${later.id}`,{token:owner.token,method:"PATCH",body:{scope:"following",recurrence}})).status,200);
+    items = (await (await request("/api/items",{token:owner.token})).json()).items.filter((item) => item.seriesId === later.id);
+    assert.ok(items.length > 2);
+    assert.ok(items.every((item) => item.calendarSync.some((status) => status.limitationCode === "imported-series-split")));
+    assert.equal((await request(`/api/items/${later.id}`,{token:owner.token,method:"PATCH",body:{scope:"following",recurrence:null}})).status,200);
+    items = (await (await request("/api/items",{token:owner.token})).json()).items.filter((item) => item.title === source.summary);
+    assert.ok(items.every((item) => item.calendarSync.some((status) => status.state === "limited")));
+    const start = providerRequests.length;
+    assert.equal((await request("/api/calendars/sync",{token:owner.token,method:"POST"})).status,200);
+    const unexpectedRequests = providerRequests.slice(start).filter(({path,method}) => (path.includes("/events") || path.startsWith("/apple/")) && ["POST","PUT","PATCH"].includes(method));
+    assert.equal(unexpectedRequests.length, 0, `Unexpected provider mutations: ${JSON.stringify(unexpectedRequests.map(({method, path, body, text}) => ({method, path, body: text || body})))}`);
+    assert.deepEqual(googleEvents.get(source.id),preservedCopy);
+  } finally { googleEvents.clear(); appleEvents.clear(); }
+});
+
+test("generated Occurrences from an Apple split stay blocked after detaching", async () => {
+  const owner = await account(); const auth = await beginGoogleAuthorization(owner);
+  await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`,{cookie:auth.cookie,redirect:"manual"});
+  await request("/api/calendars",{token:owner.token,method:"POST",body:{username:"person@example.com",password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/calendar/`}});
+  const path = "/apple/calendar/generated-split.ics";
+  const source = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//FileTasks Test//EN\r\nBEGIN:VEVENT\r\nUID:generated-apple-split\r\nDTSTAMP:20261013T120000Z\r\nDTSTART;VALUE=DATE:20270101\r\nDTEND;VALUE=DATE:20270103\r\nRRULE:FREQ=DAILY;COUNT=3\r\nSUMMARY:Apple generated split\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  try {
+    appleEvents.set(path,source);
+    assert.equal((await request("/api/calendars/sync",{token:owner.token,method:"POST"})).status,200);
+    const preservedCopy = appleEvents.get(path);
+    let items = (await (await request("/api/items",{token:owner.token})).json()).items;
+    const root = items.find((item) => item.title === "Apple generated split" && item.id === item.seriesId);
+    const later = items.find((item) => item.seriesId === root.id && item.id !== root.id);
+    assert.equal((await request(`/api/items/${later.id}`,{token:owner.token,method:"PATCH",body:{scope:"following",recurrence:{...root.recurrence,end:{type:"count",count:7}}}})).status,200);
+    items = (await (await request("/api/items",{token:owner.token})).json()).items.filter((item) => item.seriesId === later.id);
+    assert.ok(items.length > 2);
+    assert.ok(items.every((item) => item.calendarSync.some((status) => status.limitationCode === "imported-series-split")));
+    assert.equal((await request(`/api/items/${later.id}`,{token:owner.token,method:"PATCH",body:{scope:"following",recurrence:null}})).status,200);
+    items = (await (await request("/api/items",{token:owner.token})).json()).items.filter((item) => item.title === "Apple generated split");
+    assert.ok(items.every((item) => item.calendarSync.some((status) => status.state === "limited")));
+    const start = providerRequests.length;
+    assert.equal((await request("/api/calendars/sync",{token:owner.token,method:"POST"})).status,200);
+    assert.equal(providerRequests.slice(start).some(({path,method}) => (path.includes("/events") || path.startsWith("/apple/")) && ["POST","PUT","PATCH"].includes(method)),false);
+    assert.equal(appleEvents.get(path),preservedCopy);
+  } finally { googleEvents.clear(); appleEvents.clear(); }
+});
+
+test("overlapping Google recovery creates one mapped replacement", async () => {
+  const owner = await account();
+  const auth = await beginGoogleAuthorization(owner);
+  await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie: auth.cookie, redirect: "manual"});
+  const source = {id: "overlap-recovery-source", summary: "Overlap recovery", start: {date: "2027-01-01"}, end: {date: "2027-01-02"}};
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  try {
+    googleEvents.set(source.id, structuredClone(source));
+    assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+    const item = (await (await request("/api/items", {token: owner.token})).json()).items.find(entry => entry.title === source.summary);
+    assert.ok(item);
+    googleEvents.delete(source.id);
+    let release;
+    const ready = new Promise(resolve => { release = resolve; });
+    googleInventoryBarrier = {arrivals: 0, ready, release};
+    const start = providerRequests.length;
+    const timeout = setTimeout(release, 5000);
+    const responses = await Promise.all([1, 2].map(() => request("/api/calendars/sync", {token: owner.token, method: "POST"})));
+    clearTimeout(timeout);
+    assert.equal(googleInventoryBarrier.arrivals, 2, "both syncs must request inventory");
+    googleInventoryBarrier = null;
+    assert.ok(responses.every(response => response.status === 200));
+    const outcomes = await Promise.all(responses.map(response => response.json()));
+    const attempts = providerRequests.slice(start);
+    assert.ok(attempts.filter(({method, path}) => method === "GET" && path.endsWith("/events")).length >= 2);
+    assert.ok(outcomes.every(outcome => outcome.syncLimitations.every(limitation => limitation.itemId === item.id && limitation.message.includes("inventory is incomplete"))), JSON.stringify(outcomes));
+    assert.ok(attempts.some(({method, path}) => method === "PUT" && path.endsWith(source.id)), JSON.stringify(attempts));
+    // A concurrent sync can pause while the other inventory is pending. Retry after both settle.
+    if (outcomes.some(outcome => outcome.syncLimitations.length)) {
+      const retry = await request("/api/calendars/sync", {token: owner.token, method: "POST"});
+      assert.equal(retry.status, 200);
+      assert.deepEqual((await retry.json()).syncLimitations, []);
+    }
+    const mappings = db.prepare("SELECT external_id FROM calendar_copies WHERE user_id=? AND item_id=? AND provider='google'").all(owner.user.id, item.id);
+    assert.equal(mappings.length, 1);
+    assert.equal(googleEvents.size, 1, "no replacement may be left orphaned");
+    assert.ok(googleEvents.has(mappings[0].external_id), "the sole remote Event must be mapped");
+    assert.notEqual(mappings[0].external_id, source.id);
+  } finally { googleInventoryBarrier?.release(); googleInventoryBarrier = null; googleEvents.clear(); db.close(); }
+});
+
+test("Google recovery reconciles a persisted replacement after a lost response", async () => {
+  const owner = await account();
+  const auth = await beginGoogleAuthorization(owner);
+  await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie: auth.cookie, redirect: "manual"});
+  const source = {id: "lost-response-source", summary: "Lost response recovery", start: {date: "2027-01-01"}, end: {date: "2027-01-02"}};
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  try {
+    googleEvents.set(source.id, structuredClone(source));
+    assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+    const item = (await (await request("/api/items", {token: owner.token})).json()).items.find(entry => entry.title === source.summary);
+    assert.ok(item);
+    googleEvents.delete(source.id);
+    loseNextGooglePostResponse = true;
+    await request("/api/calendars/sync", {token: owner.token, method: "POST"});
+    assert.equal(loseNextGooglePostResponse, false, "the fake persisted the POST before returning invalid JSON");
+    assert.equal(googleEvents.size, 1);
+    const [replacementId, replacement] = [...googleEvents.entries()][0];
+    assert.notEqual(replacementId, source.id);
+    assert.equal(replacement.extendedProperties.private.filetasksItemId, item.id);
+    assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+    const mappings = db.prepare("SELECT external_id FROM calendar_copies WHERE user_id=? AND item_id=? AND provider='google'").all(owner.user.id, item.id);
+    assert.equal(mappings.length, 1);
+    assert.equal(mappings[0].external_id, replacementId);
+    assert.equal(googleEvents.size, 1);
+    assert.ok(googleEvents.has(replacementId));
+  } finally { loseNextGooglePostResponse = false; googleEvents.clear(); db.close(); }
+});
+
+test("Google recovered single Event receives subsequent local title edits", async () => {
+  const owner = await account(); const auth = await beginGoogleAuthorization(owner);
+  await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`,{cookie:auth.cookie,redirect:"manual"});
+  const source = {id:"recover-single-edit",summary:"Original title",start:{date:"2027-01-01"},end:{date:"2027-01-02"}};
+  try {
+    googleEvents.set(source.id,structuredClone(source));
+    assert.equal((await request("/api/calendars/sync",{token:owner.token,method:"POST"})).status,200);
+    const item = (await (await request("/api/items",{token:owner.token})).json()).items.find((entry) => entry.title === source.summary);
+    assert.ok(item);
+    googleEvents.delete(source.id);
+    assert.equal((await request("/api/calendars/sync",{token:owner.token,method:"POST"})).status,200);
+    assert.equal(googleEvents.size,1);
+    const [replacementId] = googleEvents.keys();
+    assert.notEqual(replacementId,source.id);
+    googleEvents.delete(replacementId);
+    assert.equal((await request("/api/calendars/sync",{token:owner.token,method:"POST"})).status,200);
+    assert.equal(googleEvents.size,1, "a second deletion should produce exactly one replacement");
+    const [secondReplacementId] = googleEvents.keys();
+    assert.notEqual(secondReplacementId,replacementId);
+    assert.equal((await request(`/api/items/${item.id}`,{token:owner.token,method:"PATCH",body:{title:"Updated title"}})).status,200);
+    assert.equal((await request("/api/calendars/sync",{token:owner.token,method:"POST"})).status,200);
+    assert.equal(googleEvents.size,1);
+    assert.equal(googleEvents.get(secondReplacementId)?.summary,"Updated title");
+    const updated = (await (await request(`/api/items/${item.id}`,{token:owner.token})).json()).item;
+    assert.ok(updated.calendarSync.every(({state}) => state !== "pending" && state !== "limited"));
+    assert.ok(!(await (await request("/api/calendars",{token:owner.token})).json()).syncLimitations.some((entry) => entry.itemId === item.id));
+  } finally { googleEvents.clear(); }
+});
+
+test("Google recovery preserves conference and attachment options and remains idempotent", async () => {
+  const owner = await account(); const auth = await beginGoogleAuthorization(owner);
+  await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`,{cookie:auth.cookie,redirect:"manual"});
+  const source = {id:"recover-extras",summary:"Recover extras",start:{date:"2027-01-01"},end:{date:"2027-01-02"},conferenceData:{conferenceId:"abc"},attachments:[{fileUrl:"https://example.com/file",title:"File"}]};
+  try {
+    googleEvents.set(source.id,structuredClone(source));
+    assert.equal((await request("/api/calendars/sync",{token:owner.token,method:"POST"})).status,200);
+    googleEvents.delete(source.id);
+    const start = providerRequests.length;
+    assert.equal((await request("/api/calendars/sync",{token:owner.token,method:"POST"})).status,200);
+    const post = providerRequests.slice(start).find(({path,method}) => path.endsWith("/events") && method === "POST");
+    assert.equal(new URLSearchParams(post.query).get("conferenceDataVersion"),"1");
+    assert.equal(new URLSearchParams(post.query).get("supportsAttachments"),"true");
+    assert.deepEqual(post.body.conferenceData,source.conferenceData); assert.deepEqual(post.body.attachments,source.attachments);
+    const [copyId,copy] = [...googleEvents.entries()][0];
+    assert.equal((await request("/api/calendars/sync",{token:owner.token,method:"POST"})).status,200);
+    assert.equal(googleEvents.size,1); assert.deepEqual(googleEvents.get(copyId),copy);
+  } finally { googleEvents.clear(); }
+});
+
+test("unsupported schedule edits remain visible and Apple alarm descriptions survive edits", async () => {
+  const owner = await account();
+  assert.equal((await request("/api/calendars",{token:owner.token,method:"POST",body:{username:"person@example.com",password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/calendar/`}})).status,201);
+  const path = "/apple/calendar/alarm-safeguard.ics";
+  const ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//FileTasks Test//Calendar//EN\r\nBEGIN:VEVENT\r\nUID:alarm-safeguard\r\nDTSTAMP:20261013T120000Z\r\nDTSTART;TZID=America/New_York:20270314T015500\r\nDTEND;TZID=America/New_York:20270314T030500\r\nSUMMARY:Alarm safeguard\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Alarm text\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\nDESCRIPTION:Event text\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  try {
+    appleEvents.set(path,ics);
+    assert.equal((await request("/api/calendars/sync",{token:owner.token,method:"POST"})).status,200);
+    const item = (await (await request("/api/items",{token:owner.token})).json()).items.find((entry) => entry.title === "Alarm safeguard");
+    assert.equal(item.details,"Event text");
+    assert.equal((await request(`/api/items/${item.id}`,{token:owner.token,method:"PATCH",body:{details:"Changed event"}})).status,200);
+    assert.match(appleEvents.get(path),/DESCRIPTION:Alarm text\r\nTRIGGER/);
+    assert.match(appleEvents.get(path),/END:VALARM\r\nDESCRIPTION:Changed event/);
+    for (const body of [{scheduledDate:"2027-03-14",scheduledTime:"02:30"},{scheduledDate:"2027-03-14",scheduledTime:null}]) {
+      const before = appleEvents.get(path);
+      const patch = await request(`/api/items/${item.id}`,{token:owner.token,method:"PATCH",body});
+      assert.equal(patch.status,200);
+      assert.equal((await patch.json()).item.calendarSync[0].limitationCode,"schedule-unsupported");
+      assert.equal((await (await request(`/api/items/${item.id}`,{token:owner.token})).json()).item.calendarSync[0].state,"limited");
+      assert.ok((await (await request("/api/calendars",{token:owner.token})).json()).syncLimitations.some((entry) => entry.itemId === item.id));
+      assert.equal(appleEvents.get(path),before);
+    }
+  } finally { appleEvents.clear(); }
+});
+
+test("legacy imports and detached Occurrences remain blocked without provider discovery", async () => {
+  const owner = await account();
+  const auth = await beginGoogleAuthorization(owner);
+  await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`,{cookie:auth.cookie,redirect:"manual"});
+  const source = {id:"legacy-split",summary:"Legacy split",start:{date:"2027-01-01"},end:{date:"2027-01-03"},recurrence:["RRULE:FREQ=DAILY;COUNT=5"]};
+  try {
+    googleEvents.set(source.id,structuredClone(source));
+    await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    let items = (await (await request("/api/items",{token:owner.token})).json()).items;
+    const root = items.find((item) => item.title === source.summary && item.id === item.seriesId);
+    const db = new DatabaseSync(join(directory,"workspace.sqlite"));
+    db.prepare("DELETE FROM calendar_import_metadata WHERE item_id=?").run(root.id); db.close();
+    googleEvents.delete(source.id);
+    assert.equal((await (await request(`/api/items/${root.id}`,{token:owner.token})).json()).item.calendarSync[0].limitationCode,"legacy-import");
+    const third = items.filter((item) => item.seriesId === root.id).sort((a,b) => a.occurrenceDate.localeCompare(b.occurrenceDate))[2];
+    assert.equal((await request(`/api/items/${third.id}`,{token:owner.token,method:"PATCH",body:{scope:"following",recurrence:null}})).status,200);
+    items = (await (await request("/api/items",{token:owner.token})).json()).items.filter((item) => item.title === source.summary);
+    assert.ok(items.every((item) => item.calendarSync.some((status) => status.state === "limited")));
+    await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    assert.equal(googleEvents.size,0);
+  } finally { googleEvents.clear(); }
+});
+
+test("imported Occurrence edits and deletions are visible after restart", async () => {
+  const owner = await account(); const auth = await beginGoogleAuthorization(owner);
+  await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`,{cookie:auth.cookie,redirect:"manual"});
+  const source = {id:"occurrence-status",summary:"Occurrence status",start:{date:"2027-02-01"},end:{date:"2027-02-02"},recurrence:["RRULE:FREQ=DAILY;COUNT=4"]};
+  try {
+    googleEvents.set(source.id,structuredClone(source)); await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    const beforeEdit = structuredClone(googleEvents.get(source.id));
+    const items = (await (await request("/api/items",{token:owner.token})).json()).items;
+    const root = items.find((item) => item.title === source.summary && item.id === item.seriesId);
+    const occurrences = items.filter((item) => item.seriesId === root.id && item.id !== root.id);
+    const patch = await request(`/api/items/${occurrences[0].id}`,{token:owner.token,method:"PATCH",body:{scope:"occurrence",title:"Changed occurrence"}});
+    assert.equal((await patch.json()).item.calendarSync[0].limitationCode,"unsupported-recurrence");
+    assert.equal((await request(`/api/items/${occurrences[1].id}?scope=occurrence`,{token:owner.token,method:"DELETE"})).status,204);
+    await stopServer(); await startServer();
+    const restored = (await (await request("/api/items",{token:owner.token})).json()).items;
+    assert.equal(restored.find((item) => item.id === occurrences[0].id)?.title,"Changed occurrence");
+    assert.equal(restored.some((item) => item.id === occurrences[1].id),false);
+    assert.equal((await (await request(`/api/items/${root.id}`,{token:owner.token})).json()).item.calendarSync[0].limitationCode,"unsupported-recurrence");
+    assert.ok((await (await request("/api/calendars",{token:owner.token})).json()).syncLimitations.some((entry) => entry.itemId === root.id));
+    assert.deepEqual(googleEvents.get(source.id),beforeEdit);
+  } finally { googleEvents.clear(); }
+});
+
+test("Apple duplicate direct timing and recurrence properties pause export", async () => {
+  const owner = await account();
+  await request("/api/calendars",{token:owner.token,method:"POST",body:{username:"person@example.com",password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/calendar/`}});
+  try {
+    for (const [id,duplicate] of [["rrule","RRULE:FREQ=DAILY;COUNT=2\r\nRRULE:FREQ=WEEKLY;COUNT=2"],["start","DTSTART;VALUE=DATE:20270101"],["end","DTEND;VALUE=DATE:20270103"]]) {
+      const path = `/apple/calendar/duplicate-${id}.ics`;
+      const ics = `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:duplicate-${id}\r\nDTSTART;VALUE=DATE:20270101\r\nDTEND;VALUE=DATE:20270102\r\n${duplicate}\r\nSUMMARY:Duplicate ${id}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n`;
+      appleEvents.set(path,ics);
+    }
+    await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    const items = (await (await request("/api/items",{token:owner.token})).json()).items;
+    for (const id of ["rrule","start","end"]) {
+      const item = items.find((entry) => entry.title === `Duplicate ${id}`);
+      assert.equal(item.calendarSync[0].limitationCode,"malformed-event");
+      const path = `/apple/calendar/duplicate-${id}.ics`; const before = appleEvents.get(path);
+      await request(`/api/items/${item.id}`,{token:owner.token,method:"PATCH",body:{details:"Changed"}});
+      assert.equal(appleEvents.get(path),before);
+    }
+  } finally { appleEvents.clear(); }
+});
+
+test("clearing an imported root recurrence with following scope preserves the Calendar copy", async () => {
+  const owner = await account();
+  const auth = await beginGoogleAuthorization(owner);
+  await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie:auth.cookie,redirect:"manual"});
+  const source = {id:"root-following-clear",summary:"Root following clear",start:{dateTime:"2027-01-13T09:00:00-05:00",timeZone:"America/New_York"},end:{dateTime:"2027-01-13T11:00:00-05:00",timeZone:"America/New_York"},recurrence:["RRULE:FREQ=DAILY;COUNT=4"]};
+  try {
+    googleEvents.set(source.id,structuredClone(source));
+    await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    const providerBeforeEdit = structuredClone(googleEvents.get(source.id));
+    const before = (await (await request("/api/items",{token:owner.token})).json()).items;
+    const root = before.find((item) => item.title === source.summary && item.recurrence);
+    assert.ok(before.filter((item) => item.seriesId === root.id).length > 1);
+    const patch = await request(`/api/items/${root.id}`,{token:owner.token,method:"PATCH",body:{scope:"following",recurrence:null}});
+    assert.equal(patch.status,200);
+    assert.equal((await patch.json()).item.calendarSync[0].limitationCode,"unsupported-recurrence");
+    const items = (await (await request("/api/items",{token:owner.token})).json()).items.filter((item) => item.title === source.summary);
+    assert.equal(items.length,1);
+    assert.equal((await (await request(`/api/items/${root.id}`,{token:owner.token})).json()).item.calendarSync[0].state,"limited");
+    assert.ok((await (await request("/api/calendars",{token:owner.token})).json()).syncLimitations.some((entry) => entry.itemId === root.id));
+    const sync = await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    assert.ok((await sync.json()).syncLimitations.some((entry) => entry.itemId === root.id));
+    assert.equal(googleEvents.size,1);
+    assert.deepEqual(googleEvents.get(source.id),providerBeforeEdit);
+  } finally { googleEvents.clear(); }
+});
+
+test("Apple schedule edits that end in the repeated DST hour pause export", async () => {
+  const owner = await account();
+  await request("/api/calendars",{token:owner.token,method:"POST",body:{username:"person@example.com",password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/calendar/`}});
+  const path = "/apple/calendar/fallback.ics";
+  const original = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//FileTasks Test//Calendar//EN\r\nBEGIN:VEVENT\r\nUID:fallback\r\nDTSTAMP:20261013T120000Z\r\nDTSTART;TZID=America/New_York:20271106T003000\r\nDTEND;TZID=America/New_York:20271106T023000\r\nSUMMARY:Fallback edit\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  try {
+    appleEvents.set(path,original);
+    await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    const item = (await (await request("/api/items",{token:owner.token})).json()).items.find((entry) => entry.title === "Fallback edit");
+    const patch = await request(`/api/items/${item.id}`,{token:owner.token,method:"PATCH",body:{scheduledDate:"2027-11-07"}});
+    assert.equal(patch.status,200);
+    const status = (await patch.json()).item.calendarSync[0];
+    assert.equal(status.limitationCode,"schedule-unsupported");
+    assert.match(status.limitation,/ambiguous local time/);
+    assert.equal((await (await request(`/api/items/${item.id}`,{token:owner.token})).json()).item.calendarSync[0].state,"limited");
+    assert.ok((await (await request("/api/calendars",{token:owner.token})).json()).syncLimitations.some((entry) => entry.itemId === item.id));
+    const sync = await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    assert.ok((await sync.json()).syncLimitations.some((entry) => entry.itemId === item.id));
+    assert.equal(appleEvents.size,1);
+    assert.equal(appleEvents.get(path),original);
+  } finally { appleEvents.clear(); }
+});
+
+test("Apple ambiguous fallback start remains visibly blocked", async () => {
+  const owner = await account();
+  await request("/api/calendars",{token:owner.token,method:"POST",body:{username:"person@example.com",password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/calendar/`}});
+  const path = "/apple/calendar/ambiguous-start.ics";
+  const original = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:ambiguous-start\r\nDTSTART;TZID=America/New_York:20271107T013000\r\nDTEND;TZID=America/New_York:20271107T023000\r\nSUMMARY:Ambiguous start\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  try {
+    appleEvents.set(path,original);
+    const sync = await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    assert.equal(sync.status,200);
+    const item = (await (await request("/api/items",{token:owner.token})).json()).items.find((entry) => entry.title === "Ambiguous start");
+    assert.ok(item);
+    assert.equal(item.calendarSync[0].state,"limited");
+    assert.ok((await sync.json()).syncLimitations.some((entry) => entry.itemId === item.id));
+    await request(`/api/items/${item.id}`,{token:owner.token,method:"PATCH",body:{details:"Changed"}});
+    assert.equal(appleEvents.get(path),original);
+  } finally { appleEvents.clear(); }
+});
+
+test("oversized imported text and unsupported recurrence preserve provider originals", async () => {
+  const owner = await account();
+  const auth = await beginGoogleAuthorization(owner);
+  await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`,{cookie:auth.cookie,redirect:"manual"});
+  await request("/api/calendars",{token:owner.token,method:"POST",body:{username:"person@example.com",password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/calendar/`}});
+  const cases = [
+    ["long-title", "T".repeat(1000), "description", null],
+    ["long-description", "Long description", "D".repeat(20000), null],
+    ["weekly-no-byday", "Weekly without BYDAY", "description", "FREQ=WEEKLY;COUNT=3"],
+    ["count-range", "Out of range count", "description", "FREQ=DAILY;COUNT=999999999"],
+  ];
+  try {
+    for (const [id,title,description,rule] of cases) {
+      googleEvents.set(id,{id,summary:title,description,start:{date:"2027-01-14"},end:{date:"2027-01-15"},...(rule ? {recurrence:[`RRULE:${rule}`]} : {})});
+      appleEvents.set(`/apple/calendar/${id}.ics`,`BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//FileTasks Tests//EN\r\nBEGIN:VEVENT\r\nUID:${id}\r\nDTSTAMP:20270101T000000Z\r\nDTSTART;VALUE=DATE:20270114\r\nDTEND;VALUE=DATE:20270115\r\nSUMMARY:${title}\r\nDESCRIPTION:${description}\r\n${rule ? `RRULE:${rule}\r\n` : ""}END:VEVENT\r\nEND:VCALENDAR\r\n`);
+    }
+    const googleBefore = structuredClone(googleEvents);
+    const appleBefore = new Map(appleEvents);
+    const sync = await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    assert.equal(sync.status,200);
+    for (const id of ["long-title", "long-description", "count-range"]) {
+      assert.deepEqual(googleEvents.get(id), googleBefore.get(id));
+      assert.equal(appleEvents.get(`/apple/calendar/${id}.ics`), appleBefore.get(`/apple/calendar/${id}.ics`));
+    }
+    const items = (await (await request("/api/items",{token:owner.token})).json()).items;
+    for (const [id, title] of cases.filter(([id]) => id !== "weekly-no-byday")) {
+      for (const provider of ["google", "apple"]) {
+        const item = items.find((entry) => entry.title === (id === "long-title" ? title.slice(0, 200) : title) && entry.calendarSync.some((status) => status.provider === provider));
+        assert.ok(item, `${provider} ${id} imported`);
+        assert.equal(item.calendarSync.find((status) => status.provider === provider).state, "limited");
+      }
+    }
+    for (const provider of ["google", "apple"]) {
+      const series = items.filter((item) => item.title === "Weekly without BYDAY" && item.calendarSync.some((status) => status.provider === provider));
+      assert.deepEqual(series.map((item) => item.scheduledDate).sort(), ["2027-01-14", "2027-01-21", "2027-01-28"]);
+      assert.ok(series.every((item) => item.calendarSync.some((status) => status.provider === provider && status.state === "limited" && status.limitationCode === "unsupported-recurrence")));
+      assert.ok(series.every((item) => JSON.stringify(item.recurrence) === JSON.stringify({interval:1,unit:"weeks",weekdays:[4],end:{type:"count",count:3}})));
+    }
+    assert.deepEqual(googleEvents.get("weekly-no-byday").start, googleBefore.get("weekly-no-byday").start);
+    assert.deepEqual(googleEvents.get("weekly-no-byday").end, googleBefore.get("weekly-no-byday").end);
+    assert.deepEqual(googleEvents.get("weekly-no-byday").recurrence, googleBefore.get("weekly-no-byday").recurrence);
+    const weeklyApple = appleEvents.get("/apple/calendar/weekly-no-byday.ics");
+    assert.match(weeklyApple, /DTSTART;VALUE=DATE:20270114/);
+    assert.match(weeklyApple, /DTEND;VALUE=DATE:20270115/);
+    assert.match(weeklyApple, /RRULE:FREQ=WEEKLY;COUNT=3/);
+  } finally { googleEvents.clear(); appleEvents.clear(); }
+});
+
+
+test("Google exception inventory follows empty pages and blocks lossy writes", async () => {
+  const owner = await account();
+  const auth = await beginGoogleAuthorization(owner);
+  await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie: auth.cookie, redirect: "manual"});
+  const master = {id: "inventory-master", summary: "Inventory master", start: {date: "2027-01-01"}, end: {date: "2027-01-02"}, recurrence: ["RRULE:FREQ=DAILY;COUNT=3"]};
+  const moved = {id: "inventory-moved", recurringEventId: master.id, originalStartTime: {date: "2027-01-02"}, start: {date: "2040-01-01"}, end: {date: "2040-01-02"}, summary: "Moved exception"};
+  const cancelled = {id: "inventory-cancelled", recurringEventId: master.id, originalStartTime: {date: "2027-01-03"}, status: "cancelled"};
+  try {
+    googleEvents.set(master.id, structuredClone(master));
+    googleEventPages = {first: {items: [master], nextPageToken: "empty"}, empty: {items: [], nextPageToken: "later"}, later: {items: [moved, cancelled]}};
+    const sync = await request("/api/calendars/sync", {token: owner.token, method: "POST"});
+    assert.equal(sync.status, 200);
+    const items = (await (await request("/api/items", {token: owner.token})).json()).items;
+    const root = items.find(item => item.title === master.summary && item.recurrence);
+    assert.ok(root);
+    assert.ok(root.calendarSync[0].limitationCode, "exceptions must limit the imported series");
+    assert.equal(items.some(item => item.title === moved.summary), false, "exception must not become a standalone Event");
+    assert.deepEqual(googleEvents.get(master.id), master);
+    assert.equal(providerRequests.some(r => r.method === "GET" && r.query.includes("pageToken=later")), true);
+    await stopServer(); await startServer();
+    assert.ok((await (await request(`/api/items/${root.id}`, {token: owner.token})).json()).item.calendarSync[0].limitationCode);
+    googleEvents.delete(master.id);
+    await request("/api/calendars/sync", {token: owner.token, method: "POST"});
+    assert.equal(googleEvents.size, 0, "limited series must not be recovered as a lossy copy");
+  } finally { googleEventPages = null; googleEvents.clear(); }
+});
+
+test("Apple external unsupported recurrence preserves an existing imported resource", async () => {
+  const owner = await account();
+  await request("/api/calendars", {token: owner.token, method: "POST", body: {username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`}});
+  const path = "/apple/calendar/external-change.ics";
+  try {
+    appleEvents.set(path, appleCalendarFixture({uid: "external-change"}));
+    assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+    const items = (await (await request("/api/items", {token: owner.token})).json()).items;
+    const item = items.find(entry => entry.calendarSync.some(status => status.provider === "apple"));
+    assert.ok(item);
+    const original = appleCalendarFixture({uid: "external-change", recurrence: "FREQ=WEEKLY;COUNT=3"});
+    appleEvents.set(path, original);
+    const sync = await request("/api/calendars/sync", {token: owner.token, method: "POST"});
+    assert.equal(sync.status, 200);
+    assert.equal(appleEvents.get(path), original);
+    const updated = (await (await request(`/api/items/${item.id}`, {token: owner.token})).json()).item;
+    assert.equal(updated.calendarSync.find(status => status.provider === "apple").state, "limited");
+  } finally { appleEvents.clear(); }
+});
+
+
+test("Apple sync safely recreates a deleted imported Event and propagates later edits", async () => {
+  const owner = await account();
+  await request("/api/calendars", {token: owner.token, method: "POST", body: {username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`}});
+  const path = "/apple/calendar/deleted-import.ics";
+  try {
+    appleEvents.set(path, appleCalendarFixture({uid: "deleted-import"}));
+    assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+    const item = (await (await request("/api/items", {token: owner.token})).json()).items.find(entry => entry.title === "Imported calendar event");
+    assert.ok(item);
+    appleEvents.delete(path);
+    providerRequests = [];
+    assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+    const recreated = appleEvents.get(path);
+    assert.ok(recreated, "deleted resource should be recreated");
+    assert.match(recreated, /^UID:deleted-import\r?$/m);
+    assert.match(recreated, /^DTSTART;VALUE=DATE:20270114\r?$/m);
+    assert.match(recreated, /^DTEND;VALUE=DATE:20270115\r?$/m);
+    assert.equal(providerRequests.find(entry => entry.method === "PUT" && entry.path === path)?.headers["if-none-match"], "*");
+    const updated = (await (await request(`/api/items/${item.id}`, {token: owner.token})).json()).item;
+    assert.notEqual(updated.calendarSync.find(status => status.provider === "apple").state, "limited");
+    assert.equal((await request(`/api/items/${item.id}`, {token: owner.token, method: "PATCH", body: {title: "Edited after recovery"}})).status, 200);
+    assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+    assert.match(appleEvents.get(path), /^SUMMARY:Edited after recovery\r?$/m);
+  } finally { appleEvents.clear(); }
+});
+
+test("Apple REPORT omission validates the existing resource before exporting", async () => {
+  const owner = await account();
+  const auth = await beginGoogleAuthorization(owner);
+  await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie: auth.cookie, redirect: "manual"});
+  await request("/api/calendars", {token: owner.token, method: "POST", body: {username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`}});
+  const path = "/apple/calendar/omitted-resource.ics";
+  try {
+    appleEvents.set(path, appleCalendarFixture({uid: "omitted-resource"}));
+    assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+    const item = (await (await request("/api/items", {token: owner.token})).json()).items.find(entry => entry.title === "Imported calendar event");
+    assert.ok(item);
+    const original = appleCalendarFixture({uid: "omitted-resource", date: "20400114", recurrence: "FREQ=WEEKLY;COUNT=3"});
+    appleEvents.set(path, original);
+    omittedAppleReports.add(path);
+    const googleBefore = structuredClone([...googleEvents.entries()]);
+    providerRequests = [];
+    assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+    assert.ok(providerRequests.some(entry => entry.method === "GET" && entry.path === path));
+    assert.equal(appleEvents.get(path), original);
+    assert.deepEqual([...googleEvents.entries()], googleBefore);
+    const updated = (await (await request(`/api/items/${item.id}`, {token: owner.token})).json()).item;
+    assert.equal(updated.calendarSync.find(status => status.provider === "apple").state, "limited");
+  } finally { omittedAppleReports.clear(); appleEvents.clear(); googleEvents.clear(); }
+});
+
+test("Apple REPORT href with a different UID blocks overwrite", async () => {
+  const owner = await account();
+  await request("/api/calendars", {token: owner.token, method: "POST", body: {username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`}});
+  const path = "/apple/calendar/uid-mismatch.ics";
+  try {
+    appleEvents.set(path, appleCalendarFixture({uid: "original-uid"}));
+    assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+    const item = (await (await request("/api/items", {token: owner.token})).json()).items.find(entry => entry.title === "Imported calendar event");
+    assert.ok(item);
+    const replacement = appleCalendarFixture({uid: "different-uid"});
+    appleEvents.set(path, replacement);
+    providerRequests = [];
+    await request(`/api/items/${item.id}`, {token: owner.token, method: "PATCH", body: {title: "Local edit"}});
+    await request("/api/calendars/sync", {token: owner.token, method: "POST"});
+    assert.equal(appleEvents.get(path), replacement);
+    assert.equal(providerRequests.some(entry => entry.method === "PUT" && entry.path === path), false);
+  } finally { appleEvents.clear(); }
+});
+
+test("Apple connected first does not export before Google recurrence validation", async () => {
+  const owner = await account();
+  await request("/api/calendars", {token: owner.token, method: "POST", body: {username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`}});
+  const auth = await beginGoogleAuthorization(owner);
+  await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie: auth.cookie, redirect: "manual"});
+  const source = {id: "google-external-recurrence", summary: "Google external recurrence", start: {date: "2027-01-14"}, end: {date: "2027-01-15"}};
+  try {
+    googleEvents.set(source.id, structuredClone(source));
+    assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+    const item = (await (await request("/api/items", {token: owner.token})).json()).items.find(entry => entry.title === source.summary);
+    assert.ok(item);
+    googleEvents.set(source.id, {...googleEvents.get(source.id), recurrence: ["RRULE:FREQ=WEEKLY;COUNT=3"]});
+    const googleBefore = structuredClone(googleEvents.get(source.id));
+    const appleBefore = structuredClone([...appleEvents.entries()]);
+    providerRequests = [];
+    assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+    assert.deepEqual(googleEvents.get(source.id), googleBefore);
+    assert.deepEqual([...appleEvents.entries()], appleBefore);
+    assert.equal(providerRequests.some(entry => entry.method === "PUT" && entry.path.startsWith("/apple/")), false);
+    const updated = (await (await request(`/api/items/${item.id}`, {token: owner.token})).json()).item;
+    assert.equal(updated.calendarSync.find(status => status.provider === "google").state, "limited");
+  } finally { appleEvents.clear(); googleEvents.clear(); }
+});
+
+test("imported provider titles preserve whitespace until deliberately edited", async () => {
+  for (const provider of ["apple", "google"]) {
+    const owner = await account();
+    if (provider === "apple") await request("/api/calendars", {token: owner.token, method: "POST", body: {username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`}});
+    else {
+      const auth = await beginGoogleAuthorization(owner);
+      await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie: auth.cookie, redirect: "manual"});
+    }
+    const title = "  Whitespace title  ";
+    const path = "/apple/calendar/whitespace.ics";
+    const original = appleCalendarFixture({uid: "whitespace"}).replace("DTSTART;VALUE=DATE:20270114", "DTSTART;VALUE=DATE:20270114\r\nDTEND;VALUE=DATE:20270115").replace("SUMMARY:Imported calendar event", `SUMMARY:${title}`);
+    try {
+      if (provider === "apple") appleEvents.set(path, original);
+      else googleEvents.set("whitespace", {id: "whitespace", summary: title, start: {date: "2027-01-14"}, end: {date: "2027-01-15"}});
+      assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+      if (provider === "apple") assert.equal(appleEvents.get(path), original);
+      else assert.equal(googleEvents.get("whitespace").summary, title);
+      const item = (await (await request("/api/items", {token: owner.token})).json()).items.find(entry => entry.title.trim() === "Whitespace title");
+      assert.ok(item);
+      assert.equal((await request(`/api/items/${item.id}`, {token: owner.token, method: "PATCH", body: {title: "Edited title"}})).status, 200);
+      if (provider === "apple") assert.match(appleEvents.get(path), /SUMMARY:Edited title/);
+      else assert.equal(googleEvents.get("whitespace").summary, "Edited title");
+    } finally { appleEvents.clear(); googleEvents.clear(); }
+  }
+});
+
+test("legacy Google copies migrate only with a verified provider marker", async () => {
+  const owner = await account();
+  const auth = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, { cookie: auth.cookie, redirect: "manual" })).status, 303);
+  const create = async (title) => {
+    const response = await request("/api/items", { token: owner.token, method: "POST", body: { kind: "event", title, scheduledDate: "2027-01-14" } });
+    assert.equal(response.status, 201);
+    return (await response.json()).item;
+  };
+  const verified = await create("Legacy verified");
+  const blocked = await create("Legacy blocked");
+  const fileResponse = await request("/api/files", { token: owner.token, method: "POST", body: { name: "Legacy context", url: "https://example.com/context" } });
+  assert.equal(fileResponse.status, 201);
+  const file = (await fileResponse.json()).file;
+  assert.equal((await request(`/api/files/${file.id}/attachments`, { token: owner.token, method: "POST", body: { itemId: verified.id } })).status, 201);
+  const findCopy = (item) => [...googleEvents.entries()].find(([, copy]) => copy.extendedProperties.private.filetasksItemId === item.id);
+  const [verifiedId] = findCopy(verified);
+  const [blockedId, blockedCopy] = findCopy(blocked);
+  const mismatched = structuredClone(blockedCopy);
+  mismatched.extendedProperties.private.filetasksItemId = "another-item";
+  googleEvents.set(blockedId, mismatched);
+  googleEvents.set(verifiedId, { ...googleEvents.get(verifiedId), summary: "External change" });
+  await stopServer();
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  try {
+    db.prepare("UPDATE calendar_connections SET connection_scope_id=NULL, legacy_identity_eligible=0 WHERE user_id=? AND provider='google'").run(owner.user.id);
+    db.prepare("UPDATE calendar_copies SET connection_scope_id=NULL WHERE user_id=? AND provider='google'").run(owner.user.id);
+    await startServer();
+    const sync = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+    assert.equal(sync.status, 200);
+    const result = await sync.json();
+    assert.ok(!result.syncLimitations.some((entry) => entry.itemId === verified.id), "verified legacy copy must not retain a limitation on first sync");
+    const scope = db.prepare("SELECT connection_scope_id FROM calendar_connections WHERE user_id=? AND provider='google'").get(owner.user.id).connection_scope_id;
+    assert.ok(scope);
+    const mappings = () => db.prepare("SELECT item_id,external_id,connection_scope_id FROM calendar_copies WHERE user_id=? AND provider='google' ORDER BY item_id").all(owner.user.id);
+    const rows = mappings();
+    assert.equal(rows.find((row) => row.item_id === verified.id).connection_scope_id, scope);
+    assert.equal(rows.find((row) => row.item_id === blocked.id).connection_scope_id, null);
+    assert.equal((await request(`/api/items/${verified.id}`, { token: owner.token, method: "PATCH", body: { title: "Updated legacy verified" } })).status, 200);
+    assert.equal(googleEvents.get(verifiedId).summary, "Updated legacy verified");
+    assert.deepEqual(googleEvents.get(blockedId), mismatched);
+    assert.ok(result.syncLimitations.some((entry) => entry.itemId === blocked.id));
+    const items = (await (await request("/api/items", { token: owner.token })).json()).items;
+    assert.ok(items.find((item) => item.id === blocked.id).calendarSync.length);
+    assert.deepEqual(items.find((item) => item.id === verified.id).files, [{ id: file.id, name: "Legacy context", sourceType: "link" }]);
+    await stopServer();
+    await startServer();
+    assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+    assert.deepEqual(mappings(), rows);
+    assert.deepEqual(googleEvents.get(blockedId), mismatched);
+    const files = (await (await request("/api/files", { token: owner.token })).json()).files;
+    assert.ok(files.find((entry) => entry.id === file.id).attachments.some((attachment) => attachment.itemId === verified.id));
+  } finally {
+    db.close();
+    googleEvents.clear();
+  }
+});
+
+test("Apple embedded VTIMEZONE conflicting with IANA rules blocks Calendar copies", async () => {
+  const owner = await account();
+  const auth = await beginGoogleAuthorization(owner);
+  await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie: auth.cookie, redirect: "manual"});
+  await request("/api/calendars", {token: owner.token, method: "POST", body: {username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`}});
+  const path = "/apple/calendar/conflicting-timezone.ics";
+  const original = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:America/New_York\r\nBEGIN:STANDARD\r\nDTSTART:19700101T000000\r\nTZOFFSETFROM:+0900\r\nTZOFFSETTO:+0900\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:conflicting-timezone\r\nDTSTAMP:20261013T120000Z\r\nDTSTART;TZID=America/New_York:20270114T100000\r\nDTEND;TZID=America/New_York:20270114T110000\r\nSUMMARY:Conflicting timezone\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  try {
+    appleEvents.set(path, original);
+    const sync = await request("/api/calendars/sync", {token: owner.token, method: "POST"});
+    assert.equal(sync.status, 200);
+    const item = (await (await request("/api/items", {token: owner.token})).json()).items.find(entry => entry.title === "Conflicting timezone");
+    assert.ok(item);
+    assert.ok((await sync.json()).syncLimitations.some(entry => entry.itemId === item.id));
+    const status = (await (await request(`/api/items/${item.id}`, {token: owner.token})).json()).item.calendarSync.find(entry => entry.provider === "apple");
+    assert.equal(status.state, "limited");
+    assert.ok(status.limitationCode);
+    assert.equal(appleEvents.get(path), original);
+    assert.equal(googleEvents.size, 0);
+  } finally { appleEvents.clear(); googleEvents.clear(); }
+});
+
+for (const order of ["apple-first", "google-first"]) {
+  test(`Apple-origin copies recover together in one sync (${order})`, async () => {
+    const owner = await account();
+    const connectApple = () => request("/api/calendars", {token: owner.token, method: "POST", body: {username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`}});
+    const connectGoogle = async () => {
+      const auth = await beginGoogleAuthorization(owner);
+      return request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie: auth.cookie, redirect: "manual"});
+    };
+    const path = "/apple/calendar/both-deleted.ics";
+    try {
+      appleEvents.set(path, appleCalendarFixture({uid: "both-deleted"}));
+      if (order === "apple-first") { await connectApple(); await connectGoogle(); }
+      else { await connectGoogle(); await connectApple(); }
+      assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+      const items = (await (await request("/api/items", {token: owner.token})).json()).items;
+      const item = items.find(entry => entry.title === "Imported calendar event");
+      assert.ok(item);
+      assert.equal(googleEvents.size, 1);
+      appleEvents.clear(); googleEvents.clear();
+      assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+      assert.equal(appleEvents.size, 1);
+      assert.equal(googleEvents.size, 1);
+      assert.equal((await request(`/api/items/${item.id}`, {token: owner.token, method: "PATCH", body: {title: "Recovered event edited"}})).status, 200);
+      assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+      assert.match([...appleEvents.values()][0], /SUMMARY:Recovered event edited/);
+      assert.equal([...googleEvents.values()][0].summary, "Recovered event edited");
+      assert.equal(appleEvents.size, 1);
+      assert.equal(googleEvents.size, 1);
+      assert.equal((await (await request("/api/items", {token: owner.token})).json()).items.filter(entry => entry.title === "Recovered event edited").length, 1);
+    } finally { appleEvents.clear(); googleEvents.clear(); }
+  });
+}
+
+test("dual verified NULL-scope Calendar copies update on first sync without stale status", async () => {
+  const owner = await account();
+  const auth = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie: auth.cookie, redirect: "manual"})).status, 303);
+  assert.equal((await request("/api/calendars", {token: owner.token, method: "POST", body: {username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`}})).status, 201);
+  const created = await request("/api/items", {token: owner.token, method: "POST", body: {kind: "event", title: "Authoritative title", scheduledDate: "2027-01-14"}});
+  const item = (await created.json()).item;
+  const [googleId] = googleEvents.keys(); const [applePath] = appleEvents.keys();
+  googleEvents.set(googleId, {...googleEvents.get(googleId), summary: "External title"});
+  appleEvents.set(applePath, appleEvents.get(applePath).replace("SUMMARY:Authoritative title", "SUMMARY:External title"));
+  await stopServer();
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  try {
+    db.prepare("UPDATE calendar_connections SET connection_scope_id=NULL, legacy_identity_eligible=0 WHERE user_id=?").run(owner.user.id);
+    db.prepare("UPDATE calendar_copies SET connection_scope_id=NULL WHERE user_id=?").run(owner.user.id);
+    await startServer();
+    const sync = await request("/api/calendars/sync", {token: owner.token, method: "POST"});
+    assert.equal(sync.status, 200);
+    const result = await sync.json();
+    assert.equal(googleEvents.get(googleId).summary, "Authoritative title");
+    assert.match(appleEvents.get(applePath), /SUMMARY:Authoritative title/);
+    assert.ok(!result.syncLimitations.some(entry => entry.itemId === item.id));
+    const updated = (await (await request(`/api/items/${item.id}`, {token: owner.token})).json()).item;
+    assert.ok(updated.calendarSync.every(({state}) => state !== "pending" && state !== "limited"));
+  } finally { db.close(); googleEvents.clear(); appleEvents.clear(); }
+});
+
+test("Google tentative status survives the actual PUT body", async () => {
+  const owner = await account(); const auth = await beginGoogleAuthorization(owner);
+  await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie: auth.cookie, redirect: "manual"});
+  const source = {id: "tentative-status", status: "tentative", summary: "Tentative event", start: {date: "2027-01-01"}, end: {date: "2027-01-02"}};
+  try {
+    googleEvents.set(source.id, structuredClone(source));
+    assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+    const item = (await (await request("/api/items", {token: owner.token})).json()).items.find(entry => entry.title === source.summary);
+    assert.ok(item);
+    const start = providerRequests.length;
+    assert.equal((await request(`/api/items/${item.id}`, {token: owner.token, method: "PATCH", body: {title: "Edited tentative event"}})).status, 200);
+    const put = providerRequests.slice(start).find(entry => entry.method === "PUT" && entry.path.endsWith(`/events/${source.id}`));
+    assert.ok(put, "expected a Google PUT for the edited event");
+    assert.equal(put.body.status, "tentative");
+  } finally { googleEvents.clear(); }
+});
+
+test("Google attendee displayName line breaks cannot inject Apple properties", async () => {
+  const owner = await account(); const auth = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie: auth.cookie, redirect: "manual"})).status, 303);
+  assert.equal((await request("/api/calendars", {token: owner.token, method: "POST", body: {username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`}})).status, 201);
+  const source = {id: "attendee-injection", summary: "Attendee injection", start: {date: "2027-01-14"}, end: {date: "2027-01-15"}, attendees: [{email: "guest@example.com", displayName: "Guest\r\nX-INJECTED:yes\nLOCATION:Injected\rSUMMARY:Injected"}]};
+  try {
+    googleEvents.set(source.id, structuredClone(source));
+    const sync = await request("/api/calendars/sync", {token: owner.token, method: "POST"});
+    assert.equal(sync.status, 200);
+    assert.ok((await sync.json()).synced.includes("apple"));
+    assert.equal(appleEvents.size, 1);
+    const ics = [...appleEvents.values()][0];
+    assert.match(ics, /ATTENDEE/);
+    assert.doesNotMatch(ics, /(?:^|[\r\n])(?:X-INJECTED|LOCATION|SUMMARY):Injected/);
+    assert.doesNotMatch(ics, /(?:^|[\r\n])X-INJECTED:/);
+  } finally { googleEvents.clear(); appleEvents.clear(); }
+});
+
+test("Google fractional timestamps remain limited and preserve provider timing", async () => {
+  const owner = await account(); const auth = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie: auth.cookie, redirect: "manual"})).status, 303);
+  assert.equal((await request("/api/calendars", {token: owner.token, method: "POST", body: {username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`}})).status, 201);
+  const samples = [
+    {id: "fraction-start", summary: "Fraction start", start: {dateTime: "2027-01-14T12:00:00.123Z"}, end: {dateTime: "2027-01-14T13:00:00Z"}},
+    {id: "fraction-end", summary: "Fraction end", start: {dateTime: "2027-01-14T14:00:00Z"}, end: {dateTime: "2027-01-14T15:00:00.456Z"}},
+  ];
+  try {
+    for (const source of samples) googleEvents.set(source.id, structuredClone(source));
+    const sync = await request("/api/calendars/sync", {token: owner.token, method: "POST"});
+    assert.equal(sync.status, 200);
+    const result = await sync.json();
+    const items = (await (await request("/api/items", {token: owner.token})).json()).items;
+    for (const source of samples) {
+      const item = items.find(entry => entry.title === source.summary);
+      assert.ok(item);
+      assert.ok(result.syncLimitations.some(entry => entry.itemId === item.id));
+      assert.equal(item.calendarSync[0].limitationCode, "unsupported-timing");
+      assert.deepEqual(googleEvents.get(source.id), source);
+      const start = providerRequests.length;
+      assert.equal((await request(`/api/items/${item.id}`, {token: owner.token, method: "PATCH", body: {scheduledDate: "2027-01-15", scheduledTime: "10:00"}})).status, 200);
+      assert.deepEqual(googleEvents.get(source.id), source);
+      assert.ok(!providerRequests.slice(start).some(entry => entry.method === "PUT" && entry.path.endsWith(`/events/${source.id}`)));
+    }
+    assert.equal(appleEvents.size, 0);
+  } finally { googleEvents.clear(); appleEvents.clear(); }
+});
+
+for (const omitted of [false, true]) {
+  test(`Google-origin Apple copy preserves externally added unsupported recurrence (${omitted ? "REPORT omitted" : "REPORT included"})`, async () => {
+    const owner = await account();
+    const auth = await beginGoogleAuthorization(owner);
+    await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie: auth.cookie, redirect: "manual"});
+    await request("/api/calendars", {token: owner.token, method: "POST", body: {username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`}});
+    const source = {id: "google-single-destination", summary: "Google single destination", start: {date: "2027-01-14"}, end: {date: "2027-01-15"}};
+    try {
+      googleEvents.set(source.id, structuredClone(source));
+      assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+      const item = (await (await request("/api/items", {token: owner.token})).json()).items.find(entry => entry.title === source.summary);
+      assert.ok(item);
+      const [path, valid] = [...appleEvents.entries()][0];
+      assert.ok(valid);
+      const changed = valid.replace("END:VEVENT", "RRULE:FREQ=MONTHLY;BYDAY=1MO\r\nEND:VEVENT");
+      assert.notEqual(changed, valid);
+      appleEvents.set(path, changed);
+      if (omitted) omittedAppleReports.add(path);
+      const googleBefore = structuredClone([...googleEvents.entries()]);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        providerRequests = [];
+        assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+        if (omitted) assert.ok(providerRequests.some(entry => entry.method === "GET" && entry.path === path));
+        assert.equal(appleEvents.get(path), changed);
+        assert.deepEqual([...googleEvents.entries()], googleBefore);
+        assert.equal(providerRequests.some(entry => ["PUT", "PATCH", "DELETE"].includes(entry.method) && (entry.path === path || entry.path.includes(source.id))), false);
+        const updated = (await (await request(`/api/items/${item.id}`, {token: owner.token})).json()).item;
+        assert.ok(updated.calendarSync.some(status => status.state === "limited" && status.limitationCode && status.limitation));
+      }
+      appleEvents.set(path, valid);
+      omittedAppleReports.delete(path);
+      assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
+      const restored = (await (await request(`/api/items/${item.id}`, {token: owner.token})).json()).item;
+      assert.ok(restored.calendarSync.every(status => status.state !== "limited"));
+    } finally { omittedAppleReports.clear(); appleEvents.clear(); googleEvents.clear(); }
+  });
+}

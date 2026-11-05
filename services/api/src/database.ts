@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
@@ -30,6 +31,27 @@ export function database() {
         completed INTEGER CHECK(completed IN (0,1)), created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         CHECK((kind = 'task' AND completed IS NOT NULL) OR (kind = 'event' AND completed IS NULL))
       );
+      CREATE UNIQUE INDEX IF NOT EXISTS items_user_id_id ON items(user_id,id);
+      CREATE TABLE IF NOT EXISTS calendar_destination_limitations (
+        user_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        provider TEXT NOT NULL CHECK(provider IN ('google','apple')),
+        connection_scope_id TEXT NOT NULL,
+        code TEXT NOT NULL,
+        message TEXT NOT NULL,
+        PRIMARY KEY(user_id,item_id,provider,connection_scope_id),
+        FOREIGN KEY(user_id,item_id) REFERENCES items(user_id,id) ON DELETE CASCADE
+      );
+      CREATE TABLE IF NOT EXISTS google_creation_reservations (
+        user_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        provider TEXT NOT NULL CHECK(provider = 'google'),
+        connection_scope_id TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        ownership_token TEXT NOT NULL,
+        PRIMARY KEY(user_id,item_id,provider,connection_scope_id),
+        FOREIGN KEY(user_id,item_id) REFERENCES items(user_id,id) ON DELETE CASCADE
+      );
       CREATE TABLE IF NOT EXISTS user_preferences (
         user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
         task_reminders TEXT NOT NULL DEFAULT '[]', event_reminders TEXT NOT NULL DEFAULT '[]',
@@ -39,7 +61,7 @@ export function database() {
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         provider TEXT NOT NULL CHECK(provider IN ('google','apple')),
         account_label TEXT NOT NULL, access_token TEXT, refresh_token TEXT,
-        calendar_url TEXT, connected_at TEXT NOT NULL,
+        calendar_url TEXT, connected_at TEXT NOT NULL, credential_generation_id TEXT NOT NULL,
         PRIMARY KEY(user_id, provider)
       );
       CREATE TABLE IF NOT EXISTS calendar_copies (
@@ -53,6 +75,42 @@ export function database() {
         provider TEXT NOT NULL CHECK(provider IN ('google','apple')),
         external_id TEXT NOT NULL, item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
         PRIMARY KEY(user_id,provider,external_id), UNIQUE(user_id,provider,item_id)
+      );
+      CREATE TABLE IF NOT EXISTS calendar_import_metadata (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL CHECK(provider IN ('google','apple')),
+        external_id TEXT NOT NULL,
+        item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+        source_account_id TEXT NOT NULL,
+        source_payload_json TEXT,
+        source_ics TEXT,
+        timing_json TEXT NOT NULL,
+        baseline_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('supported','limited')),
+        limitation_code TEXT,
+        limitation_message TEXT,
+        captured_at TEXT NOT NULL,
+        PRIMARY KEY(user_id,provider,external_id),
+        FOREIGN KEY(user_id,provider,external_id)
+          REFERENCES calendar_imports(user_id,provider,external_id) ON DELETE CASCADE,
+        CHECK(
+          (provider='google' AND source_payload_json IS NOT NULL AND source_ics IS NULL)
+          OR
+          (provider='apple' AND source_payload_json IS NULL AND source_ics IS NOT NULL)
+        )
+      );
+      CREATE TABLE IF NOT EXISTS google_inventory_pending (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+        source_account_id TEXT NOT NULL,
+        inventory_id TEXT NOT NULL,
+        PRIMARY KEY(user_id,item_id)
+      );
+      CREATE INDEX IF NOT EXISTS calendar_import_metadata_item ON calendar_import_metadata(user_id,item_id);
+      CREATE TABLE IF NOT EXISTS calendar_import_split_blocks (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL, PRIMARY KEY(user_id,item_id,provider)
       );
       CREATE TABLE IF NOT EXISTS calendar_import_exclusions (
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -145,6 +203,18 @@ export function database() {
     db.exec("CREATE INDEX IF NOT EXISTS items_series ON items(series_root_id, occurrence_date)");
     const connectionColumns = new Set(db.prepare("PRAGMA table_info(calendar_connections)").all().map((column) => String(column.name)));
     if (!connectionColumns.has("expires_at")) db.exec("ALTER TABLE calendar_connections ADD COLUMN expires_at INTEGER");
+    if (!connectionColumns.has("legacy_identity_eligible")) db.exec("ALTER TABLE calendar_connections ADD COLUMN legacy_identity_eligible INTEGER NOT NULL DEFAULT 0 CHECK(legacy_identity_eligible IN (0,1))");
+    if (!connectionColumns.has("credential_generation_id")) db.exec("ALTER TABLE calendar_connections ADD COLUMN credential_generation_id TEXT NOT NULL DEFAULT ''");
+    // Upgrade existing connections before any sync can use them. Empty values are not
+    // authorization wildcards; each legacy connection receives its own generation.
+    for (const row of db.prepare("SELECT user_id,provider FROM calendar_connections WHERE credential_generation_id='' OR credential_generation_id IS NULL").all()) {
+      db.prepare("UPDATE calendar_connections SET credential_generation_id=? WHERE user_id=? AND provider=? AND (credential_generation_id='' OR credential_generation_id IS NULL)")
+        .run(randomUUID(),row.user_id,row.provider);
+    }
+    for (const table of ["calendar_connections", "calendar_copies", "calendar_imports", "calendar_import_metadata", "calendar_import_exclusions", "google_inventory_pending"]) {
+      const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((column) => String(column.name)));
+      if (!columns.has("connection_scope_id")) db.exec(`ALTER TABLE ${table} ADD COLUMN connection_scope_id TEXT`);
+    }
     // OAuth transactions are short-lived. Discard legacy state-only transactions so they cannot
     // be completed after upgrading to the browser-bound flow.
     db.exec("DROP TABLE IF EXISTS calendar_oauth_states");

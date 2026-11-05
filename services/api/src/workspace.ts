@@ -1,5 +1,7 @@
+import { sameRecurrence } from "./items";
+import { importedScheduleLimitation } from "./calendars";
 import { randomUUID } from "node:crypto";
-import type { RecurrenceRule, ReminderRule, WorkspaceFileSummary, WorkspaceItem } from "./items";
+import type { CalendarSyncStatus, RecurrenceRule, ReminderRule, WorkspaceFileSummary, WorkspaceItem } from "./items";
 import { database } from "./database";
 import { now } from "./clock";
 import { HttpError } from "./http";
@@ -18,7 +20,7 @@ function fromRow(row: Record<string, unknown>): WorkspaceItem {
     recurrence: json(row.root_recurrence_json ?? row.recurrence_json, null),
     reminders: json(row.reminders_json, []),
     seriesId: row.series_root_id == null || (row.root_recurrence_json ?? row.recurrence_json) == null ? null : String(row.series_root_id),
-    isOccurrence: row.series_root_id != null && String(row.id) !== String(row.series_root_id),
+    isOccurrence: row.series_root_id != null && String(row.id) !== String(row.series_root_id), calendarSync: [],
     occurrenceDate: row.occurrence_date == null ? null : String(row.occurrence_date),
     createdAt: String(row.created_at), updatedAt: String(row.updated_at),
   };
@@ -134,6 +136,8 @@ function ensureOccurrences(userId: string) {
         recurrence_json,reminders_json,series_root_id,occurrence_date)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, userId, row.kind, row.title, row.details, date, row.scheduled_time,
         row.kind === "task" ? 0 : null, createdAt, createdAt, null, row.reminders_json ?? "[]", row.id, date);
+      db.prepare(`INSERT OR IGNORE INTO calendar_import_split_blocks(user_id,item_id,provider)
+        SELECT user_id,?,provider FROM calendar_import_split_blocks WHERE user_id=? AND item_id=?`).run(id,userId,row.id);
     }
   }
 }
@@ -162,7 +166,137 @@ function withFiles(items: WorkspaceItem[], userId: string) {
     const itemId = String(row.item_id);
     filesByItem.set(itemId, [...(filesByItem.get(itemId) ?? []), { id: String(row.id), name: String(row.name), sourceType: row.source_type as "upload" | "link" }]);
   }
-  return items.map((item) => ({ ...item, files: filesByItem.get(item.id) ?? [] }));
+  const calendarSyncByItem = new Map<string, CalendarSyncStatus[]>();
+  const currentAccounts = new Map(database().prepare("SELECT provider,calendar_url,connection_scope_id FROM calendar_connections WHERE user_id=?").all(userId)
+    .map((row) => [String(row.provider), row]));
+  const metadata = database().prepare(`SELECT item_id,provider,state,limitation_code,limitation_message,baseline_json,source_payload_json,source_ics
+    ,source_account_id,timing_json,connection_scope_id,external_id FROM calendar_import_metadata WHERE user_id=?`).all(userId);
+  for (const row of metadata) {
+    const rootId = String(row.item_id);
+    const rootRow = database().prepare("SELECT * FROM items WHERE user_id=? AND id=?").get(userId,rootId);
+    const item = rootRow ? fromRow(rootRow) : undefined;
+    if (!item) continue;
+    const baseline = json<{ scheduledDate?: string | null; scheduledTime?: string | null; recurrence?: RecurrenceRule | null }>(row.baseline_json, {});
+    const scheduleEdited = (baseline.scheduledDate ?? null) !== item.scheduledDate || (baseline.scheduledTime ?? null) !== item.scheduledTime;
+    const recurrenceEdited = !sameRecurrence(baseline.recurrence ?? null,item.recurrence);
+    const sourceState = row.state === "limited" ? "limited" : "supported";
+    let limitationCode = typeof row.limitation_code === "string" ? row.limitation_code : null;
+    let limitation = typeof row.limitation_message === "string" ? row.limitation_message : null;
+    let state: CalendarSyncStatus["state"] = sourceState;
+    const active = currentAccounts.get(String(row.provider));
+    const identity = database().prepare("SELECT 1 FROM calendar_imports WHERE user_id=? AND item_id=? AND provider=? AND external_id=? AND connection_scope_id=?").get(userId,rootId,row.provider,row.external_id,row.connection_scope_id);
+    if ((!active || !active.connection_scope_id || !row.connection_scope_id || active.connection_scope_id !== row.connection_scope_id || !identity || (active.calendar_url ?? (row.provider === "google" ? "primary" : null)) !== row.source_account_id) && sourceState !== "limited") {
+      state = "limited";
+      limitationCode = "source-account-changed";
+      limitation = "The connected calendar account changed after this Event was imported. Sync is paused so the original Calendar copy is not replaced with a guess.";
+    }
+    if (recurrenceEdited && sourceState !== "limited") {
+      state = "limited";
+      limitationCode = "recurrence-edited";
+      limitation = "This imported Recurrence rule was edited in FileTasks. Calendar sync is paused until the original Recurrence representation can be preserved.";
+    }
+    if (scheduleEdited && state === "supported") {
+      const scheduleLimitation = importedScheduleLimitation(String(row.timing_json),item,row.provider === "apple");
+      if (scheduleLimitation) {
+        state = "limited";
+        limitationCode = "schedule-unsupported";
+        limitation = scheduleLimitation;
+      }
+    }
+    const occurrenceChanged = item.recurrence && Boolean(database().prepare(`SELECT 1 FROM occurrence_exclusions WHERE user_id=? AND series_root_id=?
+      UNION ALL SELECT 1 FROM items WHERE user_id=? AND series_root_id=? AND id<>? AND
+      (scheduled_date IS NOT occurrence_date OR scheduled_time IS NOT ? OR title IS NOT ? OR details IS NOT ?) LIMIT 1`)
+      .get(userId,rootId,userId,rootId,rootId,item.scheduledTime,item.title,item.details));
+    if (occurrenceChanged && state === "supported") {
+      state = "limited"; limitationCode = "occurrence-edited";
+      limitation = "This imported Event has edited or deleted Occurrences. Calendar sync is paused to preserve its original recurrence.";
+    }
+    if (item.recurrence && state === "supported") {
+      state = "limited"; limitationCode = "unsupported-recurrence";
+      limitation = "Imported recurring Events are paused to preserve external exceptions.";
+    }
+    if (database().prepare("SELECT 1 FROM google_inventory_pending WHERE user_id=? AND item_id=?").get(userId,rootId)) {
+      state = "limited"; limitationCode = "inventory-pending";
+      limitation = "Google Calendar inventory is incomplete. Sync is paused to protect this Event.";
+    }
+    let location: string | undefined;
+    if (row.provider === "google" && typeof row.source_payload_json === "string") {
+      const payload = json<{ location?: unknown }>(row.source_payload_json, {});
+      if (typeof payload.location === "string" && payload.location) location = payload.location;
+    } else if (row.provider === "apple" && typeof row.source_ics === "string") {
+      const match = row.source_ics.replace(/\r?\n[ \t]/g, "").split(/\r?\n/).find((line) => /^LOCATION(?:;[^:]*)?:/i.test(line));
+      if (match) location = match.slice(match.indexOf(":") + 1).replace(/\\n/gi, "\n").replace(/\\,/g, ",").replace(/\\;/g, ";").replace(/\\\\/g, "\\");
+    }
+    const status: CalendarSyncStatus = {
+      provider: row.provider as CalendarSyncStatus["provider"], state, scheduleEdited, recurrenceEdited,
+      limitationCode, limitation, ...(location ? { location } : {}),
+    };
+    for (const target of items.filter((candidate) => candidate.id === rootId || candidate.seriesId === rootId))
+      calendarSyncByItem.set(target.id, [...(calendarSyncByItem.get(target.id) ?? []), status]);
+  }
+  for (const row of database().prepare(`SELECT i.item_id,i.provider FROM calendar_imports i
+    LEFT JOIN calendar_import_metadata m ON m.user_id=i.user_id AND m.provider=i.provider AND m.external_id=i.external_id
+    WHERE i.user_id=? AND m.external_id IS NULL`).all(userId)) {
+    for (const target of items.filter((candidate) => candidate.id === String(row.item_id) || candidate.seriesId === String(row.item_id))) {
+      const status: CalendarSyncStatus = { provider:row.provider as CalendarSyncStatus["provider"], state:"limited", scheduleEdited:false, recurrenceEdited:false,
+        limitationCode:"legacy-import", limitation:"This Event was imported before source timing could be retained. Calendar sync is paused because its original timing cannot be verified." };
+      calendarSyncByItem.set(target.id,[...(calendarSyncByItem.get(target.id) ?? []),status]);
+    }
+  }
+  for (const row of database().prepare("SELECT item_id,provider FROM calendar_import_split_blocks WHERE user_id=?").all(userId)) {
+    const itemId = String(row.item_id);
+    const status: CalendarSyncStatus = { provider: row.provider as CalendarSyncStatus["provider"], state:"limited", scheduleEdited:true,
+      recurrenceEdited:true, limitationCode:"imported-series-split", limitation:"This imported series was split in FileTasks. Calendar sync is paused to preserve the original Calendar copy." };
+    for (const target of items.filter((candidate) => candidate.id === itemId || candidate.seriesId === itemId)) {
+      const existing = calendarSyncByItem.get(target.id) ?? [];
+      if (!existing.some((entry) => entry.provider === status.provider && entry.limitationCode === status.limitationCode)) {
+        calendarSyncByItem.set(target.id,[...existing,status]);
+      }
+    }
+  }
+  for (const row of database().prepare(`SELECT c.item_id,c.provider FROM calendar_copies c
+    JOIN calendar_connections conn ON conn.user_id=c.user_id AND conn.provider=c.provider
+    WHERE c.user_id=? AND (conn.connection_scope_id IS NULL OR c.connection_scope_id IS NULL OR c.connection_scope_id<>conn.connection_scope_id)`).all(userId)) {
+    const status: CalendarSyncStatus = { provider:row.provider as CalendarSyncStatus["provider"], state:"limited", scheduleEdited:false, recurrenceEdited:false,
+      limitationCode:"copy-scope-unverified", limitation:"This Calendar copy belongs to an earlier or unknown connection. Sync is paused because its identity cannot be verified." };
+    for (const target of items.filter((candidate) => candidate.id === String(row.item_id) || candidate.seriesId === String(row.item_id))) {
+      const existing = calendarSyncByItem.get(target.id) ?? [];
+      calendarSyncByItem.set(target.id, [...existing.filter((entry) => entry.provider !== status.provider), status]);
+    }
+  }
+  for (const row of database().prepare(`SELECT l.item_id,l.provider,l.code,l.message FROM calendar_destination_limitations l
+    JOIN calendar_connections c ON c.user_id=l.user_id AND c.provider=l.provider
+      AND c.connection_scope_id=l.connection_scope_id
+    JOIN items i ON i.user_id=l.user_id AND i.id=l.item_id AND i.kind='event'
+    WHERE l.user_id=?`).all(userId)) {
+    const status: CalendarSyncStatus = { provider: row.provider as CalendarSyncStatus["provider"], state: "limited",
+      scheduleEdited: false, recurrenceEdited: false, limitationCode: String(row.code), limitation: String(row.message) };
+    for (const target of items.filter((candidate) => candidate.kind === "event" &&
+      (candidate.id === String(row.item_id) || candidate.seriesId === String(row.item_id)))) {
+      calendarSyncByItem.set(target.id, [...(calendarSyncByItem.get(target.id) ?? []), status]);
+    }
+  }
+  return items.map((item) => ({ ...item, files: filesByItem.get(item.id) ?? [], calendarSync: calendarSyncByItem.get(item.id) ?? [] }));
+}
+
+export function calendarSyncLimitations(userId: string) {
+  const connectedProviders = new Set(database().prepare("SELECT provider FROM calendar_connections WHERE user_id=?").all(userId).map((row) => String(row.provider)));
+  const limitations = listItems(userId).flatMap((item) => {
+    const limitations = item.calendarSync.filter((status) => status.state === "limited")
+      .map((status) => ({ itemId: item.id, title: item.title, provider: status.provider, message: status.limitation ?? "This Event cannot be synchronized safely." }));
+    if (item.recurrence && connectedProviders.has("apple") && item.calendarSync.some((status) => status.provider === "google" && status.state === "supported")) {
+      limitations.push({itemId:item.id,title:item.title,provider:"apple",message:"This recurring Event uses a Google timezone rule. Apple export is paused because its daylight-saving behavior cannot be preserved safely yet."});
+    }
+    return limitations;
+  });
+  for (const row of database().prepare(`SELECT c.item_id,c.provider FROM calendar_copies c
+    JOIN calendar_connections conn ON conn.user_id=c.user_id AND conn.provider=c.provider
+    WHERE c.user_id=? AND (conn.connection_scope_id IS NULL OR c.connection_scope_id IS NULL OR c.connection_scope_id<>conn.connection_scope_id)
+      AND NOT EXISTS (SELECT 1 FROM items i WHERE i.user_id=c.user_id AND i.id=c.item_id)`).all(userId)) {
+    limitations.push({ itemId:String(row.item_id), title:"Deleted Event", provider:row.provider as CalendarSyncStatus["provider"],
+      message:"The deleted Event has a Calendar copy from an earlier or unknown connection. Its identity cannot be verified, so the copy is retained." });
+  }
+  return limitations;
 }
 
 export function listItems(userId: string) {
@@ -255,6 +389,18 @@ export function saveItem(userId: string, body: Record<string, unknown>, id?: str
     const comparison = scope === "following" ? " AND occurrence_date >= ?" : "";
     const params: (string | null)[] = scope === "following" ? [userId, series, existing.scheduledDate] : [userId, series];
     const targets = db.prepare(`SELECT id,occurrence_date FROM items WHERE user_id=? AND series_root_id=?${comparison} ORDER BY occurrence_date,id`).all(...params);
+    // Retain inherited split safeguards before any Occurrences can become standalone.
+    db.prepare(`INSERT OR IGNORE INTO calendar_import_split_blocks(user_id,item_id,provider)
+      SELECT i.user_id,i.id,b.provider FROM items i JOIN calendar_import_split_blocks b
+        ON b.user_id=i.user_id AND b.item_id=? WHERE i.user_id=? AND i.series_root_id=?`).run(series,userId,series);
+    if (scope === "following" && id !== series) {
+      db.prepare(`INSERT OR IGNORE INTO calendar_import_split_blocks(user_id,item_id,provider)
+        SELECT i.user_id,i.id,p.provider FROM items i JOIN (
+          SELECT user_id,provider FROM calendar_imports WHERE user_id=? AND item_id=?
+          UNION SELECT user_id,provider FROM calendar_import_split_blocks WHERE user_id=? AND item_id=?
+        ) p ON p.user_id=i.user_id WHERE i.user_id=? AND i.series_root_id=?`)
+        .run(userId,series,userId,series,userId,series);
+    }
     const wholeSeries = scope === "series" || (scope === "following" && id === series);
     const root = db.prepare("SELECT scheduled_date FROM items WHERE user_id=? AND id=?").get(userId,series);
     const remindersOnly = scope === "series" && body.scheduledDate === undefined && body.scheduledTime === undefined && body.recurrence === undefined;
@@ -282,6 +428,9 @@ export function saveItem(userId: string, body: Record<string, unknown>, id?: str
             .run(followingDates[index],id,followingDates[index],index===0?JSON.stringify(splitRule):null,target.id);
           else db.prepare("DELETE FROM items WHERE user_id=? AND id=?").run(userId,target.id);
         });
+        db.prepare(`INSERT OR IGNORE INTO calendar_import_split_blocks(user_id,item_id,provider)
+          SELECT user_id,?,provider FROM calendar_import_metadata WHERE user_id=? AND item_id=?
+          UNION SELECT user_id,?,provider FROM calendar_import_split_blocks WHERE user_id=? AND item_id=?`).run(id,userId,series,id,userId,series);
         db.prepare("UPDATE items SET recurrence_json=NULL,series_root_id=? WHERE user_id=? AND id=?").run(series,userId,series);
         db.prepare(`INSERT OR IGNORE INTO attachments(file_id,item_id,created_at,scope)
           SELECT file_id,?,created_at,'series' FROM attachments WHERE item_id=? AND scope='series'`).run(id,series);
@@ -290,7 +439,7 @@ export function saveItem(userId: string, body: Record<string, unknown>, id?: str
         db.prepare("UPDATE items SET series_root_id=?,recurrence_json=NULL WHERE user_id=? AND id=?").run(series,userId,series);
       }
     }
-    if (scope === "series" && !item.recurrence) for (const target of targets) {
+    if (wholeSeries && !item.recurrence) for (const target of targets) {
       if (String(target.id) !== series) db.prepare("DELETE FROM items WHERE user_id=? AND id=?").run(userId,target.id);
     }
     if (item.recurrence) ensureOccurrences(userId);
