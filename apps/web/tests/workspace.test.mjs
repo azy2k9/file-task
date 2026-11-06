@@ -2991,13 +2991,15 @@ test("imported series normalization and splits retain export safeguards", async 
     assert.equal(root.calendarSync[0].state,"limited");
     assert.equal(root.calendarSync[0].recurrenceEdited,false);
     const later = items.find((item) => item.seriesId === root.id && item.id !== root.id);
+    const providerEventsBeforeSplit = structuredClone([...googleEvents.entries()]);
     const patch = await request(`/api/items/${later.id}`,{token:owner.token,method:"PATCH",body:{title:"Split later",scope:"following"}});
     assert.equal(patch.status,200);
     assert.equal((await patch.json()).item.calendarSync[0].limitationCode,"imported-series-split");
     const loaded = (await (await request(`/api/items/${later.id}`,{token:owner.token})).json()).item;
     assert.equal(loaded.calendarSync[0].state,"limited");
     assert.ok((await (await request("/api/calendars",{token:owner.token})).json()).syncLimitations.some((entry) => entry.itemId === later.id));
-    assert.equal(googleEvents.size,1);
+    assert.deepEqual([...googleEvents.entries()],providerEventsBeforeSplit,
+      "splitting an imported series must leave every Google provider copy unchanged");
     assert.deepEqual(googleEvents.get(source.id).start,source.start);
     assert.deepEqual(googleEvents.get(source.id).end,source.end);
   } finally { googleEvents.clear(); }

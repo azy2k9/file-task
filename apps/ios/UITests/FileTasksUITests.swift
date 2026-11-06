@@ -56,8 +56,15 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         XCTAssertTrue(settingsButton.waitForExistence(timeout: 10), "The sign-in screen should expose real Server settings.")
         settingsButton.tap()
 
+        let settingsNavigation = app.navigationBars["Server settings"]
+        if !settingsNavigation.waitForExistence(timeout: 3) {
+            settingsButton.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        }
+        XCTAssertTrue(settingsNavigation.waitForExistence(timeout: 10),
+                      "Server settings should open from the sign-in screen. Accessibility hierarchy: \(app.debugDescription)")
+
         let originField = app.textFields["https://api.example.com"]
-        XCTAssertTrue(originField.waitForExistence(timeout: 30),
+        XCTAssertTrue(originField.waitForExistence(timeout: 10),
                       "Server settings should show the server origin field. Accessibility hierarchy: \(app.debugDescription)")
         replaceText(in: originField, with: "http://localhost:3107")
         XCTAssertEqual(originField.value as? String, "http://localhost:3107", "Server origin must be entered exactly before saving.")
@@ -79,7 +86,6 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [httpEnabled], timeout: 5), .completed,
                        "Local development HTTP must be enabled before saving. Accessibility hierarchy: \(app.debugDescription)")
 
-        let settingsNavigation = app.navigationBars["Server settings"]
         app.buttons["Save"].tap()
         let sheetDismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: settingsNavigation)
         XCTAssertEqual(XCTWaiter.wait(for: [sheetDismissed], timeout: 10), .completed,
@@ -123,18 +129,25 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
     private func openToolbarMenu(_ name: String, select itemName: String) {
         let menu = app.buttons[name]
         XCTAssertTrue(menu.waitForExistence(timeout: 10))
-        menu.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        let embeddedMenuButton = menu.buttons.firstMatch
+        if embeddedMenuButton.exists && embeddedMenuButton.isHittable {
+            embeddedMenuButton.tap()
+        } else {
+            menu.tap()
+        }
 
-        let menuItem = app.descendants(matching: .any)
-            .matching(NSPredicate(format: "label == %@", itemName))
-            .firstMatch
-        let menuItemReady = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == true AND hittable == true"),
-            object: menuItem
-        )
-        XCTAssertEqual(XCTWaiter.wait(for: [menuItemReady], timeout: 10), .completed,
+        let menuItem = app.menuItems[itemName]
+        let menuButton = app.buttons[itemName]
+        let menuActionReady = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            (menuItem.exists && menuItem.isHittable) || (menuButton.exists && menuButton.isHittable)
+        }, object: app)
+        XCTAssertEqual(XCTWaiter.wait(for: [menuActionReady], timeout: 10), .completed,
                        "The \(itemName) menu item should be hittable. Accessibility hierarchy: \(app.debugDescription)")
-        menuItem.tap()
+        if menuItem.exists && menuItem.isHittable {
+            menuItem.tap()
+        } else {
+            menuButton.tap()
+        }
     }
 
     private func signInInApp(email: String) {
