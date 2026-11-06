@@ -1,5 +1,8 @@
 package com.filetasks.android
 
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsOff
+import androidx.compose.ui.test.assertIsOn
 import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
@@ -61,11 +64,23 @@ class RecurringAgendaUiTest {
 
         compose.onNodeWithTag("agenda.complete.${personalTask.id}").performClick()
         waitFor("the Task to be marked complete") {
-            items(api, token).single { it.id == personalTask.id }.completed == true
+            val saved = items(api, token).single { it.id == personalTask.id }.completed == true
+            val checkboxReady = runCatching {
+                compose.onNodeWithTag("agenda.complete.${personalTask.id}")
+                    .assertIsOn()
+                    .assertIsEnabled()
+            }.isSuccess
+            saved && checkboxReady
         }
         compose.onNodeWithTag("agenda.complete.${personalTask.id}").performClick()
         waitFor("the Task to be reopened") {
-            items(api, token).single { it.id == personalTask.id }.completed == false
+            val saved = items(api, token).single { it.id == personalTask.id }.completed == false
+            val checkboxReady = runCatching {
+                compose.onNodeWithTag("agenda.complete.${personalTask.id}")
+                    .assertIsOff()
+                    .assertIsEnabled()
+            }.isSuccess
+            saved && checkboxReady
         }
 
         editSimpleItem(personalTask, "Android UI edited Task", "Updated Task details")
@@ -157,8 +172,9 @@ class RecurringAgendaUiTest {
             compose.onAllNodes(hasTestTag("item.delete.confirm"), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
         }
         compose.onNodeWithTag("item.delete.confirm", useUnmergedTree = true).performClick()
-        waitFor("the deleted item to leave the agenda") {
+        waitFor("the deleted item and confirmation dialog to leave the agenda") {
             compose.onAllNodes(hasTestTag("agenda.item.${item.id}"), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
+                && compose.onAllNodes(hasTestTag("item.delete.confirm"), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
         }
     }
 
