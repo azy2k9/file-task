@@ -174,7 +174,10 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         field.typeText(String(password.prefix(1)))
         dismissStrongPasswordSuggestionIfShown()
         let firstCharacterWasEntered = (field.value as? String)?.count == 1
-        field.typeText(firstCharacterWasEntered ? String(password.dropFirst()) : password)
+        let remainingPassword = firstCharacterWasEntered ? String(password.dropFirst()) : password
+        for character in remainingPassword {
+            field.typeText(String(character))
+        }
         XCTAssertEqual((field.value as? String)?.count, password.count,
                        "The full password should be entered before submitting the form. Accessibility hierarchy: \(app.debugDescription)")
     }
