@@ -3,6 +3,7 @@ package com.filetasks.android
 import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isRoot
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -153,11 +154,11 @@ class RecurringAgendaUiTest {
         compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.delete.${item.id}"))
         compose.onNodeWithTag("agenda.delete.${item.id}").performClick()
         waitFor("the delete confirmation to appear") {
-            compose.onAllNodes(hasTestTag("item.delete.confirm")).fetchSemanticsNodes().isNotEmpty()
+            compose.onAllNodes(hasTestTag("item.delete.confirm"), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
         }
-        compose.onNodeWithTag("item.delete.confirm").performClick()
+        compose.onNodeWithTag("item.delete.confirm", useUnmergedTree = true).performClick()
         waitFor("the deleted item to leave the agenda") {
-            compose.onAllNodes(hasTestTag("agenda.item.${item.id}")).fetchSemanticsNodes().isEmpty()
+            compose.onAllNodes(hasTestTag("agenda.item.${item.id}"), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
         }
     }
 
@@ -194,7 +195,9 @@ class RecurringAgendaUiTest {
             compose.waitUntil(30_000, condition)
         } catch (failure: Throwable) {
             val password = InstrumentationRegistry.getArguments().getString("password")
-            val snapshot = runCatching { compose.onRoot(useUnmergedTree = true).printToString() }.getOrElse { it.toString() }
+            val snapshot = runCatching {
+                compose.onAllNodes(isRoot(), useUnmergedTree = true).printToString()
+            }.getOrElse { it.toString() }
             val ui = if (password.isNullOrEmpty()) snapshot else snapshot.replace(password, "<redacted>")
             throw AssertionError("Failed while waiting for $description. UI: $ui", failure)
         }
