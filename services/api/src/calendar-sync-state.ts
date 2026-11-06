@@ -50,7 +50,7 @@ export function failCalendarSync(userId: string, generation: CalendarSyncGenerat
   const currentTime = nowMs();
   const preserveAuthorization = !reauthorizationRequired && row.last_error_code === "authorization";
   const lastError = reauthorizationRequired
-    ? `${generation.provider === "google" ? "Google" : "Apple"} Calendar denied a delete request. Reauthorize this calendar to retry cleanup; the Calendar copy identity is retained and retries continue automatically.`
+    ? `${generation.provider === "google" ? "Google" : "Apple"} Calendar denied a delete request. Reauthorize ${generation.provider === "google" ? "Google" : "Apple"} Calendar to retry cleanup; the Calendar copy identity is retained and retries continue automatically.`
     : preserveAuthorization ? row.last_error : safeFailureMessage;
   db.prepare(`UPDATE calendar_sync_state SET state='failed',attempts=?,next_attempt_at=?,last_attempt_at=?,last_error=?,last_error_code=?
     WHERE user_id=? AND provider=? AND generation=?`).run(
