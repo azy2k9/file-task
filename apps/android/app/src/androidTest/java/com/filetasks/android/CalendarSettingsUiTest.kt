@@ -114,6 +114,9 @@ class CalendarSettingsUiTest {
                 hasAnyDescendant(hasText("android-calendar@example.com")),
         ).assertExists()
 
+        waitFor("Sync Calendar to become available") {
+            compose.onAllNodes(hasTestTag("calendar.sync") and isEnabled()).fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithTag("calendar.sync").performScrollTo().performClick()
         waitFor("first native Calendar sync") {
             compose.onAllNodes(hasText("Synced Apple Calendar. 1 Event refreshed.")).fetchSemanticsNodes().isNotEmpty()
