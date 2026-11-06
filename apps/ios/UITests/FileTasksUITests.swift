@@ -296,7 +296,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
     }
 
     private func assertCalendarDeliveryNotice(_ message: String) {
-        let notice = app.staticTexts[message]
+        let notice = app.staticTexts.matching(NSPredicate(format: "label == %@", message)).firstMatch
         XCTAssertTrue(notice.waitForExistence(timeout: 15),
                       "A failed Calendar delivery must be reported separately from the saved Event. Accessibility hierarchy: \(app.debugDescription)")
     }

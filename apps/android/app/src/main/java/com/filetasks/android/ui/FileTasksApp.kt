@@ -207,7 +207,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                     }
                 }
                 calendarNoticeVersion += 1
-            } catch {
+            } catch (failure: Exception) {
                 if (token == currentToken && outcome != null) {
                     calendarSyncNotice = if (outcome == "deleted") {
                         "Deleted from FileTasks. Calendar removal status is not available yet."
