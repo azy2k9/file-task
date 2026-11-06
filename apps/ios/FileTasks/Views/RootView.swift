@@ -26,6 +26,7 @@ struct RootView: View {
                     try model.resetSessionForServerChange()
                 }
                 settings.update(baseURLString: baseURL, allowsLocalHTTP: allowsHTTP)
+                showingServerSettings = false
             }
         }
         .task {

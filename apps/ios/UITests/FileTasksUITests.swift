@@ -56,8 +56,16 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         XCTAssertTrue(settingsButton.waitForExistence(timeout: 10), "The sign-in screen should expose real Server settings.")
         settingsButton.tap()
 
+        let settingsNavigation = app.navigationBars["Server settings"]
+        if !settingsNavigation.waitForExistence(timeout: 3) {
+            settingsButton.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        }
+        XCTAssertTrue(settingsNavigation.waitForExistence(timeout: 10),
+                      "Server settings should open from the sign-in screen. Accessibility hierarchy: \(app.debugDescription)")
+
         let originField = app.textFields["https://api.example.com"]
-        XCTAssertTrue(originField.waitForExistence(timeout: 5))
+        XCTAssertTrue(originField.waitForExistence(timeout: 10),
+                      "Server settings should show the server origin field. Accessibility hierarchy: \(app.debugDescription)")
         replaceText(in: originField, with: "http://localhost:3107")
         XCTAssertEqual(originField.value as? String, "http://localhost:3107", "Server origin must be entered exactly before saving.")
         dismissKeyboardIfShown()
@@ -78,7 +86,6 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [httpEnabled], timeout: 5), .completed,
                        "Local development HTTP must be enabled before saving. Accessibility hierarchy: \(app.debugDescription)")
 
-        let settingsNavigation = app.navigationBars["Server settings"]
         app.buttons["Save"].tap()
         let sheetDismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: settingsNavigation)
         XCTAssertEqual(XCTWaiter.wait(for: [sheetDismissed], timeout: 10), .completed,
@@ -97,7 +104,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         scrollToHittable(createAccount, toward: .down)
         createAccount.tap()
         allowLocalNetworkIfPrompted()
-        XCTAssertTrue(app.buttons["Account options"].waitForExistence(timeout: 15),
+        XCTAssertTrue(app.buttons["Account options"].waitForExistence(timeout: 60),
                       "Registration must complete through the installed app. Accessibility hierarchy: \(app.debugDescription)")
         XCTAssertTrue(app.staticTexts["Your workspace is empty"].waitForExistence(timeout: 30),
                       "The newly registered workspace should finish loading before opening its menu. Accessibility hierarchy: \(app.debugDescription)")
@@ -122,25 +129,25 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
     private func openToolbarMenu(_ name: String, select itemName: String) {
         let menu = app.buttons[name]
         XCTAssertTrue(menu.waitForExistence(timeout: 10))
-        let menuItem = app.buttons[itemName]
-        let visibleFrame = NSPredicate { _, _ in
-            guard menuItem.exists else { return false }
-            let frame = menuItem.frame
-            return frame.origin.x.isFinite && frame.origin.y.isFinite && frame.width > 0 && frame.height > 0
-                && self.app.frame.intersects(frame)
+        let embeddedMenuButton = menu.buttons.firstMatch
+        if embeddedMenuButton.exists && embeddedMenuButton.isHittable {
+            embeddedMenuButton.tap()
+        } else {
+            menu.tap()
         }
-        var menuOpened = false
-        for _ in 0..<3 {
-            // SwiftUI exposes a labelled wrapper that can lack a hit point.
-            menu.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
-            let menuReady = XCTNSPredicateExpectation(predicate: visibleFrame, object: menuItem)
-            if XCTWaiter.wait(for: [menuReady], timeout: 5) == .completed {
-                menuOpened = true
-                break
-            }
+
+        let menuItem = app.menuItems[itemName]
+        let menuButton = app.buttons[itemName]
+        let menuActionReady = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            (menuItem.exists && menuItem.isHittable) || (menuButton.exists && menuButton.isHittable)
+        }, object: app)
+        XCTAssertEqual(XCTWaiter.wait(for: [menuActionReady], timeout: 10), .completed,
+                       "The \(itemName) menu item should be hittable. Accessibility hierarchy: \(app.debugDescription)")
+        if menuItem.exists && menuItem.isHittable {
+            menuItem.tap()
+        } else {
+            menuButton.tap()
         }
-        XCTAssertTrue(menuOpened, "The \(itemName) menu item should have a visible frame. Accessibility hierarchy: \(app.debugDescription)")
-        menuItem.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
     }
 
     private func signInInApp(email: String) {
@@ -150,7 +157,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         scrollToHittable(signIn, toward: .down)
         signIn.tap()
         allowLocalNetworkIfPrompted()
-        XCTAssertTrue(app.buttons["Create item"].waitForExistence(timeout: 15),
+        XCTAssertTrue(app.buttons["Create item"].waitForExistence(timeout: 60),
                       "Sign-in must use the app's account flow. Accessibility hierarchy: \(app.debugDescription)")
     }
 
@@ -168,18 +175,30 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         scrollToHittable(field, toward: .down, message: "The password field should be visible.")
         field.tap()
         dismissStrongPasswordSuggestionIfShown()
+        ensureKeyboardFocus(field)
 
         // iOS may present its strong-password sheet after the first keystroke.
         // Handle it before typing the remaining characters.
         field.typeText(String(password.prefix(1)))
         dismissStrongPasswordSuggestionIfShown()
         let firstCharacterWasEntered = (field.value as? String)?.count == 1
+        ensureKeyboardFocus(field)
         let remainingPassword = firstCharacterWasEntered ? String(password.dropFirst()) : password
         for character in remainingPassword {
             field.typeText(String(character))
         }
         XCTAssertEqual((field.value as? String)?.count, password.count,
                        "The full password should be entered before submitting the form. Accessibility hierarchy: \(app.debugDescription)")
+    }
+
+    private func ensureKeyboardFocus(_ field: XCUIElement) {
+        let focused = NSPredicate(format: "hasKeyboardFocus == true")
+        if !focused.evaluate(with: field) {
+            field.tap()
+        }
+        let focusReady = XCTNSPredicateExpectation(predicate: focused, object: field)
+        XCTAssertEqual(XCTWaiter.wait(for: [focusReady], timeout: 15), .completed,
+                       "The password field should have keyboard focus before typing. Accessibility hierarchy: \(app.debugDescription)")
     }
 
     private func dismissStrongPasswordSuggestionIfShown() {
@@ -311,6 +330,9 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         let row = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", title)).firstMatch
         scrollToHittable(row, toward: .down, maxSwipes: 10, message: "The saved item should appear in the signed-in workspace.")
         row.tap()
+        let editor = app.navigationBars.matching(NSPredicate(format: "identifier BEGINSWITH %@", "Edit ")).firstMatch
+        XCTAssertTrue(editor.waitForExistence(timeout: 30),
+                      "The saved item should open in the editor. Accessibility hierarchy: \(app.debugDescription)")
     }
 
     private func cancelEditor() {

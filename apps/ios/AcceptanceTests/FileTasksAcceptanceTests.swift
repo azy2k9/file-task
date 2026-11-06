@@ -86,10 +86,14 @@ final class FileTasksAcceptanceTests: XCTestCase {
         workerRequest.setValue("Bearer \(ProcessInfo.processInfo.environment["FILETASKS_TEST_WORKER_SECRET"] ?? "test-worker-secret")", forHTTPHeaderField: "Authorization")
         let (workerData, workerResponse) = try await URLSession.shared.data(for: workerRequest)
         XCTAssertEqual((workerResponse as? HTTPURLResponse)?.statusCode, 200)
-        let workerResult = try XCTUnwrap(JSONSerialization.jsonObject(with: workerData) as? [String: Int])
-        XCTAssertGreaterThanOrEqual(workerResult["sent"] ?? 0, 1)
+        let workerResult = try JSONDecoder().decode(ReminderWorkerResponse.self, from: workerData)
+        XCTAssertGreaterThanOrEqual(workerResult.sent, 1)
 
         try await client.revokePushDevice(id: device.id, token: token)
         try await client.logout(token: token)
     }
+}
+
+private struct ReminderWorkerResponse: Decodable {
+    let sent: Int
 }
