@@ -12,6 +12,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         app.launch()
     }
 
+    @MainActor
     func testRegistrationSignInCrossTypeReminderPreservation() async throws {
         configureLocalServerInApp()
         registerSecondAccountInApp()
