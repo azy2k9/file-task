@@ -2937,7 +2937,7 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, calenda
       "test",
     ], {
       ...process.env,
-      FILETASKS_IOS_UI_APPLE_URL: `${deliveryBase}/apple/calendar/`,
+      TEST_RUNNER_FILETASKS_IOS_UI_APPLE_URL: `${deliveryBase}/apple/calendar/`,
     }, repoRoot, { detached: true });
     assert.equal(failNextAppleRequest, null, "the native Apple Calendar UI should surface and then recover from the provider failure");
   } catch (error) {

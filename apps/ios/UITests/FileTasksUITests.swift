@@ -139,8 +139,18 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
 
     private func exerciseCalendarSettingsForSecondAccount() {
         openToolbarMenu("Account options", select: "Connected calendars")
-        XCTAssertTrue(app.buttons["calendar.connect.google"].waitForExistence(timeout: 5),
+        let connectGoogle = app.buttons["calendar.connect.google"]
+        XCTAssertTrue(connectGoogle.waitForExistence(timeout: 5),
                       "An account without a Google connection should be offered the secure browser handoff.")
+        scrollToHittable(connectGoogle, toward: .down)
+        connectGoogle.tap()
+        app.activate()
+        let handoffNotice = element(identifier: "calendar.action.notice")
+        XCTAssertTrue(handoffNotice.waitForExistence(timeout: 15),
+                      "Returning from Safari should refresh the native calendar status after the Google handoff.")
+        XCTAssertTrue(handoffNotice.label.localizedCaseInsensitiveContains("not connected"), handoffNotice.label)
+        XCTAssertTrue(connectGoogle.exists,
+                      "An incomplete or cancelled browser flow must not connect Google to the native account.")
         XCTAssertTrue(app.buttons["calendar.connect.apple"].exists,
                       "An account without an Apple connection should be offered the native Apple form.")
 
