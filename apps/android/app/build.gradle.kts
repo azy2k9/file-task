@@ -50,6 +50,7 @@ dependencies {
 
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test.espresso:espresso-intents:3.6.1")
     androidTestImplementation("junit:junit:4.13.2")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation(platform("androidx.compose:compose-bom:2025.05.00"))

@@ -460,6 +460,36 @@ async function startDeliveryFakeDuringSetup(setup) {
     }
     const isJson = request.headers["content-type"]?.includes("application/json");
     const body = isJson && bodyText ? JSON.parse(bodyText) : {};
+    if (url.pathname === "/__acceptance/apple-copy") {
+      const uid = url.searchParams.get("uid") ?? body.uid;
+      if (request.method === "POST") {
+        const path = `/apple/calendar/${uid}.ics`;
+        if (body.action === "failApple") {
+          failNextAppleRequest = { method: body.method ?? "PROPFIND", path: body.path ?? "/apple/calendar/", status: body.status ?? 503 };
+        } else if (body.action === "seed") {
+          const title = String(body.title ?? "Imported acceptance Event");
+          appleEvents.set(path, `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//FileTasks Test//Calendar//EN\r\nBEGIN:VEVENT\r\nUID:${uid}\r\nDTSTAMP:20261013T120000Z\r\nDTSTART;VALUE=DATE:20270114\r\nDTEND;VALUE=DATE:20270115\r\nSUMMARY:${title}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n`);
+        } else if (body.action === "edit") {
+          const original = appleEvents.get(path);
+          if (original) appleEvents.set(path, original.replace(`SUMMARY:${body.title}`, `SUMMARY:${body.changedTitle}`));
+        } else if (body.action === "delete") {
+          appleEvents.delete(path);
+        } else {
+          response.writeHead(400).end();
+          return;
+        }
+        response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (request.method === "GET") {
+        const copies = [...appleEvents.entries()].filter(([path]) => path.endsWith(`/${uid}.ics`))
+          .map(([path, calendarData]) => ({ path, calendarData }));
+        response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ copies }));
+        return;
+      }
+      response.writeHead(405).end();
+      return;
+    }
     providerRequests.push({ path: url.pathname, method: request.method, body, text: bodyText, query: url.search, headers: request.headers });
     const idempotencyKey = request.headers["idempotency-key"];
     deliveryRequests.push({ path: request.url, body, idempotencyKey });
@@ -2756,13 +2786,15 @@ test("a person's account and saved items remain available after the server resta
   assert.equal(login.status, 200);
 });
 
-test("Android UI acceptance: recurring agenda updates are visible across clients", {
+test("Android UI acceptance: recurring agenda and connected calendar workflows work natively", {
   skip: process.env.FILETASKS_RUN_ANDROID_UI_ACCEPTANCE !== "1",
 }, async () => {
   await setTestClock("2026-10-13T12:00:00.000Z");
   const email = "android-ui-shared@example.com";
   const password = "correct-horse-battery";
   const owner = await account(email);
+  const calendarEmail = `android-calendar-ui-${crypto.randomUUID()}@example.com`;
+  await account(calendarEmail);
   try {
     const authorization = await beginGoogleAuthorization(owner);
     assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
@@ -2776,6 +2808,21 @@ test("Android UI acceptance: recurring agenda updates are visible across clients
       `-Pandroid.testInstrumentationRunnerArguments.email=${email}`,
       `-Pandroid.testInstrumentationRunnerArguments.password=${password}`,
     ], process.env, join(repoRoot, "apps/android"), { detached: true });
+    const fakePort = new URL(deliveryBase).port;
+    await runCommand("adb", ["reverse", `tcp:${fakePort}`, `tcp:${fakePort}`]);
+    try {
+      await runCommand("./gradlew", [
+        ":app:connectedDebugAndroidTest",
+        "-Pandroid.testInstrumentationRunnerArguments.class=com.filetasks.android.CalendarSettingsUiTest",
+        `-Pandroid.testInstrumentationRunnerArguments.apiUrl=${base}`,
+        `-Pandroid.testInstrumentationRunnerArguments.calendarEmail=${calendarEmail}`,
+        `-Pandroid.testInstrumentationRunnerArguments.password=${password}`,
+        `-Pandroid.testInstrumentationRunnerArguments.providerFakeUrl=${deliveryBase}`,
+        `-Pandroid.testInstrumentationRunnerArguments.appleCalendarUrl=${deliveryBase}/apple/calendar/`,
+      ], process.env, join(repoRoot, "apps/android"), { detached: true });
+    } finally {
+      await runCommand("adb", ["reverse", "--remove", `tcp:${fakePort}`]).catch(() => {});
+    }
   } catch (error) {
     const resultsPath = join(repoRoot, "apps/android/app/build/outputs/androidTest-results/connected");
     let reports;

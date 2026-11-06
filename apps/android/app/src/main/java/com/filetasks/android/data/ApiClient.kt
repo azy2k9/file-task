@@ -41,6 +41,15 @@ data class CalendarSyncDeliveryStatus(
     val connected: Boolean,
 )
 
+data class ConnectedCalendar(val provider: String, val accountLabel: String)
+data class CalendarSyncLimitation(val itemId: String, val title: String, val provider: String, val message: String)
+data class CalendarStatus(
+    val calendars: List<ConnectedCalendar>,
+    val syncLimitations: List<CalendarSyncLimitation>,
+    val syncDelivery: List<CalendarSyncDeliveryStatus>,
+)
+data class CalendarSyncResult(val synced: List<String>, val eventCount: Int, val syncLimitations: List<CalendarSyncLimitation>)
+
 data class ReminderRule(val delivery: String, val amount: Int, val unit: String, val time: String)
 data class RecurrenceEnd(val type: String, val date: String? = null, val count: Int? = null)
 data class RecurrenceRule(val interval: Int, val unit: String, val weekdays: List<Int>?, val end: RecurrenceEnd)
@@ -239,27 +248,67 @@ class ApiClient(rawBaseUrl: String) {
         Unit
     }
 
-    suspend fun calendarSyncDelivery(token: String): List<CalendarSyncDeliveryStatus> = withContext(Dispatchers.IO) {
+    suspend fun calendarStatus(token: String): CalendarStatus = withContext(Dispatchers.IO) {
         val response = request("GET", "/api/calendars", token = token)
-        val statuses = response.optJSONArray("syncDelivery") ?: return@withContext emptyList()
-        buildList {
-            for (index in 0 until statuses.length()) {
-                val entry = statuses.optJSONObject(index) ?: continue
+        val calendars = response.optJSONArray("calendars")?.let { entries -> buildList {
+            for (index in 0 until entries.length()) {
+                val entry = entries.optJSONObject(index) ?: continue
                 val provider = entry.optString("provider")
-                val state = entry.optString("state")
-                if (provider !in setOf("google", "apple") || state !in setOf("pending", "failed")) continue
-                add(
-                    CalendarSyncDeliveryStatus(
-                        provider = provider,
-                        state = state,
-                        attempts = entry.optInt("attempts"),
-                        nextAttemptAt = entry.optString("nextAttemptAt").takeUnless { it.isBlank() || it == "null" },
-                        lastAttemptAt = entry.optString("lastAttemptAt").takeUnless { it.isBlank() || it == "null" },
-                        lastError = entry.optString("lastError").takeUnless { it.isBlank() || it == "null" },
-                        connected = entry.optBoolean("connected"),
-                    ),
-                )
+                if (provider !in setOf("google", "apple")) continue
+                add(ConnectedCalendar(provider, entry.optString("account_label")))
             }
+        } } ?: emptyList()
+        CalendarStatus(calendars, parseCalendarLimitations(response.optJSONArray("syncLimitations")), parseCalendarDeliveries(response.optJSONArray("syncDelivery")))
+    }
+
+    suspend fun connectAppleCalendar(token: String, username: String, password: String, calendarUrl: String?): ConnectedCalendar = withContext(Dispatchers.IO) {
+        val body = JSONObject().put("username", username).put("password", password)
+        calendarUrl?.takeIf(String::isNotBlank)?.let { body.put("calendarUrl", it) }
+        val entry = request("POST", "/api/calendars", body, token).getJSONObject("calendar")
+        ConnectedCalendar("apple", entry.optString("account_label", username))
+    }
+
+    suspend fun disconnectCalendar(token: String, provider: String) = withContext(Dispatchers.IO) {
+        require(provider in setOf("google", "apple")) { "Unknown calendar provider." }
+        request("DELETE", "/api/calendars/$provider", token = token)
+        Unit
+    }
+
+    suspend fun syncCalendars(token: String): CalendarSyncResult = withContext(Dispatchers.IO) {
+        val response = request("POST", "/api/calendars/sync", token = token)
+        CalendarSyncResult(
+            synced = response.optJSONArray("synced")?.let { array -> buildList { for (index in 0 until array.length()) add(array.optString(index)) } } ?: emptyList(),
+            eventCount = response.optInt("eventCount"),
+            syncLimitations = parseCalendarLimitations(response.optJSONArray("syncLimitations")),
+        )
+    }
+
+    private fun parseCalendarDeliveries(statuses: org.json.JSONArray?): List<CalendarSyncDeliveryStatus> = buildList {
+        if (statuses != null) for (index in 0 until statuses.length()) {
+            val entry = statuses.optJSONObject(index) ?: continue
+            val provider = entry.optString("provider")
+            val state = entry.optString("state")
+            if (provider !in setOf("google", "apple") || state !in setOf("pending", "failed")) continue
+            add(
+                CalendarSyncDeliveryStatus(
+                    provider = provider,
+                    state = state,
+                    attempts = entry.optInt("attempts"),
+                    nextAttemptAt = entry.optString("nextAttemptAt").takeUnless { it.isBlank() || it == "null" },
+                    lastAttemptAt = entry.optString("lastAttemptAt").takeUnless { it.isBlank() || it == "null" },
+                    lastError = entry.optString("lastError").takeUnless { it.isBlank() || it == "null" },
+                    connected = entry.optBoolean("connected"),
+                ),
+            )
+        }
+    }
+
+    private fun parseCalendarLimitations(entries: org.json.JSONArray?): List<CalendarSyncLimitation> = buildList {
+        if (entries != null) for (index in 0 until entries.length()) {
+            val entry = entries.optJSONObject(index) ?: continue
+            val provider = entry.optString("provider")
+            if (provider !in setOf("google", "apple")) continue
+            add(CalendarSyncLimitation(entry.optString("itemId"), entry.optString("title"), provider, entry.optString("message")))
         }
     }
 
