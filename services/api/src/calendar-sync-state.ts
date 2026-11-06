@@ -105,6 +105,7 @@ export function calendarSyncDeliveryStatus(userId: string) {
       nextAttemptAt: number | null;
       lastAttemptAt: number | null;
       lastError: string | null;
+      lastErrorCode: string | null;
       connected: number;
     }[];
   return rows.map((row) => ({
