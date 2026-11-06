@@ -510,14 +510,18 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         guard keyboard.exists else { return }
 
         let returnButton = keyboard.buttons.matching(
-            NSPredicate(format: "label IN %@", ["Done", "Go", "Next", "Return"])
+            NSPredicate(format: "label IN[c] %@", ["Done", "Go", "Next", "Return"])
         ).firstMatch
         if returnButton.exists {
             returnButton.tap()
             if !keyboard.exists { return }
         }
 
-        let navigationBar = app.navigationBars.firstMatch
+        let editorBar = app.navigationBars.matching(
+            NSPredicate(format: "label BEGINSWITH 'Create ' OR label BEGINSWITH 'Edit '")
+        ).firstMatch
+        let settingsBar = app.navigationBars["Server settings"]
+        let navigationBar = editorBar.exists ? editorBar : settingsBar
         if navigationBar.exists {
             navigationBar.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         }
