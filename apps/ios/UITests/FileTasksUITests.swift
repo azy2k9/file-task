@@ -295,7 +295,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         let delete = app.buttons["agenda.delete.\(title)"]
         XCTAssertTrue(delete.waitForExistence(timeout: 5), "The agenda row should expose Delete after a swipe.")
         delete.tap()
-        let confirm = app.buttons["agenda.delete.confirm"]
+        let confirm = app.buttons["agenda.delete.confirm"].firstMatch
         XCTAssertTrue(confirm.waitForExistence(timeout: 5), "Deleting an item should require confirmation.")
         confirm.tap()
         let removed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: row)

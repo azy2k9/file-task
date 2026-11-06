@@ -127,7 +127,7 @@ class RecurringAgendaUiTest {
 
     private fun createSimpleItem(title: String, isEvent: Boolean, details: String) {
         compose.onNodeWithTag("agenda.add").performClick()
-        if (isEvent) compose.onNodeWithText("Event").performClick()
+        if (isEvent) compose.onNodeWithTag("item.editor.kind.event").performClick()
         compose.onNodeWithText("Title").performTextInput(title)
         compose.onNodeWithText("Details").performTextInput(details)
         compose.onNodeWithText("Create").performClick()
@@ -157,7 +157,7 @@ class RecurringAgendaUiTest {
 
     private fun createRecurring(title: String, isEvent: Boolean, date: String) {
         compose.onNodeWithTag("agenda.add").performClick()
-        if (isEvent) compose.onNodeWithText("Event").performClick()
+        if (isEvent) compose.onNodeWithTag("item.editor.kind.event").performClick()
         compose.onNodeWithText("Title").performTextInput(title)
         compose.onNodeWithText("Date (YYYY-MM-DD, optional)").performTextInput(date)
         compose.onNodeWithTag("item.editor.repeat").performScrollTo().performClick()
