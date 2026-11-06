@@ -1787,6 +1787,8 @@ test("clearing a local Event date retries Google and Apple copy removal after re
     "failed Apple removal must retain its identity");
     const delivery = (await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery;
     assert.deepEqual(delivery.map((entry) => entry.provider).sort(), ["apple", "google"]);
+    assert.equal(delivery.some((entry) => entry.reauthorizationRequired), false,
+      "transient DELETE failures must remain distinct from authorization failures");
     assert.deepEqual((await (await request("/api/calendars", { token: other.token })).json()).syncDelivery, [],
       "another account must not see this retry state");
     assert.equal(googleId(dated.id) !== undefined, true, "the dated Event must continue to synchronize");
@@ -1818,7 +1820,7 @@ test("clearing a local Event date retries Google and Apple copy removal after re
   }
 });
 
-test("clearing an imported Event date preserves its source copy and removes its exported copy", async () => {
+test("clearing a verified supported imported Event date removes its source and exported copies", async () => {
   const owner = await account();
   const originalGoogleEvents = googleEvents;
   const originalAppleEvents = appleEvents;
@@ -1845,12 +1847,12 @@ test("clearing an imported Event date preserves its source copy and removes its 
       scheduledDate: null, scheduledTime: null,
     } });
     assert.equal(cleared.status, 200);
-    assert.deepEqual(googleEvents.get(source.id), source, "the verified imported Google source copy must be preserved");
+    assert.equal(googleEvents.has(source.id), false, "the verified supported Google source copy must be removed after its date is cleared");
     assert.equal(appleEvents.has(appleCopy[0]), false, "the FileTasks-owned Apple copy must be removed");
     const retained = (await (await request(`/api/items/${imported.id}`, { token: owner.token })).json()).item;
     assert.equal(retained.scheduledDate, null);
-    assert.ok(retained.calendarSync.some((status) => status.provider === "google" && status.state === "limited"),
-      "the preserved source representation should remain visibly limited while the Event is undated");
+    assert.equal(retained.calendarSync.some((status) => status.provider === "google" && status.state === "limited"), false,
+      "a verified supported source representation should not remain limited after successful cleanup");
   } finally {
     googleEvents = originalGoogleEvents;
     appleEvents = originalAppleEvents;
@@ -1883,6 +1885,16 @@ test("an authorization failure while removing an undated Event copy stays visibl
     const retained = (await (await request(`/api/items/${event.id}`, { token: owner.token })).json()).item;
     assert.ok(retained.calendarSync.some((status) => status.provider === "google"
       && status.limitationCode === "undated-copy-removal-failed"), "the Event should surface an authorization-related cleanup limitation");
+    let delivery = (await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery;
+    const authorizationFailure = delivery.find((status) => status.provider === "google");
+    assert.equal(authorizationFailure?.reauthorizationRequired, true, "DELETE 401 must be classified as a reauthorization failure");
+    assert.match(authorizationFailure?.lastError ?? "", /Reauthorize Google Calendar/i);
+    assert.ok(Number.isFinite(Date.parse(authorizationFailure?.nextAttemptAt ?? "")), "authorization failures must retain scheduled retries");
+    await stopServer();
+    await startServer();
+    delivery = (await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery;
+    assert.equal(delivery.find((status) => status.provider === "google")?.reauthorizationRequired, true,
+      "the authorization classification must persist across an API restart");
 
     failNextGoogleRequest = { method: "DELETE", path: `/google/calendar/v3/calendars/primary/events/${copy[0]}`, status: 403 };
     const response = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
@@ -1896,8 +1908,72 @@ test("an authorization failure while removing an undated Event copy stays visibl
     assert.equal(mapping(), copy[0]);
     assert.equal((await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery
       .some((status) => status.provider === "google" && status.state === "failed"), true);
+    assert.equal((await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery
+      .find((status) => status.provider === "google")?.reauthorizationRequired, true,
+    "DELETE 403 must continue to be classified separately from transient failures");
+    const reconnection = await beginGoogleAuthorization(owner);
+    assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(reconnection.state)}&code=fake-code`, {
+      cookie: reconnection.cookie, redirect: "manual",
+    })).status, 303);
+    assert.equal(mapping(), copy[0], "reauthorizing the same Google destination must preserve the pending copy identity");
+    assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+    assert.equal(googleEvents.has(copy[0]), false, "a retry after reauthorization should remove the provider copy");
+    assert.equal(mapping(), undefined, "successful retry should clear the retained mapping");
+    assert.equal((await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery
+      .some((status) => status.provider === "google"), false, "successful cleanup should clear the authorization recovery state");
   } finally {
     failNextGoogleRequest = null;
+    db.close();
+  }
+});
+
+test("Apple DELETE authorization failures persist recovery and keep the copy identity through reauthorization", async () => {
+  const owner = await account();
+  const previousAppleEvents = appleEvents;
+  appleEvents = new Map();
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  try {
+    const calendarUrl = `${deliveryBase}/apple/calendar/`;
+    assert.equal((await request("/api/calendars", { token: owner.token, method: "POST", body: {
+      username: "person@example.com", password: "app-specific-password", calendarUrl,
+    } })).status, 201);
+    const event = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "event", title: "Apple calendar reauthorization", scheduledDate: "2027-02-14",
+    } })).json()).item;
+    const copy = [...appleEvents.entries()].find(([, value]) => value.includes(`URL:${base}/?event=${event.id}`));
+    assert.ok(copy);
+    const mapping = () => db.prepare("SELECT external_id,resource_uid,connection_scope_id FROM calendar_copies WHERE user_id=? AND item_id=? AND provider='apple'")
+      .get(owner.user.id, event.id);
+    const originalMapping = mapping();
+    assert.equal(originalMapping.external_id, copy[0]);
+    failNextAppleRequest = { method: "DELETE", path: copy[0], status: 403 };
+    assert.equal((await request(`/api/items/${event.id}`, { token: owner.token, method: "PATCH", body: {
+      scheduledDate: null, scheduledTime: null,
+    } })).status, 200);
+    assert.equal(failNextAppleRequest, null);
+    assert.deepEqual(mapping(), originalMapping, "Apple authorization failure must retain the complete copy identity");
+    assert.equal(appleEvents.has(copy[0]), true);
+    let delivery = (await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery;
+    assert.equal(delivery.find((status) => status.provider === "apple")?.reauthorizationRequired, true);
+    assert.match(delivery.find((status) => status.provider === "apple")?.lastError ?? "", /Reauthorize Apple Calendar/i);
+    await stopServer();
+    await startServer();
+    delivery = (await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery;
+    assert.equal(delivery.find((status) => status.provider === "apple")?.reauthorizationRequired, true,
+      "Apple authorization recovery must remain actionable after restart");
+
+    assert.equal((await request("/api/calendars", { token: owner.token, method: "POST", body: {
+      username: "person@example.com", password: "renewed-app-specific-password", calendarUrl,
+    } })).status, 201);
+    assert.deepEqual(mapping(), originalMapping, "reauthorizing the same Apple destination must preserve copy identity and scope");
+    assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+    assert.equal(appleEvents.has(copy[0]), false, "the scheduled retry should delete the copy with refreshed credentials");
+    assert.equal(mapping(), undefined);
+    assert.equal((await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery
+      .some((status) => status.provider === "apple"), false);
+  } finally {
+    failNextAppleRequest = null;
+    appleEvents = previousAppleEvents;
     db.close();
   }
 });

@@ -15,7 +15,7 @@ export function enqueueCalendarSync(userId: string) {
     ON CONFLICT(user_id,provider) DO UPDATE SET
       generation=calendar_sync_state.generation+1,
       state='pending',attempts=0,next_attempt_at=excluded.next_attempt_at,
-      last_attempt_at=NULL,last_error=NULL`).run(currentTime,userId);
+      last_attempt_at=NULL,last_error=NULL,last_error_code=NULL`).run(currentTime,userId);
 }
 
 /** Ensure connected providers have retry rows and snapshot their generations before a sync pass. */
@@ -34,11 +34,11 @@ export function beginCalendarSync(userId: string, providers?: readonly CalendarS
 }
 
 export function completeCalendarSync(userId: string, generation: CalendarSyncGeneration) {
-  database().prepare(`UPDATE calendar_sync_state SET state='synced',next_attempt_at=NULL,last_error=NULL
+  database().prepare(`UPDATE calendar_sync_state SET state='synced',next_attempt_at=NULL,last_error=NULL,last_error_code=NULL
     WHERE user_id=? AND provider=? AND generation=?`).run(userId,generation.provider,generation.generation);
 }
 
-export function failCalendarSync(userId: string, generation: CalendarSyncGeneration) {
+export function failCalendarSync(userId: string, generation: CalendarSyncGeneration, reauthorizationRequired = false) {
   const db = database();
   const row = db.prepare(`SELECT attempts FROM calendar_sync_state WHERE user_id=? AND provider=? AND generation=?`)
     .get(userId,generation.provider,generation.generation) as { attempts: number } | undefined;
@@ -46,15 +46,18 @@ export function failCalendarSync(userId: string, generation: CalendarSyncGenerat
   const attempts = row.attempts + 1;
   const delayMs = Math.min(6 * 60 * 60 * 1000, 30_000 * (2 ** Math.min(attempts - 1, 10)));
   const currentTime = nowMs();
-  db.prepare(`UPDATE calendar_sync_state SET state='failed',attempts=?,next_attempt_at=?,last_attempt_at=?,last_error=?
+  const lastError = reauthorizationRequired
+    ? `${generation.provider === "google" ? "Google" : "Apple"} Calendar denied a delete request. Reauthorize this calendar to retry cleanup; the Calendar copy identity is retained and retries continue automatically.`
+    : safeFailureMessage;
+  db.prepare(`UPDATE calendar_sync_state SET state='failed',attempts=?,next_attempt_at=?,last_attempt_at=?,last_error=?,last_error_code=?
     WHERE user_id=? AND provider=? AND generation=?`).run(
-    attempts,currentTime+delayMs,currentTime,safeFailureMessage,userId,generation.provider,generation.generation,
+    attempts,currentTime+delayMs,currentTime,lastError,reauthorizationRequired ? "authorization" : null,userId,generation.provider,generation.generation,
   );
 }
 
 export function calendarSyncDeliveryStatus(userId: string) {
   const rows = database().prepare(`SELECT s.provider,s.state,s.attempts,s.next_attempt_at AS nextAttemptAt,
-      s.last_attempt_at AS lastAttemptAt,s.last_error AS lastError,
+      s.last_attempt_at AS lastAttemptAt,s.last_error AS lastError,s.last_error_code AS lastErrorCode,
       EXISTS(SELECT 1 FROM calendar_connections c WHERE c.user_id=s.user_id AND c.provider=s.provider) AS connected
     FROM calendar_sync_state s WHERE s.user_id=? AND s.state IN ('pending','failed') ORDER BY s.provider`).all(userId) as {
       provider: CalendarSyncProvider;
@@ -63,6 +66,7 @@ export function calendarSyncDeliveryStatus(userId: string) {
       nextAttemptAt: number | null;
       lastAttemptAt: number | null;
       lastError: string | null;
+      lastErrorCode: string | null;
       connected: number;
     }[];
   return rows.map((row) => ({
@@ -72,6 +76,7 @@ export function calendarSyncDeliveryStatus(userId: string) {
     nextAttemptAt: row.nextAttemptAt == null ? null : new Date(row.nextAttemptAt).toISOString(),
     lastAttemptAt: row.lastAttemptAt == null ? null : new Date(row.lastAttemptAt).toISOString(),
     lastError: row.lastError,
+    reauthorizationRequired: row.lastErrorCode === "authorization",
     connected: Boolean(row.connected),
   }));
 }
