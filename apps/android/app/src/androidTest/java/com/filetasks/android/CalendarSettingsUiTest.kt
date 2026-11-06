@@ -46,8 +46,13 @@ class CalendarSettingsUiTest {
         val appleCalendarUrl = args.getString("appleCalendarUrl") ?: error("appleCalendarUrl is required")
         val token = ApiClient(apiUrl).login(email, password).first
 
-        waitFor("the current signed-in account") { compose.onAllNodes(hasText("Sign out")).fetchSemanticsNodes().isNotEmpty() }
-        compose.onNodeWithText("Sign out").performClick()
+        compose.waitUntil(timeoutMillis = 30_000) {
+            compose.onAllNodes(hasText("Sign out")).fetchSemanticsNodes().isNotEmpty() ||
+                compose.onAllNodes(hasText("Email")).fetchSemanticsNodes().isNotEmpty()
+        }
+        if (compose.onAllNodes(hasText("Sign out")).fetchSemanticsNodes().isNotEmpty()) {
+            compose.onNodeWithText("Sign out").performClick()
+        }
         waitFor("sign-in form after sign-out") { compose.onAllNodes(hasText("Email")).fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("Email").performTextInput(email)
         compose.onNodeWithText("Password").performTextInput(password)
