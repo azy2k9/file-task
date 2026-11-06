@@ -402,7 +402,7 @@ async function startServerDuringSetup(setup) {
   }
 }
 
-async function startCalendarApiReplica(port) {
+async function startCalendarApiReplica(port, extraEnv = {}) {
   const child = spawn(process.execPath,[nextBin,"dev",...(process.env.FILETASKS_RUN_SHARED_ACCEPTANCE==="1"?["--webpack"]:[]),"--port",String(port)],{
     cwd:projectRoot,detached:process.platform!=="win32",
     env:{...process.env,FILETASKS_DATABASE_PATH:join(directory,"workspace.sqlite"),FILETASKS_ORIGIN:base,FILETASKS_TIME_ZONE:serverTimeZone,
@@ -413,7 +413,7 @@ async function startCalendarApiReplica(port) {
       FILETASKS_GOOGLE_TOKEN_URL:`${deliveryBase}/google-token`,FILETASKS_GOOGLE_AUTH_URL:`${deliveryBase}/google-auth`,
       FILETASKS_APPLE_CALDAV_ORIGIN:`${deliveryBase}/apple`,FILETASKS_R2_ACCOUNT_ID:"fake-account",FILETASKS_R2_ACCESS_KEY_ID:"fake-access-key",
       FILETASKS_R2_SECRET_ACCESS_KEY:"fake-secret-key",FILETASKS_R2_BUCKET:"filetasks-test",FILETASKS_R2_ENDPOINT:`${deliveryBase}/r2`,
-      FILETASKS_TEST_NEXT_DIST_DIR:".next-test-replica"},
+      FILETASKS_TEST_NEXT_DIST_DIR:".next-test-replica",...extraEnv},
     stdio:["ignore","pipe","pipe"],
   });
   const output=[];
@@ -4025,6 +4025,128 @@ test("Calendar retry deadlines increase and the worker runs only when delivery i
     assert.equal(db.prepare("SELECT attempts FROM calendar_sync_state WHERE user_id=? AND provider='google'").get(owner.user.id).attempts,0,
       "successful delivery resets the retry count");
   } finally { failNextGoogleRequest=null; db.close(); }
+});
+
+test("two calendar workers atomically claim one due generation", async () => {
+  const owner=await account();
+  const auth=await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`,{cookie:auth.cookie,redirect:"manual"})).status,303);
+  const db=new DatabaseSync(join(directory,"workspace.sqlite"));
+  const replica=await startCalendarApiReplica(3114);
+  try {
+    const inventoryPath="/google/calendar/v3/calendars/primary/events";
+    failNextGoogleRequest={path:inventoryPath,method:"GET"};
+    await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    const due=db.prepare("SELECT next_attempt_at FROM calendar_sync_state WHERE user_id=? AND provider='google'").get(owner.user.id);
+    await advanceTestClock(due.next_attempt_at-testClock.getTime());
+    const before=providerRequests.filter(entry=>entry.path===inventoryPath&&entry.method==="GET").length;
+    const headers={Authorization:"Bearer test-worker-secret"};
+    const [first,second]=await Promise.all([
+      request("/api/internal/reminders/deliver",{method:"POST",headers}),
+      fetch(`http://localhost:${replica.port}/api/internal/reminders/deliver`,{method:"POST",headers}),
+    ]);
+    assert.equal(first.status,200);
+    assert.equal(second.status,200);
+    const results=await Promise.all([first.json(),second.json()]);
+    assert.equal(results.reduce((sum,result)=>sum+result.calendarSync.attempted,0),1,
+      "only the worker that atomically claims the due generation runs it");
+    assert.equal(providerRequests.filter(entry=>entry.path===inventoryPath&&entry.method==="GET").length-before,1,
+      "the second worker cannot bypass the retry backoff using its stale due snapshot");
+  } finally { failNextGoogleRequest=null; await stopCalendarApiReplica(replica); db.close(); }
+});
+
+test("a crashed Calendar create is recovered as an individual uncertain attempt and a late commit is cleaned", async () => {
+  const owner=await account();
+  const created=await request("/api/items",{token:owner.token,method:"POST",body:{kind:"event",title:"Crash recovery copy",scheduledDate:"2027-03-14"}});
+  const item=(await created.json()).item;
+  assert.equal((await request("/api/calendars",{token:owner.token,method:"POST",body:{username:"crash-recovery@example.com",password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/crash-recovery-${item.id}/`}})).status,201);
+  const db=new DatabaseSync(join(directory,"workspace.sqlite"));
+  let release; let started;
+  const held=new Promise(resolve=>{started=resolve;});
+  const releasePromise=new Promise(resolve=>{release=resolve;});
+  let crashedWorker; let recoveryWorker;
+  try {
+    holdNextCalendarCreation={provider:"apple",beforeCommit:true,created:started,releasePromise,release};
+    crashedWorker=await startCalendarApiReplica(3115);
+    const exporting=fetch(`http://localhost:${crashedWorker.port}/api/calendars/sync`,{method:"POST",headers:{Authorization:`Bearer ${owner.token}`}}).catch(error=>({error}));
+    await held;
+    const active=db.prepare("SELECT attempt_id,status FROM calendar_creation_attempts WHERE user_id=? AND item_id=? AND provider='apple'").get(owner.user.id,item.id);
+    assert.equal(active.status,"active");
+    await stopCalendarApiReplica(crashedWorker); crashedWorker=undefined;
+    recoveryWorker=await startCalendarApiReplica(3116);
+    assert.equal(db.prepare("SELECT status FROM calendar_creation_attempts WHERE attempt_id=?").get(active.attempt_id).status,"uncertain",
+      "restart gives this provider request a durable identity instead of inheriting a stuck active count");
+    assert.equal(db.prepare("SELECT active_attempts FROM apple_creation_reservations WHERE user_id=? AND item_id=?").get(owner.user.id,item.id).active_attempts,0);
+
+    assert.equal((await request(`/api/items/${item.id}`,{token:owner.token,method:"DELETE"})).status,204);
+    const workerSync=async()=>fetch(`http://localhost:${recoveryWorker.port}/api/calendars/sync`,{method:"POST",headers:{Authorization:`Bearer ${owner.token}`}});
+    const beforeCommit=await workerSync();
+    assert.equal(beforeCommit.status,200,await beforeCommit.text());
+    assert.equal(db.prepare("SELECT state FROM calendar_sync_state WHERE user_id=? AND provider='apple'").get(owner.user.id).state,"synced",
+      "a provider identity verified absent resolves visible delivery status while retaining uncertain cleanup intent");
+    assert.ok(db.prepare("SELECT 1 FROM calendar_creation_cleanup WHERE user_id=? AND provider='apple' AND item_id=?").get(owner.user.id,item.id));
+
+    release(); holdNextCalendarCreation=null;
+    await exporting;
+    assert.ok([...appleEvents.values()].some(ics=>ics.includes(`?event=${item.id}`)),"the provider may commit after the worker process exited");
+    const afterCommit=await workerSync();
+    assert.equal(afterCommit.status,200,await afterCommit.text());
+    assert.equal([...appleEvents.values()].some(ics=>ics.includes(`?event=${item.id}`)),false,
+      "the durable tombstone finds and removes the late provider commit");
+    assert.equal(db.prepare("SELECT state FROM calendar_sync_state WHERE user_id=? AND provider='apple'").get(owner.user.id).state,"synced");
+  } finally {
+    release?.(); holdNextCalendarCreation=null;
+    if(crashedWorker) await stopCalendarApiReplica(crashedWorker);
+    if(recoveryWorker) await stopCalendarApiReplica(recoveryWorker);
+    db.close();
+  }
+});
+
+test("a timed out Calendar create releases its lease, keeps its attempt uncertain, and permits another account", async () => {
+  const owner=await account();
+  const independent=await account();
+  const created=await request("/api/items",{token:owner.token,method:"POST",body:{kind:"event",title:"Timed request",scheduledDate:"2027-04-02"}});
+  const item=(await created.json()).item;
+  const otherEvent=await request("/api/items",{token:independent.token,method:"POST",body:{kind:"event",title:"Independent request",scheduledDate:"2027-04-03"}});
+  const otherItem=(await otherEvent.json()).item;
+  const connect=async(user,path)=>request("/api/calendars",{token:user.token,method:"POST",body:{username:`${user.user.id}@example.com`,password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/${path}/`}});
+  assert.equal((await connect(owner,`timeout-${item.id}`)).status,201);
+  assert.equal((await connect(independent,`independent-${otherItem.id}`)).status,201);
+  const db=new DatabaseSync(join(directory,"workspace.sqlite"));
+  let release; let started;
+  const held=new Promise(resolve=>{started=resolve;});
+  const releasePromise=new Promise(resolve=>{release=resolve;});
+  let replica;
+  try {
+    replica=await startCalendarApiReplica(3117,{FILETASKS_CALENDAR_OPERATION_TIMEOUT_MS:"250",FILETASKS_CALENDAR_LOCK_WAIT_TIMEOUT_MS:"250"});
+    holdNextCalendarCreation={provider:"apple",beforeCommit:true,created:started,releasePromise,release};
+    const startedAt=Date.now();
+    const exporting=fetch(`http://localhost:${replica.port}/api/calendars/sync`,{method:"POST",headers:{Authorization:`Bearer ${owner.token}`}});
+    await held;
+    const response=await Promise.race([exporting,delay(4000).then(()=>{throw new Error("provider timeout did not bound the stalled request");})]);
+    assert.ok(Date.now()-startedAt<4000,"the stalled provider request is aborted at its operation deadline");
+    assert.notEqual(response.status,200,"the uncertain create is retried after reconciliation rather than treated as delivered");
+    const attempt=db.prepare("SELECT status FROM calendar_creation_attempts WHERE user_id=? AND item_id=? AND provider='apple' ORDER BY started_at DESC LIMIT 1").get(owner.user.id,item.id);
+    assert.equal(attempt.status,"uncertain");
+    assert.equal(db.prepare("SELECT active_attempts FROM apple_creation_reservations WHERE user_id=? AND item_id=?").get(owner.user.id,item.id).active_attempts,0,
+      "aborting the HTTP request cannot leave an active lease count behind");
+    const unrelated=await request("/api/calendars/sync",{token:independent.token,method:"POST"});
+    assert.equal(unrelated.status,200,await unrelated.text(),"one stalled destination cannot block another account");
+    release(); holdNextCalendarCreation=null;
+    const retried=await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    assert.equal(retried.status,200,await retried.text());
+    assert.equal([...appleEvents.values()].filter(ics=>ics.includes(`?event=${item.id}`)).length,1,
+      "the late commit and retry converge on the reserved Apple resource");
+    db.prepare("UPDATE calendar_export_locks SET owner_token='test-held-lease',lease_until=? WHERE user_id=? AND provider='apple'")
+      .run(Date.now()+60_000,owner.user.id);
+    const lockWaitStarted=Date.now();
+    const blocked=fetch(`http://localhost:${replica.port}/api/calendars/sync`,{method:"POST",headers:{Authorization:`Bearer ${owner.token}`}});
+    const otherAccount=await request("/api/calendars/sync",{token:independent.token,method:"POST"});
+    assert.equal(otherAccount.status,200,await otherAccount.text(),"export lock acquisition is scoped to one connected account");
+    const lockResult=await blocked;
+    assert.equal(lockResult.status,503);
+    assert.ok(Date.now()-lockWaitStarted<2000,"export lock acquisition ends at its configured deadline");
+  } finally { release?.(); holdNextCalendarCreation=null; if(replica) await stopCalendarApiReplica(replica); db.close(); }
 });
 
 test("Google recovery reconciles a persisted replacement after a lost response", async () => {
