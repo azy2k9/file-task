@@ -1820,7 +1820,10 @@ private fun CalendarSettingsDialog(
                 Text("Calendar connections for ${user.email}", style = MaterialTheme.typography.bodySmall)
                 Text("Sync Calendar keeps FileTasks Events authoritative. Imported Events and their Files stay in your workspace.")
                 status.calendars.forEach { calendar ->
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        Modifier.fillMaxWidth().testTag("calendar.connection.${calendar.provider}"),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
                         Column(Modifier.weight(1f)) {
                             Text(if (calendar.provider == "google") "Google Calendar" else "Apple Calendar", fontWeight = FontWeight.SemiBold)
                             Text(calendar.accountLabel, style = MaterialTheme.typography.bodySmall)

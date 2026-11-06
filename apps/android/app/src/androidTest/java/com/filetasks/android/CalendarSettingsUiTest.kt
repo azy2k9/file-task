@@ -4,7 +4,10 @@ import android.app.Activity
 import android.app.Instrumentation
 import android.content.Intent
 import android.net.Uri
+import androidx.compose.ui.test.hasAnyDescendant
+import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isEnabled
 import androidx.compose.ui.test.isRoot
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -69,7 +72,9 @@ class CalendarSettingsUiTest {
         compose.onNodeWithText("Email").performTextInput(email)
         compose.onNodeWithText("Password").performTextInput(password)
         compose.onNodeWithTag("auth.submit").performScrollTo().performClick()
-        waitFor("calendar acceptance account") { compose.onAllNodes(hasText("Calendars")).fetchSemanticsNodes().isNotEmpty() }
+        waitFor("calendar acceptance account") {
+            compose.onAllNodes(hasText("Calendars") and isEnabled()).fetchSemanticsNodes().isNotEmpty()
+        }
 
         compose.onNodeWithText("Calendars").performClick()
         waitFor("connected calendar settings") { compose.onAllNodes(hasText("Connected calendars")).fetchSemanticsNodes().isNotEmpty() }
@@ -101,8 +106,13 @@ class CalendarSettingsUiTest {
         compose.onNodeWithTag("calendar.apple.password").performScrollTo().performTextInput("fake-app-specific-password")
         compose.onNodeWithTag("calendar.connect.apple").performScrollTo().performClick()
         waitFor("Apple Calendar connection status") {
-            compose.onAllNodes(hasText("Apple Calendar · android-calendar@example.com")).fetchSemanticsNodes().isNotEmpty()
+            compose.onAllNodes(hasTestTag("calendar.connection.apple")).fetchSemanticsNodes().isNotEmpty()
         }
+        compose.onNode(
+            hasTestTag("calendar.connection.apple") and
+                hasAnyDescendant(hasText("Apple Calendar")) and
+                hasAnyDescendant(hasText("android-calendar@example.com")),
+        ).assertExists()
 
         compose.onNodeWithTag("calendar.sync").performScrollTo().performClick()
         waitFor("first native Calendar sync") {
@@ -189,7 +199,11 @@ class CalendarSettingsUiTest {
             compose.waitUntil(30_000, condition)
         } catch (failure: Throwable) {
             val snapshot = runCatching {
-                compose.onAllNodes(isRoot(), useUnmergedTree = true).printToString()
+                val roots = compose.onAllNodes(isRoot(), useUnmergedTree = true)
+                val rootCount = roots.fetchSemanticsNodes().size
+                (0 until rootCount).joinToString("\n") { index ->
+                    "Compose root $index:\n${roots.get(index).printToString()}"
+                }
             }.getOrElse { it.toString() }
             throw AssertionError("Failed while waiting for $description. UI: $snapshot", failure)
         }
