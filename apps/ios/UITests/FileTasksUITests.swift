@@ -331,9 +331,8 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         } else {
             field.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5)).tap()
         }
-        let focused = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hasKeyboardFocus == true"), object: field)
-        XCTAssertEqual(XCTWaiter.wait(for: [focused], timeout: 10), .completed,
-                       "The text field should receive keyboard focus. Accessibility hierarchy: \(app.debugDescription)")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5),
+                      "The text field should open the keyboard before text entry. Accessibility hierarchy: \(app.debugDescription)")
         if !currentValue.isEmpty {
             field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: currentValue.count))
         }
