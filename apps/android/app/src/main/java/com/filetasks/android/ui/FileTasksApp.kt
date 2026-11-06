@@ -665,6 +665,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                 confirmButton = {
                     Button(
                         enabled = !working,
+                        modifier = Modifier.testTag("item.delete.confirm"),
                         onClick = {
                             val currentToken = token
                             if (currentToken != null) {
@@ -1213,7 +1214,7 @@ private fun WorkspaceItemCard(
                     checked = item.completed == true,
                     onCheckedChange = { onToggleTask() },
                     enabled = enabled,
-                    modifier = Modifier.padding(top = 0.dp),
+                    modifier = Modifier.padding(top = 0.dp).testTag("agenda.complete.${item.id}"),
                 )
                 Spacer(Modifier.width(4.dp))
             }
@@ -1262,7 +1263,11 @@ private fun WorkspaceItemCard(
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.align(Alignment.End)) {
                     TextButton(onClick = onEdit, enabled = enabled, modifier = Modifier.testTag("agenda.edit.${item.id}")) { Text("Edit") }
-                    TextButton(onClick = onDelete, enabled = enabled) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+                    TextButton(
+                        onClick = onDelete,
+                        enabled = enabled,
+                        modifier = Modifier.testTag("agenda.delete.${item.id}"),
+                    ) { Text("Delete", color = MaterialTheme.colorScheme.error) }
                 }
             }
         }

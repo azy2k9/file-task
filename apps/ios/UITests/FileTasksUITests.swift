@@ -17,6 +17,8 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         signOutInApp()
         signInInApp(email: sharedEmail)
 
+        createTaskAndExerciseItsLifecycle()
+
         createEventBySwitchingFromTask(title: "UI Runner Event Default")
         assertReminder(amount: 3, unit: "weeks")
         saveCurrentItem()
@@ -49,6 +51,8 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         openItem("UI Runner No Reminders")
         assertNoReminders()
         cancelEditor()
+
+        createEventAndExerciseItsLifecycle()
     }
 
     private func configureLocalServerInApp() {
@@ -235,6 +239,70 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         openToolbarMenu("Create item", select: "New \(kind)")
     }
 
+    private func createTaskAndExerciseItsLifecycle() {
+        let originalTitle = "UI Runner personal Task"
+        let editedTitle = "UI Runner edited Task"
+        startNewItem(kind: "Task")
+        setTitle(originalTitle)
+        saveCurrentItem()
+        XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", originalTitle)).firstMatch.waitForExistence(timeout: 10))
+
+        openItem(originalTitle)
+        setTitle(editedTitle)
+        saveCurrentItem()
+        XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", editedTitle)).firstMatch.waitForExistence(timeout: 10))
+
+        let complete = app.buttons["Complete Task: \(editedTitle)"]
+        scrollToHittable(complete, toward: .down, message: "The Task should expose its completion control.")
+        complete.tap()
+        let reopen = app.buttons["Reopen Task: \(editedTitle)"]
+        XCTAssertTrue(reopen.waitForExistence(timeout: 10), "The completed Task should offer a reopen action. Accessibility hierarchy: \(app.debugDescription)")
+        reopen.tap()
+        XCTAssertTrue(complete.waitForExistence(timeout: 10), "Reopening the Task should restore its incomplete state.")
+
+        deleteItemFromAgenda(title: editedTitle)
+        XCTAssertFalse(app.buttons["agenda.open.\(editedTitle)"].exists,
+                       "The deleted Task should leave the agenda.")
+    }
+
+    private func createEventAndExerciseItsLifecycle() {
+        let originalTitle = "UI Runner personal Event"
+        let editedTitle = "UI Runner edited Event"
+        startNewItem(kind: "Event")
+        setTitle(originalTitle)
+        saveCurrentItem()
+        let originalRow = app.buttons["agenda.open.\(originalTitle)"]
+        XCTAssertTrue(originalRow.waitForExistence(timeout: 10))
+        XCTAssertEqual(element(identifier: "agenda.kind.\(originalTitle)").label, "Event",
+                       "The agenda should expose the Event type separately from its title.")
+        XCTAssertFalse(app.buttons["Complete Task: \(originalTitle)"].exists,
+                       "Events should not expose Task completion controls.")
+
+        openItem(originalTitle)
+        setTitle(editedTitle)
+        saveCurrentItem()
+        XCTAssertTrue(app.buttons["agenda.open.\(editedTitle)"].waitForExistence(timeout: 10))
+
+        deleteItemFromAgenda(title: editedTitle)
+        XCTAssertFalse(app.buttons["agenda.open.\(editedTitle)"].exists,
+                       "The deleted Event should leave the agenda.")
+    }
+
+    private func deleteItemFromAgenda(title: String) {
+        let row = app.buttons["agenda.open.\(title)"]
+        scrollToHittable(row, toward: .down, message: "The item should be visible before deletion.")
+        row.swipeLeft()
+        let delete = app.buttons["agenda.delete.\(title)"]
+        XCTAssertTrue(delete.waitForExistence(timeout: 5), "The agenda row should expose Delete after a swipe.")
+        delete.tap()
+        let confirm = app.buttons["agenda.delete.confirm"]
+        XCTAssertTrue(confirm.waitForExistence(timeout: 5), "Deleting an item should require confirmation.")
+        confirm.tap()
+        let removed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: row)
+        XCTAssertEqual(XCTWaiter.wait(for: [removed], timeout: 10), .completed,
+                       "The item should leave the agenda after its deletion is saved.")
+    }
+
     private func selectType(_ kind: String) {
         let typePicker = element(identifier: "itemEditor.type")
         scrollToHittable(typePicker, toward: .up, message: "The new-item Type picker should be present.")
@@ -308,7 +376,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
     }
 
     private func openItem(_ title: String) {
-        let row = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", title)).firstMatch
+        let row = app.buttons["agenda.open.\(title)"]
         scrollToHittable(row, toward: .down, maxSwipes: 10, message: "The saved item should appear in the signed-in workspace.")
         row.tap()
     }
