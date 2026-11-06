@@ -510,7 +510,7 @@ final class AppModel: ObservableObject {
                     ? "Deleted from FileTasks. Calendar removal status is not available yet."
                     : "Saved to FileTasks. Calendar sync status is not available yet."
                 Task { @MainActor [weak self] in
-                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    try? await Task.sleep(nanoseconds: 15_000_000_000)
                     guard let self, self.calendarNoticeVersion == version else { return }
                     self.calendarSyncNotice = nil
                 }
