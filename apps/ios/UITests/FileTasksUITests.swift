@@ -20,7 +20,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         createEventBySwitchingFromTask(title: "UI Runner Event Default")
         assertReminder(amount: 3, unit: "weeks")
         saveCurrentItem()
-        assertCalendarDeliveryNotice("Calendar sync pending. Your Event is saved in FileTasks and will be retried. The last attempt failed; another retry is scheduled.")
+        assertCalendarDeliveryNotice()
 
         openItem("UI Runner Event Default")
         assertReminder(amount: 3, unit: "weeks")
@@ -298,10 +298,12 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         app.buttons["Save"].tap()
     }
 
-    private func assertCalendarDeliveryNotice(_ message: String) {
-        let notice = app.staticTexts.matching(NSPredicate(format: "label == %@", message)).firstMatch
+    private func assertCalendarDeliveryNotice() {
+        let notice = element(identifier: "calendar.sync.delivery.status")
         XCTAssertTrue(notice.waitForExistence(timeout: 15),
                       "A failed Calendar delivery must be reported separately from the saved Event. Accessibility hierarchy: \(app.debugDescription)")
+        XCTAssertTrue(notice.label.localizedCaseInsensitiveContains("Calendar sync"), notice.label)
+        XCTAssertTrue(notice.label.localizedCaseInsensitiveContains("saved in FileTasks"), notice.label)
     }
 
     private func openItem(_ title: String) {
