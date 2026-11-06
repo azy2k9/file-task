@@ -322,11 +322,32 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         startNewItem(kind: kind)
         setTitle(title)
 
+        dismissKeyboardIfShown()
+        let keyboardDismissed = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"),
+            object: app.keyboards.firstMatch
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [keyboardDismissed], timeout: 5), .completed,
+                       "The title keyboard should be dismissed before scheduling the item. Accessibility hierarchy: \(app.debugDescription)")
+
         let addDate = element(identifier: "itemEditor.schedule.includesDate")
         scrollToHittable(addDate, toward: .down, message: "A recurring item needs a schedule date.")
         if (addDate.value as? String) != "1" { addDate.tap() }
 
+        let dateEnabled = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", "1"),
+            object: addDate
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [dateEnabled], timeout: 10), .completed,
+                       "The schedule date should be enabled before Repeat is used. Accessibility hierarchy: \(app.debugDescription)")
+
         let repeatToggle = element(identifier: "itemEditor.recurrence.enabled")
+        let repeatEnabledForScheduling = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "isEnabled == true"),
+            object: repeatToggle
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [repeatEnabledForScheduling], timeout: 10), .completed,
+                       "Repeat should become available after enabling the schedule date. Accessibility hierarchy: \(app.debugDescription)")
         scrollToHittable(repeatToggle, toward: .down, message: "The editor should offer a Recurrence rule after adding a date.")
         if (repeatToggle.value as? String) != "1" { repeatToggle.tap() }
 
