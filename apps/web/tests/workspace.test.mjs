@@ -3065,10 +3065,14 @@ test("Android UI acceptance: recurring agenda updates are visible across clients
     await runCommand("adb", ["reverse", "tcp:3107", "tcp:3107"]);
   }
   const undatedEventTitle = "Android UI date clearing Event";
+  const deleteEventTitle = "Android UI delete Event";
   let undatedEvent;
   let undatedFile;
   let googleCopyId;
   let appleCopyPath;
+  let eventToDelete;
+  let deleteGoogleCopyId;
+  let deleteAppleCopyPath;
   try {
     const authorization = await beginGoogleAuthorization(owner);
     assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
@@ -3094,6 +3098,14 @@ test("Android UI acceptance: recurring agenda updates are visible across clients
     googleCopyId = [...googleEvents.entries()].find(([, event]) => event.extendedProperties?.private?.filetasksItemId === undatedEvent.id)?.[0];
     appleCopyPath = [...appleEvents.entries()].find(([, calendarData]) => calendarData.includes(`URL:${base}/?event=${undatedEvent.id}`))?.[0];
     assert.ok(googleCopyId && appleCopyPath, "the dated Event should have both provider copies before the Android UI clears its date");
+    const deleteEventResponse = await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "event", title: deleteEventTitle, scheduledDate: "2026-10-17",
+    } });
+    assert.equal(deleteEventResponse.status, 201);
+    eventToDelete = (await deleteEventResponse.json()).item;
+    deleteGoogleCopyId = [...googleEvents.entries()].find(([, event]) => event.extendedProperties?.private?.filetasksItemId === eventToDelete.id)?.[0];
+    deleteAppleCopyPath = [...appleEvents.entries()].find(([, calendarData]) => calendarData.includes(`URL:${base}/?event=${eventToDelete.id}`))?.[0];
+    assert.ok(deleteGoogleCopyId && deleteAppleCopyPath, "the second dated Event should have provider copies before native deletion");
     failNextGoogleRequest = { method: "POST", path: "/google/calendar/v3/calendars/primary/events", status: 503 };
     await runCommand("./gradlew", [
       ":app:connectedDebugAndroidTest",
@@ -3128,6 +3140,10 @@ test("Android UI acceptance: recurring agenda updates are visible across clients
   assert.deepEqual(clearedEvent.files.map(({ id }) => id), [undatedFile.id], "the File relationship should remain after the Android UI edit");
   assert.equal(googleEvents.has(googleCopyId), false, "the Android UI date clear should remove the Google copy");
   assert.equal(appleEvents.has(appleCopyPath), false, "the Android UI date clear should remove the Apple copy");
+  assert.equal((await request(`/api/items/${eventToDelete.id}`, { token: owner.token })).status, 404,
+    "the Android UI should delete the separate dated Event locally");
+  assert.equal(googleEvents.has(deleteGoogleCopyId), false, "the Android UI deletion should remove the Google copy");
+  assert.equal(appleEvents.has(deleteAppleCopyPath), false, "the Android UI deletion should remove the Apple copy");
 
   uiAcceptanceBrowser = await launchUIAcceptanceBrowser();
   try {
@@ -3341,6 +3357,7 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, save/re
   const owner = process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1" ? sharedUIOwner : await account(email);
   assert.ok(owner, "The Android UI phase must create the shared account before the iOS UI phase.");
   const undatedEventTitle = "iOS UI date clearing Event";
+  const deleteEventTitle = "iOS UI delete Event";
 
   const settingsResponse = await request("/api/settings/reminders", {
     token: owner.token,
@@ -3381,6 +3398,14 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, save/re
   const googleCopyId = [...googleEvents.entries()].find(([, event]) => event.extendedProperties?.private?.filetasksItemId === undatedEvent.id)?.[0];
   const appleCopyPath = [...appleEvents.entries()].find(([, calendarData]) => calendarData.includes(`URL:${base}/?event=${undatedEvent.id}`))?.[0];
   assert.ok(googleCopyId && appleCopyPath, "the dated Event should have both provider copies before the iOS UI clears its date");
+  const deleteEventResponse = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: deleteEventTitle, scheduledDate: "2026-10-17",
+  } });
+  assert.equal(deleteEventResponse.status, 201);
+  const eventToDelete = (await deleteEventResponse.json()).item;
+  const deleteGoogleCopyId = [...googleEvents.entries()].find(([, event]) => event.extendedProperties?.private?.filetasksItemId === eventToDelete.id)?.[0];
+  const deleteAppleCopyPath = [...appleEvents.entries()].find(([, calendarData]) => calendarData.includes(`URL:${base}/?event=${eventToDelete.id}`))?.[0];
+  assert.ok(deleteGoogleCopyId && deleteAppleCopyPath, "the second dated Event should have provider copies before native deletion");
   failNextGoogleRequest = { method: "POST", path: "/google/calendar/v3/calendars/primary/events", status: 503 };
 
   const simulatorId = process.env.FILETASKS_IOS_UI_SIMULATOR_ID;
@@ -3437,6 +3462,10 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, save/re
   assert.deepEqual(clearedEvent.files.map(({ id }) => id), [undatedFile.id], "the File relationship should remain after the iOS UI edit");
   assert.equal(googleEvents.has(googleCopyId), false, "the iOS UI date clear should remove the Google copy");
   assert.equal(appleEvents.has(appleCopyPath), false, "the iOS UI date clear should remove the Apple copy");
+  assert.equal((await request(`/api/items/${eventToDelete.id}`, { token: owner.token })).status, 404,
+    "the iOS UI should delete the separate dated Event locally");
+  assert.equal(googleEvents.has(deleteGoogleCopyId), false, "the iOS UI deletion should remove the Google copy");
+  assert.equal(appleEvents.has(deleteAppleCopyPath), false, "the iOS UI deletion should remove the Apple copy");
 
   const recurringTaskRows = items.filter(({ title }) => title === "UI Runner Whole Series Task");
   assert.equal(recurringTaskRows.length, 2, "The iOS scoped saves should leave both affected Task Occurrences in the shared API.");

@@ -1,8 +1,12 @@
 package com.filetasks.android
 
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isDialog
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -16,6 +20,7 @@ import androidx.compose.ui.test.printToString
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.filetasks.android.data.ApiClient
+import com.filetasks.android.data.ItemKind
 import com.filetasks.android.data.WorkspaceItem
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -50,8 +55,11 @@ class RecurringAgendaUiTest {
         compose.onNodeWithTag("auth.submit").performScrollTo().performClick()
         waitFor("the signed-in workspace") { compose.onAllNodes(hasTestTag("agenda.add")).fetchSemanticsNodes().isNotEmpty() }
         val undatedEvent = items(api, token).single { it.title == "Android UI date clearing Event" }
+        val eventToDelete = items(api, token).single { it.title == "Android UI delete Event" }
         assertEquals(ItemKind.Event, undatedEvent.kind)
+        assertEquals(ItemKind.Event, eventToDelete.kind)
         assertAgendaItem(undatedEvent.id, undatedEvent.title)
+        assertAgendaItem(eventToDelete.id, eventToDelete.title)
 
         createRecurring("Android UI Task", isEvent = false, date = "2026-10-14")
         val task = items(api, token).filter { it.title == "Android UI Task" }.sortedBy { it.scheduledDate }
@@ -80,6 +88,7 @@ class RecurringAgendaUiTest {
         afterSeries.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
 
         clearEventDate(undatedEvent, api, token)
+        deleteEvent(eventToDelete, api, token)
     }
 
     private fun items(api: ApiClient, token: String): List<WorkspaceItem> = runBlocking { api.listItems(token) }
@@ -121,6 +130,29 @@ class RecurringAgendaUiTest {
                 && saved.files.any { file -> file.name == "Android Event notes" }
         }
         assertAgendaItem(item.id, item.title)
+    }
+
+    private fun deleteEvent(item: WorkspaceItem, api: ApiClient, token: String) {
+        val itemTag = "agenda.item.${item.id}"
+        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag(itemTag))
+        val deleteButton = compose.onNode(hasText("Delete") and hasAnyAncestor(hasTestTag(itemTag)))
+        waitFor("the Event delete action to become available") {
+            runCatching {
+                deleteButton.assertIsDisplayed()
+                deleteButton.assertIsEnabled()
+            }.isSuccess
+        }
+        deleteButton.performClick()
+        waitFor("the Event delete confirmation") {
+            compose.onAllNodes(isDialog()).fetchSemanticsNodes().isNotEmpty()
+        }
+        val confirmDelete = compose.onNode(hasText("Delete") and hasAnyAncestor(isDialog()))
+        confirmDelete.performClick()
+        waitFor("the deleted Event and confirmation to leave the workspace") {
+            items(api, token).none { it.id == item.id }
+                && compose.onAllNodes(hasTestTag(itemTag)).fetchSemanticsNodes().isEmpty()
+                && compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
+        }
     }
 
     private fun assertAgendaItem(id: String, title: String) {
