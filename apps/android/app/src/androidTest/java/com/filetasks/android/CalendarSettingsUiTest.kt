@@ -5,10 +5,10 @@ import android.app.Instrumentation
 import android.content.Intent
 import android.net.Uri
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isRoot
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
-import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextClearance
@@ -188,7 +188,9 @@ class CalendarSettingsUiTest {
         try {
             compose.waitUntil(30_000, condition)
         } catch (failure: Throwable) {
-            val snapshot = runCatching { compose.onRoot(useUnmergedTree = true).printToString() }.getOrElse { it.toString() }
+            val snapshot = runCatching {
+                compose.onAllNodes(isRoot(), useUnmergedTree = true).printToString()
+            }.getOrElse { it.toString() }
             throw AssertionError("Failed while waiting for $description. UI: $snapshot", failure)
         }
     }
