@@ -40,18 +40,19 @@ export function completeCalendarSync(userId: string, generation: CalendarSyncGen
 
 export function failCalendarSync(userId: string, generation: CalendarSyncGeneration, reauthorizationRequired = false) {
   const db = database();
-  const row = db.prepare(`SELECT attempts FROM calendar_sync_state WHERE user_id=? AND provider=? AND generation=?`)
-    .get(userId,generation.provider,generation.generation) as { attempts: number } | undefined;
+  const row = db.prepare(`SELECT attempts,last_error,last_error_code FROM calendar_sync_state WHERE user_id=? AND provider=? AND generation=?`)
+    .get(userId,generation.provider,generation.generation) as { attempts: number; last_error: string | null; last_error_code: string | null } | undefined;
   if (!row) return;
   const attempts = row.attempts + 1;
   const delayMs = Math.min(6 * 60 * 60 * 1000, 30_000 * (2 ** Math.min(attempts - 1, 10)));
   const currentTime = nowMs();
+  const preserveAuthorization = !reauthorizationRequired && row.last_error_code === "authorization";
   const lastError = reauthorizationRequired
     ? `${generation.provider === "google" ? "Google" : "Apple"} Calendar denied a delete request. Reauthorize this calendar to retry cleanup; the Calendar copy identity is retained and retries continue automatically.`
-    : safeFailureMessage;
+    : preserveAuthorization ? row.last_error : safeFailureMessage;
   db.prepare(`UPDATE calendar_sync_state SET state='failed',attempts=?,next_attempt_at=?,last_attempt_at=?,last_error=?,last_error_code=?
     WHERE user_id=? AND provider=? AND generation=?`).run(
-    attempts,currentTime+delayMs,currentTime,lastError,reauthorizationRequired ? "authorization" : null,userId,generation.provider,generation.generation,
+    attempts,currentTime+delayMs,currentTime,lastError,reauthorizationRequired || preserveAuthorization ? "authorization" : null,userId,generation.provider,generation.generation,
   );
 }
 

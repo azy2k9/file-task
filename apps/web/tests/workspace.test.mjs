@@ -32,6 +32,7 @@ let holdNextPushRevoke = null;
 let pushRegistrationIds = new Map();
 let activePushRegistrations = new Set();
 let failNextGoogleRequest = null;
+let failGoogleRequests = [];
 let failNextAppleRequest = null;
 let loseNextGooglePostResponse = false;
 let googleInventoryBarrier = null;
@@ -424,6 +425,7 @@ async function startDeliveryFakeDuringSetup(setup) {
   pushRegistrationIds = new Map();
   activePushRegistrations = new Set();
   failNextGoogleRequest = null;
+  failGoogleRequests = [];
   failNextAppleRequest = null;
   providerRequests = [];
   storageRequests = [];
@@ -465,9 +467,13 @@ async function startDeliveryFakeDuringSetup(setup) {
     providerRequests.push({ path: url.pathname, method: request.method, body, text: bodyText, query: url.search, headers: request.headers });
     const idempotencyKey = request.headers["idempotency-key"];
     deliveryRequests.push({ path: request.url, body, idempotencyKey });
-    if (failNextGoogleRequest?.path === url.pathname && failNextGoogleRequest.method === request.method) {
-      const { status = 503 } = failNextGoogleRequest;
-      failNextGoogleRequest = null;
+    const queuedGoogleFailureIndex = failGoogleRequests.findIndex((failure) => failure.path === url.pathname && failure.method === request.method);
+    const matchingGoogleFailure = failNextGoogleRequest?.path === url.pathname && failNextGoogleRequest.method === request.method
+      ? failNextGoogleRequest : queuedGoogleFailureIndex >= 0 ? failGoogleRequests[queuedGoogleFailureIndex] : null;
+    if (matchingGoogleFailure) {
+      const { status = 503 } = matchingGoogleFailure;
+      if (matchingGoogleFailure === failNextGoogleRequest) failNextGoogleRequest = null;
+      else failGoogleRequests.splice(queuedGoogleFailureIndex,1);
       response.writeHead(status).end();
       return;
     }
@@ -1859,6 +1865,44 @@ test("clearing a verified supported imported Event date removes its source and e
   }
 });
 
+test("an omitted recurring Google import remains protected while inventory verification is pending", async () => {
+  const owner = await account();
+  const originalGoogleEvents = googleEvents;
+  const originalGooglePages = googleEventPages;
+  googleEvents = new Map([[
+    "recurring-source-pending-inventory",
+    { id: "recurring-source-pending-inventory", summary: "Imported recurring Event", start: { date: "2027-02-12" }, end: { date: "2027-02-13" }, recurrence: ["RRULE:FREQ=DAILY;COUNT=3"] },
+  ]]);
+  try {
+    const authorization = await beginGoogleAuthorization(owner);
+    assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
+      cookie: authorization.cookie, redirect: "manual",
+    })).status, 303);
+    assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+    const imported = (await (await request("/api/items", { token: owner.token })).json()).items
+      .find((item) => item.title === "Imported recurring Event");
+    assert.ok(imported?.recurrence, "the source recurring Event should be imported");
+    const sourceId = "recurring-source-pending-inventory";
+    const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+    try {
+      db.prepare("UPDATE items SET scheduled_date=NULL,scheduled_time=NULL WHERE user_id=? AND id=?").run(owner.user.id, imported.id);
+      googleEventPages = { first: { items: [] } };
+      const sync = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+      assert.equal(sync.status, 200);
+      const result = await sync.json();
+      assert.equal(googleEvents.has(sourceId), true, "an omitted source must not be deleted while the inventory is incomplete");
+      assert.ok(db.prepare("SELECT 1 FROM google_inventory_pending WHERE user_id=? AND item_id=?").get(owner.user.id, imported.id),
+        "the incomplete inventory marker should remain durable");
+      assert.ok(result.syncLimitations.some((limitation) => limitation.itemId === imported.id && limitation.provider === "google"
+        && /original Google Calendar copy is preserved/i.test(limitation.message)),
+      "the incomplete verification should be surfaced as a preservation limitation");
+    } finally { db.close(); }
+  } finally {
+    googleEventPages = originalGooglePages;
+    googleEvents = originalGoogleEvents;
+  }
+});
+
 test("an authorization failure while removing an undated Event copy stays visible and retains identity", async () => {
   const owner = await account();
   const authorization = await beginGoogleAuthorization(owner);
@@ -1923,6 +1967,52 @@ test("an authorization failure while removing an undated Event copy stays visibl
       .some((status) => status.provider === "google"), false, "successful cleanup should clear the authorization recovery state");
   } finally {
     failNextGoogleRequest = null;
+    db.close();
+  }
+});
+
+test("a DELETE authorization failure remains classified if a later Google operation fails", async () => {
+  const owner = await account();
+  const authorization = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
+    cookie: authorization.cookie, redirect: "manual",
+  })).status, 303);
+  const deletedEvent = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "Pending deletion authorization", scheduledDate: "2027-02-14",
+  } })).json()).item;
+  const editedEvent = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "Before later update failure", scheduledDate: "2027-02-15",
+  } })).json()).item;
+  const deletedCopy = [...googleEvents.entries()].find(([, value]) => value.extendedProperties?.private?.filetasksItemId === deletedEvent.id);
+  const editedCopy = [...googleEvents.entries()].find(([, value]) => value.extendedProperties?.private?.filetasksItemId === editedEvent.id);
+  assert.ok(deletedCopy && editedCopy);
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  try {
+    db.prepare("UPDATE items SET scheduled_date=NULL,scheduled_time=NULL WHERE user_id=? AND id=?").run(owner.user.id, deletedEvent.id);
+    db.prepare("UPDATE items SET title=? WHERE user_id=? AND id=?").run("Changed while offline", owner.user.id, editedEvent.id);
+    failGoogleRequests = [
+      { method: "DELETE", path: `/google/calendar/v3/calendars/primary/events/${deletedCopy[0]}`, status: 401 },
+      { method: "PUT", path: `/google/calendar/v3/calendars/primary/events/${editedCopy[0]}`, status: 503 },
+    ];
+    const failed = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+    assert.equal(failed.status, 502, "the later provider update failure should fail this sync pass");
+    assert.equal(failGoogleRequests.length, 0, "both the DELETE authorization and later update failures should be exercised");
+    assert.equal(googleEvents.has(deletedCopy[0]), true, "the failed deletion should retain its provider copy");
+    let delivery = (await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery;
+    assert.equal(delivery.find((entry) => entry.provider === "google")?.reauthorizationRequired, true,
+      "the DELETE authorization result must be persisted before the later failure aborts the pass");
+
+    failGoogleRequests = [
+      { method: "DELETE", path: `/google/calendar/v3/calendars/primary/events/${deletedCopy[0]}`, status: 503 },
+    ];
+    const retry = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+    assert.equal(retry.status, 200);
+    assert.equal(failGoogleRequests.length, 0);
+    delivery = (await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery;
+    assert.equal(delivery.find((entry) => entry.provider === "google")?.reauthorizationRequired, true,
+      "a later generic DELETE failure must not erase an unresolved authorization classification");
+  } finally {
+    failGoogleRequests = [];
     db.close();
   }
 });
