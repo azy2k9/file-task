@@ -49,7 +49,9 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("Password").performTextInput(password)
         compose.onNodeWithTag("auth.submit").performScrollTo().performClick()
         waitFor("the signed-in workspace") { compose.onAllNodes(hasTestTag("agenda.add")).fetchSemanticsNodes().isNotEmpty() }
-        waitFor("the initial empty agenda") { compose.onAllNodes(hasText("Nothing here yet")).fetchSemanticsNodes().isNotEmpty() }
+        val undatedEvent = items(api, token).single { it.title == "Android UI date clearing Event" }
+        assertEquals(ItemKind.Event, undatedEvent.kind)
+        assertAgendaItem(undatedEvent.id, undatedEvent.title)
 
         createRecurring("Android UI Task", isEvent = false, date = "2026-10-14")
         val task = items(api, token).filter { it.title == "Android UI Task" }.sortedBy { it.scheduledDate }
@@ -76,6 +78,8 @@ class RecurringAgendaUiTest {
         assertTrue(afterSeries.any { it.title == "Android UI Event" })
         assertEquals(2, afterSeries.count { it.title == "Android UI Following" })
         afterSeries.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
+
+        clearEventDate(undatedEvent, api, token)
     }
 
     private fun items(api: ApiClient, token: String): List<WorkspaceItem> = runBlocking { api.listItems(token) }
@@ -101,6 +105,22 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText(scope).performScrollTo().performClick()
         compose.onNodeWithText("Save").performClick()
         waitFor("the edit editor to close") { compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty() }
+    }
+
+    private fun clearEventDate(item: WorkspaceItem, api: ApiClient, token: String) {
+        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
+        compose.onNodeWithTag("agenda.edit.${item.id}").performClick()
+        compose.onNodeWithText("Date (YYYY-MM-DD, optional)").performScrollTo().performTextClearance()
+        compose.onNodeWithText("Save").performClick()
+        waitFor("the date-clearing editor to close") {
+            compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty()
+        }
+        waitFor("the Event to remain undated with its File") {
+            val saved = items(api, token).singleOrNull { it.id == item.id }
+            saved != null && saved.scheduledDate == null && saved.scheduledTime == null
+                && saved.files.any { file -> file.name == "Android Event notes" }
+        }
+        assertAgendaItem(item.id, item.title)
     }
 
     private fun assertAgendaItem(id: String, title: String) {

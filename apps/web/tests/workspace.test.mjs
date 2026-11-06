@@ -3064,11 +3064,36 @@ test("Android UI acceptance: recurring agenda updates are visible across clients
       "The Android emulator port 3107 must be available for the shared UI workflow.");
     await runCommand("adb", ["reverse", "tcp:3107", "tcp:3107"]);
   }
+  const undatedEventTitle = "Android UI date clearing Event";
+  let undatedEvent;
+  let undatedFile;
+  let googleCopyId;
+  let appleCopyPath;
   try {
     const authorization = await beginGoogleAuthorization(owner);
     assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
       cookie: authorization.cookie, redirect: "manual",
     })).status, 303);
+    const appleConnection = await request("/api/calendars", { token: owner.token, method: "POST", body: {
+      username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
+    } });
+    assert.equal(appleConnection.status, 201);
+    const eventResponse = await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "event", title: undatedEventTitle, details: "Keep its File", scheduledDate: "2026-10-16",
+    } });
+    assert.equal(eventResponse.status, 201);
+    undatedEvent = (await eventResponse.json()).item;
+    const fileResponse = await request("/api/files", { token: owner.token, method: "POST", body: {
+      name: "Android Event notes", url: "https://example.com/android-event-notes.pdf",
+    } });
+    assert.equal(fileResponse.status, 201);
+    undatedFile = (await fileResponse.json()).file;
+    assert.equal((await request(`/api/files/${undatedFile.id}/attachments`, { token: owner.token, method: "POST", body: {
+      itemId: undatedEvent.id,
+    } })).status, 201);
+    googleCopyId = [...googleEvents.entries()].find(([, event]) => event.extendedProperties?.private?.filetasksItemId === undatedEvent.id)?.[0];
+    appleCopyPath = [...appleEvents.entries()].find(([, calendarData]) => calendarData.includes(`URL:${base}/?event=${undatedEvent.id}`))?.[0];
+    assert.ok(googleCopyId && appleCopyPath, "the dated Event should have both provider copies before the Android UI clears its date");
     failNextGoogleRequest = { method: "POST", path: "/google/calendar/v3/calendars/primary/events", status: 503 };
     await runCommand("./gradlew", [
       ":app:connectedDebugAndroidTest",
@@ -3098,6 +3123,11 @@ test("Android UI acceptance: recurring agenda updates are visible across clients
   assert.equal(items.filter(({ title }) => title === "Android UI Whole Task").length, 3);
   assert.equal(items.filter(({ title }) => title === "Android UI Following").length, 2);
   assert.equal(items.filter(({ title }) => title === "Android UI Event").length, 1);
+  const clearedEvent = (await (await request(`/api/items/${undatedEvent.id}`, { token: owner.token })).json()).item;
+  assert.equal(clearedEvent.scheduledDate, null, "the Android UI should clear the Event's date");
+  assert.deepEqual(clearedEvent.files.map(({ id }) => id), [undatedFile.id], "the File relationship should remain after the Android UI edit");
+  assert.equal(googleEvents.has(googleCopyId), false, "the Android UI date clear should remove the Google copy");
+  assert.equal(appleEvents.has(appleCopyPath), false, "the Android UI date clear should remove the Apple copy");
 
   uiAcceptanceBrowser = await launchUIAcceptanceBrowser();
   try {
@@ -3310,6 +3340,7 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, save/re
   const noRemindersTitle = "UI Runner No Reminders";
   const owner = process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1" ? sharedUIOwner : await account(email);
   assert.ok(owner, "The Android UI phase must create the shared account before the iOS UI phase.");
+  const undatedEventTitle = "iOS UI date clearing Event";
 
   const settingsResponse = await request("/api/settings/reminders", {
     token: owner.token,
@@ -3330,6 +3361,26 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, save/re
   assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
     cookie: authorization.cookie, redirect: "manual",
   })).status, 303);
+  const appleConnection = await request("/api/calendars", { token: owner.token, method: "POST", body: {
+    username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
+  } });
+  assert.equal(appleConnection.status, 201);
+  const eventResponse = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: undatedEventTitle, details: "Keep its File", scheduledDate: "2026-10-16",
+  } });
+  assert.equal(eventResponse.status, 201);
+  const undatedEvent = (await eventResponse.json()).item;
+  const fileResponse = await request("/api/files", { token: owner.token, method: "POST", body: {
+    name: "iOS Event notes", url: "https://example.com/ios-event-notes.pdf",
+  } });
+  assert.equal(fileResponse.status, 201);
+  const undatedFile = (await fileResponse.json()).file;
+  assert.equal((await request(`/api/files/${undatedFile.id}/attachments`, { token: owner.token, method: "POST", body: {
+    itemId: undatedEvent.id,
+  } })).status, 201);
+  const googleCopyId = [...googleEvents.entries()].find(([, event]) => event.extendedProperties?.private?.filetasksItemId === undatedEvent.id)?.[0];
+  const appleCopyPath = [...appleEvents.entries()].find(([, calendarData]) => calendarData.includes(`URL:${base}/?event=${undatedEvent.id}`))?.[0];
+  assert.ok(googleCopyId && appleCopyPath, "the dated Event should have both provider copies before the iOS UI clears its date");
   failNextGoogleRequest = { method: "POST", path: "/google/calendar/v3/calendars/primary/events", status: 503 };
 
   const simulatorId = process.env.FILETASKS_IOS_UI_SIMULATOR_ID;
@@ -3381,6 +3432,11 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, save/re
   assert.deepEqual(reverseTask.reminders, [taskReminder]);
   assert.equal(noRemindersEvent.kind, "event");
   assert.deepEqual(noRemindersEvent.reminders, []);
+  const clearedEvent = (await (await request(`/api/items/${undatedEvent.id}`, { token: owner.token })).json()).item;
+  assert.equal(clearedEvent.scheduledDate, null, "the iOS UI should clear the Event's date");
+  assert.deepEqual(clearedEvent.files.map(({ id }) => id), [undatedFile.id], "the File relationship should remain after the iOS UI edit");
+  assert.equal(googleEvents.has(googleCopyId), false, "the iOS UI date clear should remove the Google copy");
+  assert.equal(appleEvents.has(appleCopyPath), false, "the iOS UI date clear should remove the Apple copy");
 
   const recurringTaskRows = items.filter(({ title }) => title === "UI Runner Whole Series Task");
   assert.equal(recurringTaskRows.length, 2, "The iOS scoped saves should leave both affected Task Occurrences in the shared API.");
