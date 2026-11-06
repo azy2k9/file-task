@@ -143,6 +143,24 @@ export function database() {
         provider_id TEXT NOT NULL, platform TEXT NOT NULL CHECK(platform IN ('web','ios','android')),
         created_at TEXT NOT NULL, UNIQUE(user_id,provider_id)
       );
+      CREATE TABLE IF NOT EXISTS push_cleanup_jobs (
+        registration_id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL,
+        last_error TEXT
+      );
+      CREATE INDEX IF NOT EXISTS push_cleanup_jobs_due ON push_cleanup_jobs(next_attempt_at);
+      CREATE TABLE IF NOT EXISTS push_cleanup_completed (
+        registration_id TEXT PRIMARY KEY,
+        completed_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS push_operation_locks (
+        registration_id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        lease_until INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS push_operation_locks_lease ON push_operation_locks(lease_until);
       CREATE TABLE IF NOT EXISTS reminder_deliveries (
         id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,

@@ -379,27 +379,51 @@ final class AppModel: ObservableObject {
     }
 
     func logout() async {
-        let context: SessionContext
+        let context = try? currentContext()
+        let previousUser = user
+        let deviceId = previousUser.flatMap { UserDefaults.standard.string(forKey: pushDeviceKey(for: $0.id)) }
+        var tokenDeletionError: String?
         do {
-            context = try currentContext()
+            try tokenStore.delete()
         } catch {
-            errorMessage = error.localizedDescription
-            return
+            tokenDeletionError = error.localizedDescription
+        }
+        if let previousUser {
+            UserDefaults.standard.removeObject(forKey: pushDeviceKey(for: previousUser.id))
+            UserDefaults.standard.removeObject(forKey: pushDeviceRevokedKey(for: previousUser.id))
+        }
+        UIApplication.shared.unregisterForRemoteNotifications()
+        invalidateSession()
+        let logoutGeneration = sessionGeneration
+
+        var remoteCleanupFailed = false
+        if let context {
+            let api = APIClient(baseURL: context.baseURL)
+            if let deviceId {
+                do {
+                    try await api.revokePushDevice(id: deviceId, token: context.token)
+                } catch let error as APIClientError where error.statusCode == 404 {
+                    // A missing registration is already absent from future scheduling.
+                } catch {
+                    remoteCleanupFailed = true
+                }
+            }
+            do {
+                try await api.logout(token: context.token)
+            } catch {
+                remoteCleanupFailed = true
+            }
+        } else if previousUser != nil {
+            remoteCleanupFailed = true
         }
 
-        do {
-            try await revokeCurrentPushDevice(using: context)
-            try await APIClient(baseURL: context.baseURL).logout(token: context.token)
-            guard isCurrent(context) else { return }
-            UIApplication.shared.unregisterForRemoteNotifications()
-            invalidateSession()
-            do {
-                try tokenStore.delete()
-            } catch {
-                errorMessage = error.localizedDescription
-            }
-        } catch {
-            handle(error, for: context)
+        var logoutWarnings: [String] = []
+        if let tokenDeletionError {
+            logoutWarnings.append("The saved credential could not be removed: \(tokenDeletionError)")
+        }
+        if remoteCleanupFailed { logoutWarnings.append("Remote session and push cleanup could not be confirmed.") }
+        if !logoutWarnings.isEmpty, logoutGeneration == sessionGeneration {
+            errorMessage = "Signed out on this device. " + logoutWarnings.joined(separator: " ")
         }
     }
 
