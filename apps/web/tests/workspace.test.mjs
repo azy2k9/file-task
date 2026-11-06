@@ -2159,7 +2159,7 @@ test("Apple DELETE authorization failures persist recovery and keep the copy ide
     const mapping = () => db.prepare("SELECT external_id,resource_uid,connection_scope_id FROM calendar_copies WHERE user_id=? AND item_id=? AND provider='apple'")
       .get(owner.user.id, event.id);
     const originalMapping = mapping();
-    assert.equal(originalMapping.external_id, new URL(copy[0], deliveryBase).pathname,
+    assert.equal(new URL(originalMapping.external_id, deliveryBase).pathname, new URL(copy[0], deliveryBase).pathname,
       "Apple Calendar copy URLs should be compared by their normalized resource path");
     failNextAppleRequest = { method: "DELETE", path: copy[0], status: 403 };
     assert.equal((await request(`/api/items/${event.id}`, { token: owner.token, method: "PATCH", body: {
