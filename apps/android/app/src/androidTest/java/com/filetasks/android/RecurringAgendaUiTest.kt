@@ -152,7 +152,13 @@ class RecurringAgendaUiTest {
     private fun deleteItem(item: WorkspaceItem) {
         compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.delete.${item.id}"))
         compose.onNodeWithTag("agenda.delete.${item.id}").performClick()
+        waitFor("the delete confirmation to appear") {
+            compose.onAllNodes(hasTestTag("item.delete.confirm")).fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithTag("item.delete.confirm").performClick()
+        waitFor("the deleted item to leave the agenda") {
+            compose.onAllNodes(hasTestTag("agenda.item.${item.id}")).fetchSemanticsNodes().isEmpty()
+        }
     }
 
     private fun createRecurring(title: String, isEvent: Boolean, date: String) {
