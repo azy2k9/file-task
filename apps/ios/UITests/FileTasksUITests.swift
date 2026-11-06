@@ -250,7 +250,9 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         openItem(originalTitle)
         setTitle(editedTitle)
         saveCurrentItem()
-        XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", editedTitle)).firstMatch.waitForExistence(timeout: 10))
+        let editedRow = app.buttons.matching(identifier: "agenda.open.\(editedTitle)").firstMatch
+        XCTAssertTrue(editedRow.waitForExistence(timeout: 10),
+                      "Saving the Task edit should update its agenda row. Accessibility hierarchy: \(app.debugDescription)")
 
         let complete = app.buttons["Complete Task: \(editedTitle)"]
         scrollToHittable(complete, toward: .down, message: "The Task should expose its completion control.")
