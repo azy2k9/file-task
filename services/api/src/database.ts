@@ -74,6 +74,36 @@ export function database() {
         UNIQUE(user_id,provider,connection_scope_id,resource_uid),
         FOREIGN KEY(user_id,item_id) REFERENCES items(user_id,id) ON DELETE CASCADE
       );
+      CREATE TABLE IF NOT EXISTS calendar_creation_cleanup (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL CHECK(provider IN ('google','apple')),
+        connection_scope_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        external_id TEXT NOT NULL,
+        ownership_token TEXT,
+        PRIMARY KEY(user_id,provider,connection_scope_id,item_id)
+      );
+      CREATE TABLE IF NOT EXISTS calendar_export_locks (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL CHECK(provider IN ('google','apple')),
+        connection_scope_id TEXT NOT NULL,
+        owner_token TEXT NOT NULL,
+        fence INTEGER NOT NULL,
+        lease_until INTEGER NOT NULL,
+        PRIMARY KEY(user_id,provider,connection_scope_id)
+      );
+      CREATE INDEX IF NOT EXISTS calendar_export_locks_lease ON calendar_export_locks(lease_until);
+      CREATE TRIGGER IF NOT EXISTS preserve_calendar_creation_before_item_delete
+      BEFORE DELETE ON items BEGIN
+        INSERT INTO calendar_creation_cleanup(user_id,provider,connection_scope_id,item_id,external_id,ownership_token)
+          SELECT r.user_id,'google',r.connection_scope_id,r.item_id,r.event_id,r.ownership_token
+          FROM google_creation_reservations r WHERE r.user_id=OLD.user_id AND r.item_id=OLD.id
+        ON CONFLICT(user_id,provider,connection_scope_id,item_id) DO UPDATE SET external_id=excluded.external_id,ownership_token=excluded.ownership_token;
+        INSERT INTO calendar_creation_cleanup(user_id,provider,connection_scope_id,item_id,external_id,ownership_token)
+          SELECT r.user_id,'apple',r.connection_scope_id,r.item_id,r.resource_uid,NULL
+          FROM apple_creation_reservations r WHERE r.user_id=OLD.user_id AND r.item_id=OLD.id
+        ON CONFLICT(user_id,provider,connection_scope_id,item_id) DO UPDATE SET external_id=excluded.external_id;
+      END;
       CREATE TABLE IF NOT EXISTS user_preferences (
         user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
         task_reminders TEXT NOT NULL DEFAULT '[]', event_reminders TEXT NOT NULL DEFAULT '[]',

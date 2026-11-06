@@ -398,6 +398,55 @@ async function startServerDuringSetup(setup) {
   }
 }
 
+async function startCalendarApiReplica(port) {
+  const child = spawn(process.execPath,[nextBin,"dev",...(process.env.FILETASKS_RUN_SHARED_ACCEPTANCE==="1"?["--webpack"]:[]),"--port",String(port)],{
+    cwd:projectRoot,detached:process.platform!=="win32",
+    env:{...process.env,FILETASKS_DATABASE_PATH:join(directory,"workspace.sqlite"),FILETASKS_ORIGIN:base,FILETASKS_TIME_ZONE:serverTimeZone,
+      FILETASKS_EMAIL_DELIVERY_URL:`${deliveryBase}/email`,FILETASKS_PUSH_DELIVERY_URL:`${deliveryBase}/push`,FILETASKS_REMINDER_WORKER_SECRET:"test-worker-secret",
+      FILETASKS_REMINDER_RETRY_BASE_MS:"1000",FILETASKS_TEST_CLOCK_PATH:clockFile,FILETASKS_CALENDAR_ENCRYPTION_KEY:Buffer.alloc(32,7).toString("base64"),
+      FILETASKS_PUBLIC_URL:base,GOOGLE_CALENDAR_CLIENT_ID:"fake-client",GOOGLE_CALENDAR_CLIENT_SECRET:"fake-secret",
+      GOOGLE_CALENDAR_REDIRECT_URI:`${base}/api/calendars/google/callback`,FILETASKS_GOOGLE_API_ORIGIN:`${deliveryBase}/google`,
+      FILETASKS_GOOGLE_TOKEN_URL:`${deliveryBase}/google-token`,FILETASKS_GOOGLE_AUTH_URL:`${deliveryBase}/google-auth`,
+      FILETASKS_APPLE_CALDAV_ORIGIN:`${deliveryBase}/apple`,FILETASKS_R2_ACCOUNT_ID:"fake-account",FILETASKS_R2_ACCESS_KEY_ID:"fake-access-key",
+      FILETASKS_R2_SECRET_ACCESS_KEY:"fake-secret-key",FILETASKS_R2_BUCKET:"filetasks-test",FILETASKS_R2_ENDPOINT:`${deliveryBase}/r2`,
+      FILETASKS_TEST_NEXT_DIST_DIR:".next-test-replica"},
+    stdio:["ignore","pipe","pipe"],
+  });
+  const output=[];
+  child.stdout.on("data",(chunk)=>output.push(chunk.toString("utf8")));
+  child.stderr.on("data",(chunk)=>output.push(chunk.toString("utf8")));
+  const closed=new Promise((resolve)=>child.once("close",resolve));
+  if(child.pid) trackRunnerOwnedProcessGroup(child.pid);
+  const replica={child,closed,output,port};
+  const started=Date.now();
+  while(Date.now()-started<serverReadinessTimeoutMs){
+    if(child.exitCode!==null||child.signalCode!==null){
+      await rm(join(projectRoot,".next-test-replica"),{recursive:true,force:true});
+      throw new Error(`Calendar API replica exited early: ${output.join("")}`);
+    }
+    if(output.join("").includes("Ready in ")){
+      try { const response=await fetch(`http://localhost:${port}/api/auth/session`,{signal:AbortSignal.timeout(serverReadinessProbeTimeoutMs)}); await response.body?.cancel(); if(response.status===401)return replica; }
+      catch {}
+    }
+    await delay(100);
+  }
+  await stopCalendarApiReplica(replica);
+  throw new Error(`Calendar API replica did not become ready: ${output.join("")}`);
+}
+
+async function stopCalendarApiReplica(replica) {
+  if(!replica)return;
+  if(replica.child.pid!==undefined&&process.platform==="win32") await runCommand("taskkill",["/PID",String(replica.child.pid),"/T","/F"],process.env,repoRoot,{cleanup:true});
+  else if(replica.child.pid!==undefined) await terminateProcessGroup(replica.child.pid,"SIGTERM",{graceMs:serverShutdownTimeoutMs,killWaitMs:serverShutdownTimeoutMs});
+  const closed=await Promise.race([replica.closed.then(()=>true),delay(serverShutdownTimeoutMs,false,{ref:false})]);
+  if(!closed) throw new Error(`Calendar API replica ${replica.child.pid} did not stop.`);
+  if(replica.child.pid&&process.platform!=="win32"&&runnerProcessGroupStatePath){
+    if(!(await waitForProcessGroupExit(replica.child.pid,0)))throw new Error(`Calendar API replica process group ${replica.child.pid} remained after shutdown.`);
+    forgetRunnerOwnedProcessGroup(replica.child.pid);
+  }
+  await rm(join(projectRoot,".next-test-replica"),{recursive:true,force:true});
+}
+
 async function startDeliveryFake() {
   const setup = setupGate.begin("provider fake startup");
   try {
@@ -566,6 +615,12 @@ async function startDeliveryFakeDuringSetup(setup) {
         const id = body.id ?? `google-${crypto.randomUUID()}`;
         if (googleEvents.has(id)) { response.writeHead(409).end(); return; }
         googleEvents.set(id, { ...body, id });
+        if (holdNextCalendarCreation?.provider === "google") {
+          const gate = holdNextCalendarCreation;
+          holdNextCalendarCreation = null;
+          gate.created();
+          await gate.releasePromise;
+        }
         if (loseNextGooglePostResponse) { loseNextGooglePostResponse = false; response.writeHead(200, { "Content-Type": "application/json" }).end("{"); return; }
         response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ id }));
         return;
@@ -3412,6 +3467,75 @@ test("concurrent save and Sync Calendar requests keep one Google and Apple copy"
   }
 });
 
+test("calendar export coordination spans API processes and does not block another account", async () => {
+  const owner=await account();
+  const other=await account();
+  const createEvent=async(token,title,date)=>{
+    const response=await request("/api/items",{token,method:"POST",body:{kind:"event",title,scheduledDate:date}});
+    assert.equal(response.status,201);
+    return (await response.json()).item;
+  };
+  const item=await createEvent(owner.token,"Before distributed export","2027-02-18");
+  const otherItem=await createEvent(other.token,"Independent destination","2027-02-19");
+  const connect=async(user)=>{
+    const auth=await beginGoogleAuthorization(user);
+    assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`,{cookie:auth.cookie,redirect:"manual"})).status,303);
+  };
+  await connect(owner); await connect(other);
+  const replica=await startCalendarApiReplica(3112);
+  const requestReplica=(path,{token,method="GET",body}={})=>fetch(`http://localhost:${replica.port}${path}`,{
+    method,headers:{...(token?{Authorization:`Bearer ${token}`}:{"Authorization":"Bearer test-worker-secret"}),...(body===undefined?{}:{"Content-Type":"application/json"})},
+    ...(body===undefined?{}:{body:JSON.stringify(body)}),
+  });
+  let release;
+  let started;
+  const held=new Promise((resolve)=>{started=resolve;});
+  const released=new Promise((resolve)=>{release=resolve;});
+  let firstSync;
+  let concurrentSync;
+  let edited;
+  holdNextCalendarCreation={provider:"google",created:started,releasePromise:released,release};
+  try {
+    firstSync=request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    await held;
+    assert.equal([...googleEvents.values()].filter((event)=>event.description?.includes(item.id)).length,1,"the first process has created its reserved Google resource");
+
+    const independent=await requestReplica("/api/calendars/sync",{token:other.token,method:"POST"});
+    assert.equal(independent.status,200,await independent.text());
+    assert.equal([...googleEvents.values()].filter((event)=>event.description?.includes(otherItem.id)).length,1,
+      "an unrelated account can export while another destination is held");
+
+    concurrentSync=requestReplica("/api/calendars/sync",{token:owner.token,method:"POST"});
+    edited=requestReplica(`/api/items/${item.id}`,{token:owner.token,method:"PATCH",body:{title:"After distributed export"}});
+    const sharedDb=new DatabaseSync(join(directory,"workspace.sqlite"));
+    try {
+      const deadline=Date.now()+5000;
+      while(Date.now()<deadline&&sharedDb.prepare("SELECT title FROM items WHERE user_id=? AND id=?").get(owner.user.id,item.id)?.title!=="After distributed export") await delay(10);
+      assert.equal(sharedDb.prepare("SELECT title FROM items WHERE user_id=? AND id=?").get(owner.user.id,item.id)?.title,"After distributed export",
+        "the Event edit should commit before releasing the older provider write");
+    } finally { sharedDb.close(); }
+    release();
+    const first=await firstSync;
+    assert.equal(first.status,200,await first.text());
+    const [syncResponse,editResponse]=await Promise.all([concurrentSync,edited]);
+    assert.equal(syncResponse.status,200,await syncResponse.text());
+    assert.equal(editResponse.status,200,await editResponse.text());
+    const db=new DatabaseSync(join(directory,"workspace.sqlite"));
+    try {
+      assert.equal(db.prepare("SELECT count(*) AS count FROM calendar_copies WHERE user_id=? AND provider='google' AND item_id=?").get(owner.user.id,item.id).count,1);
+      const copy=[...googleEvents.values()].find((event)=>event.description?.includes(item.id));
+      assert.ok(copy,"the provider contains the FileTasks copy");
+      assert.equal(copy.summary,"After distributed export","the later process must reconcile the newest Event payload");
+      assert.equal([...googleEvents.values()].filter((event)=>event.description?.includes(item.id)).length,1,"the two processes retain one provider identity");
+      assert.deepEqual((await (await request("/api/calendars",{token:owner.token})).json()).syncDelivery,[],"a stale generation must not leave delivery falsely pending or falsely clear a later edit");
+    } finally { db.close(); }
+  } finally {
+    release?.(); holdNextCalendarCreation=null;
+    await firstSync?.catch(()=>{}); await concurrentSync?.catch(()=>{}); await edited?.catch(()=>{});
+    await stopCalendarApiReplica(replica);
+  }
+});
+
 test("a blocked Google calendar does not serialize a different account", async () => {
   const first = await account();
   const second = await account();
@@ -3510,6 +3634,12 @@ test("Google and Apple provider creations recover their reserved copy after a se
       activeGate = undefined;
       await interrupted;
       await startServer();
+      if (provider === "google") {
+        const edited = await request(`/api/items/${item.id}`, {token:owner.token,method:"PATCH",body:{title:"Edited before reserved ID retry"}});
+        assert.equal(edited.status,200,await edited.text());
+        assert.equal(googleEvents.get(createdResource)?.summary,"Edited before reserved ID retry",
+          "verified reserved-ID recovery must repair the provider copy with the current Event payload before succeeding");
+      }
       const retry = await request("/api/calendars/sync", {token: owner.token, method: "POST"});
       assert.equal(retry.status, 200, await retry.text());
       assert.equal(db.prepare("SELECT count(*) AS count FROM calendar_copies WHERE user_id=? AND provider=? AND item_id=?").get(owner.user.id,provider,item.id).count, 1,
@@ -3532,6 +3662,56 @@ test("Google and Apple provider creations recover their reserved copy after a se
     activeGate?.release();
     holdNextCalendarCreation = null;
     db.close();
+  }
+});
+
+test("deleting an Event after interrupted provider creation reconciles its reservation after restart", async () => {
+  const db=new DatabaseSync(join(directory,"workspace.sqlite"));
+  let gate;
+  try {
+    for(const provider of ["google","apple"]){
+      const owner=await account();
+      const created=await request("/api/items",{token:owner.token,method:"POST",body:{kind:"event",title:`Deleted interrupted ${provider} Event`,scheduledDate:"2027-02-20"}});
+      assert.equal(created.status,201);
+      const item=(await created.json()).item;
+      if(provider==="google"){
+        const auth=await beginGoogleAuthorization(owner);
+        assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`,{cookie:auth.cookie,redirect:"manual"})).status,303);
+      }else{
+        assert.equal((await request("/api/calendars",{token:owner.token,method:"POST",body:{username:"cleanup@example.com",password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/cleanup-${item.id}/`}})).status,201);
+      }
+      let signalCreated;
+      let release;
+      const providerCreated=new Promise((resolve)=>{signalCreated=resolve;});
+      const releasePromise=new Promise((resolve)=>{release=resolve;});
+      gate={provider,created:signalCreated,releasePromise,release};
+      holdNextCalendarCreation=gate;
+      const interrupted=request("/api/calendars/sync",{token:owner.token,method:"POST"}).then((response)=>({response}),error=>({error}));
+      await providerCreated;
+      const copy=provider==="google"
+        ? [...googleEvents.values()].find((event)=>event.description?.includes(item.id))
+        : [...appleEvents.entries()].find(([,ics])=>ics.includes(`?event=${item.id}`));
+      assert.ok(copy,`${provider} provider committed the copy before local completion`);
+      await stopServer();
+      db.prepare("DELETE FROM items WHERE user_id=? AND id=?").run(owner.user.id,item.id);
+      assert.equal(db.prepare("SELECT count(*) AS count FROM calendar_creation_cleanup WHERE user_id=? AND provider=? AND item_id=?").get(owner.user.id,provider,item.id).count,1,
+        `${provider} reservation identity must survive Event deletion`);
+      release(); gate=undefined; holdNextCalendarCreation=null;
+      await interrupted;
+      await startServer();
+      const retried=await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+      assert.equal(retried.status,200,await retried.text());
+      assert.equal(db.prepare("SELECT count(*) AS count FROM calendar_creation_cleanup WHERE user_id=? AND provider=? AND item_id=?").get(owner.user.id,provider,item.id).count,0,
+        `${provider} cleanup identity should be removed only after reconciliation`);
+      assert.equal(db.prepare("SELECT count(*) AS count FROM calendar_imports WHERE user_id=? AND provider=? AND item_id=?").get(owner.user.id,provider,item.id).count,0,
+        `${provider} stale provider resource must not be imported after deletion`);
+      if(provider==="google") assert.equal([...googleEvents.values()].some((event)=>event.description?.includes(item.id)),false);
+      else assert.equal([...appleEvents.values()].some((ics)=>ics.includes(`?event=${item.id}`)),false);
+    }
+  } finally {
+    gate?.release(); holdNextCalendarCreation=null;
+    try { if(!server&&!interruptedSignal) await startServer(); }
+    finally { db.close(); }
   }
 });
 

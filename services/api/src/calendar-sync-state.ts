@@ -18,19 +18,29 @@ export function enqueueCalendarSync(userId: string) {
       last_attempt_at=NULL,last_error=NULL`).run(currentTime,userId);
 }
 
-/** Ensure connected providers have retry rows and snapshot their generations before a sync pass. */
+/** Advance connected-provider generations before a sync pass so stale workers cannot settle newer delivery. */
 export function beginCalendarSync(userId: string, providers?: readonly CalendarSyncProvider[]): CalendarSyncGeneration[] {
   const db = database();
   const currentTime = nowMs();
   const filter = providers === undefined ? "" : ` AND provider IN (${providers.map(() => "?").join(",") || "NULL"})`;
   const stateFilter = providers === undefined ? "" : ` AND s.provider IN (${providers.map(() => "?").join(",") || "NULL"})`;
   const params = providers ?? [];
-  db.prepare(`INSERT OR IGNORE INTO calendar_sync_state(user_id,provider,generation,state,attempts,next_attempt_at)
-    SELECT user_id,provider,0,'pending',0,? FROM calendar_connections WHERE user_id=?${filter}`)
-    .run(currentTime,userId,...params);
-  return db.prepare(`SELECT s.provider,s.generation FROM calendar_sync_state s
-    JOIN calendar_connections c ON c.user_id=s.user_id AND c.provider=s.provider
-    WHERE s.user_id=?${stateFilter} ORDER BY s.provider`).all(userId,...params) as CalendarSyncGeneration[];
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare(`INSERT OR IGNORE INTO calendar_sync_state(user_id,provider,generation,state,attempts,next_attempt_at)
+      SELECT user_id,provider,0,'pending',0,? FROM calendar_connections WHERE user_id=?${filter}`)
+      .run(currentTime,userId,...params);
+    db.prepare(`UPDATE calendar_sync_state SET generation=generation+1,state='pending',attempts=0,next_attempt_at=?,last_attempt_at=NULL,last_error=NULL
+      WHERE user_id=?${filter}`).run(currentTime,userId,...params);
+    const generations = db.prepare(`SELECT s.provider,s.generation FROM calendar_sync_state s
+      JOIN calendar_connections c ON c.user_id=s.user_id AND c.provider=s.provider
+      WHERE s.user_id=?${stateFilter} ORDER BY s.provider`).all(userId,...params) as CalendarSyncGeneration[];
+    db.exec("COMMIT");
+    return generations;
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* Preserve the generation error. */ }
+    throw error;
+  }
 }
 
 export function completeCalendarSync(userId: string, generation: CalendarSyncGeneration) {
