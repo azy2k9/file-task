@@ -46,6 +46,17 @@ class CalendarSettingsUiTest {
         val appleCalendarUrl = args.getString("appleCalendarUrl") ?: error("appleCalendarUrl is required")
         val token = ApiClient(apiUrl).login(email, password).first
 
+        waitFor("the API server configuration button") {
+            compose.onAllNodes(hasText("Configure API URL")).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText("Configure API URL").performClick()
+        compose.onNodeWithText("Base URL").performTextClearance()
+        compose.onNodeWithText("Base URL").performTextInput(apiUrl)
+        compose.onNodeWithText("Save").performClick()
+        waitFor("the API server configuration to finish") {
+            compose.onAllNodes(hasText("Server changed. Sign in to continue.")).fetchSemanticsNodes().isNotEmpty()
+        }
+
         compose.waitUntil(timeoutMillis = 30_000) {
             compose.onAllNodes(hasText("Sign out")).fetchSemanticsNodes().isNotEmpty() ||
                 compose.onAllNodes(hasText("Email")).fetchSemanticsNodes().isNotEmpty()
