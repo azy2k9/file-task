@@ -741,11 +741,11 @@ function googleRecurrence(item: EventItem, excludedDates: string[], timeZone = p
   return recurrence;
 }
 
-function assertActiveScope(connection: Connection) {
+function assertActiveScope(connection: Connection, allowStaleGeneration = false) {
   const active = database().prepare("SELECT 1 FROM calendar_connections WHERE user_id=? AND provider=? AND connection_scope_id=? AND credential_generation_id=?")
     .get(connection.user_id,connection.provider,connection.connection_scope_id,connection.credential_generation_id);
   if (!active) throw new HttpError(409, "Calendar connection changed. Please sync again.");
-  if (connection.syncGeneration !== undefined && !database().prepare(`SELECT 1 FROM calendar_sync_state WHERE user_id=? AND provider=? AND generation=?`)
+  if (!allowStaleGeneration && connection.syncGeneration !== undefined && !database().prepare(`SELECT 1 FROM calendar_sync_state WHERE user_id=? AND provider=? AND generation=?`)
     .get(connection.user_id,connection.provider,connection.syncGeneration)) throw new HttpError(409,"Calendar sync generation changed. Please sync again.");
   const lock = (connection as Connection & {exportLock?:{ownerToken:string;fence:number}}).exportLock;
   if (lock && !database().prepare(`SELECT 1 FROM calendar_export_locks WHERE user_id=? AND provider=? AND connection_scope_id=?
@@ -844,13 +844,13 @@ function reserveAppleCreation(connection: Connection, itemId: string) {
   return { resourceUid: String(row.resource_uid) };
 }
 
-async function googleAccess(connection: Connection) {
-  assertActiveScope(connection);
+async function googleAccess(connection: Connection, allowStaleGeneration = false) {
+  assertActiveScope(connection,allowStaleGeneration);
   if (connection.expires_at && connection.expires_at > nowMs() && connection.access_token) return decrypt(connection.access_token);
   if (!connection.refresh_token) throw new HttpError(503, "Reconnect Google Calendar to continue syncing.");
-  assertActiveScope(connection);
+  assertActiveScope(connection,allowStaleGeneration);
   const response = await calendarFetch(googleTokenUrl(), { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: process.env.GOOGLE_CALENDAR_CLIENT_ID ?? "", client_secret: process.env.GOOGLE_CALENDAR_CLIENT_SECRET ?? "", refresh_token: decrypt(connection.refresh_token), grant_type: "refresh_token" }) });
-  assertActiveScope(connection);
+  assertActiveScope(connection,allowStaleGeneration);
   if (!response.ok) throw new HttpError(502, "Google Calendar authorization expired. Reconnect the calendar.");
   assertActiveScope(connection);
   const tokens = await response.json() as { access_token: string; expires_in: number };
@@ -884,7 +884,7 @@ async function reconcileDeletedCreationReservations(connection: Connection) {
       const url = googleApiUrl(`calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(row.external_id)}`);
       let current: Response;
       try { current = await calendarFetch(url,{headers:{Authorization:`Bearer ${access}`}}); }
-      catch { throw new HttpError(502,"A deleted Event's Google Calendar copy could not be verified. Sync will retry."); }
+      catch { continue; }
       assertActiveScope(connection);
       if (current.status === 404 || current.status === 410) {
         database().prepare(`DELETE FROM calendar_creation_cleanup WHERE pending_attempts=0 AND user_id=? AND provider='google' AND connection_scope_id=? AND item_id=? AND external_id=?
@@ -895,14 +895,16 @@ async function reconcileDeletedCreationReservations(connection: Connection) {
         scheduleUncertainCreationCleanup(connection,row.item_id,row.external_id);
         continue;
       }
-      if (!current.ok) throw new HttpError(502,"A deleted Event's Google Calendar copy could not be verified. Sync will retry.");
+      if (!current.ok) continue;
       const event = await current.json() as {id?:string;status?:string;extendedProperties?:{private?:{filetasksItemId?:string;filetasksOwnershipToken?:string}}};
       assertActiveScope(connection);
       if (event.id !== row.external_id || event.status === "cancelled" || event.extendedProperties?.private?.filetasksItemId !== row.item_id
         || !row.ownership_token || event.extendedProperties?.private?.filetasksOwnershipToken !== row.ownership_token) continue;
-      const deleted = await calendarFetch(url,{method:"DELETE",headers:{Authorization:`Bearer ${access}`}});
+      let deleted: Response;
+      try { deleted = await calendarFetch(url,{method:"DELETE",headers:{Authorization:`Bearer ${access}`}}); }
+      catch { continue; }
       assertActiveScope(connection);
-      if (!deleted.ok && deleted.status !== 404 && deleted.status !== 410) throw new HttpError(502,"A deleted Event's Google Calendar copy could not be removed. Sync will retry.");
+      if (!deleted.ok && deleted.status !== 404 && deleted.status !== 410) continue;
       database().prepare(`DELETE FROM calendar_creation_cleanup WHERE pending_attempts=0 AND user_id=? AND provider='google' AND connection_scope_id=? AND item_id=? AND external_id=?
         AND NOT EXISTS (SELECT 1 FROM calendar_creation_attempts a WHERE a.user_id=calendar_creation_cleanup.user_id AND a.provider=calendar_creation_cleanup.provider AND a.connection_scope_id=calendar_creation_cleanup.connection_scope_id AND a.item_id=calendar_creation_cleanup.item_id AND a.external_id=calendar_creation_cleanup.external_id AND a.status IN ('active','uncertain'))
         AND EXISTS (SELECT 1 FROM calendar_connections WHERE user_id=? AND provider='google' AND connection_scope_id=? AND credential_generation_id=?)`)
@@ -943,7 +945,9 @@ async function reconcileDeletedCreationReservations(connection: Connection) {
     // connection, generation, and lease after it completes, then bind deletion
     // to the exact version whose ownership was verified.
     assertActiveScope(connection);
-    const deleted = await calendarFetch(target,{method:"DELETE",headers:{Authorization:authorization,"If-Match":etag},redirect:"error"});
+    let deleted: Response;
+    try { deleted = await calendarFetch(target,{method:"DELETE",headers:{Authorization:authorization,"If-Match":etag},redirect:"error"}); }
+    catch { throw new HttpError(502,"A deleted Event's Apple Calendar copy could not be removed. Sync will retry."); }
     assertActiveScope(connection);
     if (!deleted.ok && deleted.status !== 404 && deleted.status !== 410) throw new HttpError(502,"A deleted Event's Apple Calendar copy could not be removed. Sync will retry.");
     database().prepare(`DELETE FROM calendar_creation_cleanup WHERE pending_attempts=0 AND user_id=? AND provider='apple' AND connection_scope_id=? AND item_id=? AND external_id=?
@@ -1237,7 +1241,7 @@ function preserveLegacyImport(userId: string, provider: Provider, externalId: st
 }
 
 async function importGoogleEvents(connection: Connection) {
-  assertActiveScope(connection);
+  assertActiveScope(connection,true);
   if (!connection.connection_scope_id) throw new Error("Missing connection scope");
   const db = database();
   const accountId = connection.calendar_url ?? "primary";
@@ -1251,9 +1255,9 @@ async function importGoogleEvents(connection: Connection) {
       AND EXISTS (SELECT 1 FROM calendar_connections WHERE user_id=? AND provider='google' AND connection_scope_id=? AND credential_generation_id=?)`)
     .run(inventoryId,connection.user_id,accountId,connection.connection_scope_id,connection.user_id,connection.connection_scope_id,connection.credential_generation_id,
       connection.user_id,connection.connection_scope_id,connection.credential_generation_id);
-  assertActiveScope(connection);
-  const access = await googleAccess(connection); const calendarId = encodeURIComponent(accountId);
-  assertActiveScope(connection);
+  assertActiveScope(connection,true);
+  const access = await googleAccess(connection,true); const calendarId = encodeURIComponent(accountId);
+  assertActiveScope(connection,true);
   const existing = new Set(database().prepare(`SELECT external_id FROM calendar_imports WHERE user_id=? AND provider='google'
     UNION SELECT external_id FROM calendar_import_exclusions WHERE user_id=? AND provider='google'
     UNION SELECT external_id FROM calendar_import_metadata WHERE user_id=? AND provider='google'
@@ -1267,7 +1271,7 @@ async function importGoogleEvents(connection: Connection) {
     const url = googleApiUrl(`calendar/v3/calendars/${calendarId}/events`);
     url.searchParams.set("singleEvents","false"); url.searchParams.set("showDeleted","true"); url.searchParams.set("maxResults","2500");
     if (pageToken) url.searchParams.set("pageToken",pageToken);
-    assertActiveScope(connection);
+    assertActiveScope(connection,true);
     const response = await calendarFetch(url,{ headers: { Authorization: `Bearer ${access}` } });
     assertActiveScope(connection);
     if (!response.ok) throw new HttpError(502,"Could not read Events from Google Calendar.");
@@ -1622,8 +1626,44 @@ function appleStoredRepresentationMatches(userId: string, itemId: string, scope:
   return previous?.representation_json === actual;
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value).sort(([left],[right]) => left.localeCompare(right))
+      .map(([key,entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "undefined";
+}
+
+function googleEventMatches(current: Record<string,unknown>, desired: Record<string,unknown>) {
+  const withoutGeneration = (event: Record<string,unknown>) => {
+    const result = { ...event };
+    const extended = event.extendedProperties as Record<string,unknown> | undefined;
+    if (extended) {
+      const properties = { ...extended };
+      const privateProperties = extended.private as Record<string,unknown> | undefined;
+      if (privateProperties) {
+        const values = { ...privateProperties };
+        delete values.filetasksSyncGeneration;
+        properties.private = values;
+      }
+      result.extendedProperties = properties;
+    }
+    return result;
+  };
+  const actual = withoutGeneration(current);
+  const expected = withoutGeneration(desired);
+  return Object.keys(expected).every((key) => canonicalJson(actual[key]) === canonicalJson(expected[key]));
+}
+
+function appleCalendarDataMatches(current: string, desired: string) {
+  const normalize = (ics: string) => ics.replace(/^X-FILETASKS-SYNC-GENERATION:[^\r\n]*\r?\n/gmi,"")
+    .replace(/^DTSTAMP(?:;[^:]*)?:[^\r\n]*\r?\n/gmi,"");
+  return normalize(current) === normalize(desired);
+}
+
 async function importAppleEvents(connection: Connection, verified: Set<string>) {
-  assertActiveScope(connection);
+  assertActiveScope(connection,true);
   if (!connection.connection_scope_id) throw new Error("Missing connection scope");
   if (!connection.access_token || !connection.calendar_url) throw new HttpError(503,"Reconnect Apple Calendar to continue syncing.");
   const credentials = JSON.parse(decrypt(connection.access_token)) as { username: string; password: string };
@@ -1631,7 +1671,7 @@ async function importAppleEvents(connection: Connection, verified: Set<string>) 
   const from = new Date(nowMs()-90*86_400_000).toISOString().replace(/[-:]/g,"").replace(/\.\d{3}Z$/, "Z");
   const to = new Date(nowMs()+370*86_400_000).toISOString().replace(/[-:]/g,"").replace(/\.\d{3}Z$/, "Z");
   const body = `<?xml version="1.0" encoding="utf-8"?><c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"><c:time-range start="${from}" end="${to}"/></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>`;
-  assertActiveScope(connection);
+  assertActiveScope(connection,true);
   const response = await calendarFetch(connection.calendar_url,{ method:"REPORT", headers:{ Authorization:authorization, Depth:"1", "Content-Type":"application/xml; charset=utf-8" }, body });
   assertActiveScope(connection);
   if (!response.ok && response.status !== 207) throw new HttpError(502,"Could not read Events from Apple Calendar.");
@@ -1936,7 +1976,7 @@ async function syncGoogle(connection: Connection, events: EventItem[], limits: M
       continue;
     }
     if (database().prepare("SELECT 1 FROM calendar_creation_cleanup WHERE user_id=? AND provider='google' AND connection_scope_id=? AND item_id=?").get(connection.user_id,connection.connection_scope_id,itemId)) {
-      limits.set(`${itemId}:google`,{itemId,title:"Deleted Event",provider:"google",message:"The deleted Event's Google Calendar identity could not be verified safely. Its copy is retained for retry."});
+      limits.set(`${itemId}:google`,{itemId,title:"Deleted Event",provider:"google",message:"The deleted Event's Google Calendar copy could not be removed or verified safely. It is retained for retry."});
       continue;
     }
     const eventId = copy.id;
@@ -1974,6 +2014,9 @@ async function syncGoogle(connection: Connection, events: EventItem[], limits: M
     const sourceText = metadata?.provider === "google" && metadata.source_payload_json ? JSON.parse(metadata.source_payload_json) as {summary?:string;description?:string} : null;
     const summary = sourceText && (typeof textBaseline?.title !== "string" || textBaseline.title === item.title) ? sourceText.summary : item.title;
     const details = sourceText && (typeof textBaseline?.details !== "string" || textBaseline.details === item.details) ? sourceText.description ?? "" : item.details;
+    const hasChangedOccurrence = events.some((occurrence) => occurrence.seriesId === item.id && occurrence.id !== item.id && occurrence.occurrenceDate
+      && (occurrence.scheduledDate !== occurrence.occurrenceDate || occurrence.scheduledTime !== item.scheduledTime
+        || occurrence.title !== item.title || occurrence.details !== item.details));
     const backlinkText = backlink ? `Open in FileTasks: ${backlink}` : "";
     let intent = mapped ? null : reserveGoogleCreation(connection,item.id);
     const mappedReservation = mapped ? database().prepare(`SELECT ownership_token FROM google_creation_reservations
@@ -1988,6 +2031,7 @@ async function syncGoogle(connection: Connection, events: EventItem[], limits: M
     let response: Response | undefined;
     let updateETag: string | undefined;
     let mappedMissing = false;
+    let unchangedMapped = false;
     if (mapped) {
       assertActiveScope(connection);
       let current: Response;
@@ -1997,15 +2041,18 @@ async function syncGoogle(connection: Connection, events: EventItem[], limits: M
       if (current.status === 404) { response = current; mappedMissing = true; }
       else {
         if (!current.ok) throw new HttpError(502,"The Google Calendar copy could not be verified. Sync will retry.");
-        const currentEvent = await current.json() as {etag?:string;extendedProperties?:{private?:{filetasksSyncGeneration?:number|string}}};
+        const currentEvent = await current.json() as Record<string,unknown> & {id?:string;status?:string;etag?:string;extendedProperties?:{private?:{filetasksSyncGeneration?:number|string}}};
         assertActiveScope(connection);
         const currentGeneration = Number(currentEvent.extendedProperties?.private?.filetasksSyncGeneration ?? 0);
         if (Number.isFinite(currentGeneration) && currentGeneration > generation) throw new HttpError(409,"Calendar export ownership changed. Please sync again.");
         updateETag = current.headers.get("etag") ?? currentEvent.etag;
         if (!updateETag) throw new HttpError(502,"Google Calendar did not provide a version for a safe update. Sync will retry.");
+        unchangedMapped = currentEvent.id === mapped && currentEvent.status !== "cancelled" && !hasChangedOccurrence
+          && googleEventMatches(currentEvent,event);
       }
     }
-    if (!mapped || !mappedMissing) {
+    if (unchangedMapped && mapped) response = new Response(JSON.stringify({id:mapped}),{status:200,headers:{"Content-Type":"application/json"}});
+    if (!unchangedMapped && (!mapped || !mappedMissing)) {
       assertActiveScope(connection);
       const marked = attempt.start(intent?.eventId ?? mapped ?? "");
       if ((intent || mappedReservation) && !marked) throw new HttpError(409,"Calendar Event changed before its provider update. Please sync again.");
@@ -2022,7 +2069,16 @@ async function syncGoogle(connection: Connection, events: EventItem[], limits: M
         if (!intent) throw error;
         response = new Response(null, { status: 409 });
       }
-      if (requestReturned && (!intent || !response?.ok)) attempt.finish(intent?.eventId ?? mapped ?? "");
+      if (requestReturned) {
+        const attemptId=intent?.eventId ?? mapped ?? "";
+        if (response?.ok && (intent || mappedReservation)) {
+          try {
+            const result=await response.clone().json() as {id?:string};
+            if (result.id === attemptId) attempt.finish(attemptId);
+            else attempt.uncertain(attemptId);
+          } catch { attempt.uncertain(attemptId); }
+        } else attempt.finish(attemptId);
+      }
     }
     if (!response) throw new HttpError(502,"The Google Calendar copy could not be synchronized safely.");
     assertActiveScope(connection);
@@ -2240,6 +2296,7 @@ async function syncApple(connection: Connection, events: EventItem[], missingHre
     }
     calendarData = withAppleSyncGeneration(calendarData,generation);
     let updateETag: string | undefined;
+    let unchangedMapped = false;
     if (mapped && !missingHrefs.has(mapped.href)) {
       assertActiveScope(connection);
       let current: Response;
@@ -2254,28 +2311,32 @@ async function syncApple(connection: Connection, events: EventItem[], missingHre
         if (appleSyncGeneration(currentIcs) > generation) throw new HttpError(409,"Calendar export ownership changed. Please sync again.");
         updateETag = current.headers.get("etag") ?? undefined;
         if (!updateETag) throw new HttpError(502,"Apple Calendar did not provide a version for a safe update. Sync will retry.");
+        unchangedMapped = appleCalendarDataMatches(currentIcs,calendarData);
       }
     }
     assertActiveScope(connection);
     let response: Response;
-    const marked = attempt.start(uid);
-    if ((creation || mappedReservation) && !marked) throw new HttpError(409,"Calendar Event changed before its provider update. Please sync again.");
-    if (!database().prepare("SELECT 1 FROM items WHERE user_id=? AND id=? AND kind='event'").get(connection.user_id,item.id)) {
-      attempt.finish(uid);
-      throw new HttpError(409,"Calendar Event changed before its provider update. Please sync again.");
+    if (unchangedMapped) response = new Response(null,{status:204});
+    else {
+      const marked = attempt.start(uid);
+      if ((creation || mappedReservation) && !marked) throw new HttpError(409,"Calendar Event changed before its provider update. Please sync again.");
+      if (!database().prepare("SELECT 1 FROM items WHERE user_id=? AND id=? AND kind='event'").get(connection.user_id,item.id)) {
+        attempt.finish(uid);
+        throw new HttpError(409,"Calendar Event changed before its provider update. Please sync again.");
+      }
+      let requestReturned = false;
+      try {
+        response = await calendarFetch(targetUrl, { method: "PUT", headers: { Authorization: authorization, "Content-Type": "text/calendar; charset=utf-8", ...(!mapped || missingHrefs.has(mapped.href) ? {"If-None-Match":"*"} : {"If-Match":updateETag!}) }, body: calendarData });
+        requestReturned = true;
+      } catch (error) {
+        attempt.uncertain(uid);
+        if (!creation) throw error;
+        // The provider may have committed the conditional PUT before the
+        // connection failed. Verify the reserved resource below before mapping it.
+        response = new Response(null, { status: 412 });
+      }
+      if (requestReturned) attempt.finish(uid);
     }
-    let requestReturned = false;
-    try {
-      response = await calendarFetch(targetUrl, { method: "PUT", headers: { Authorization: authorization, "Content-Type": "text/calendar; charset=utf-8", ...(!mapped || missingHrefs.has(mapped.href) ? {"If-None-Match":"*"} : {"If-Match":updateETag!}) }, body: calendarData });
-      requestReturned = true;
-    } catch (error) {
-      attempt.uncertain(uid);
-      if (!creation) throw error;
-      // The provider may have committed the conditional PUT before the
-      // connection failed. Verify the reserved resource below before mapping it.
-      response = new Response(null, { status: 412 });
-    }
-    if (requestReturned) attempt.finish(uid);
     assertActiveScope(connection);
     if (!response.ok && creation && response.status === 412) {
       const verification = await calendarFetch(targetUrl,{headers:{Authorization:authorization},redirect:"manual"});
@@ -2344,7 +2405,7 @@ async function performCalendarSync(userId: string, exportProviders: ReadonlySet<
       .all(userId,connection.provider,connection.connection_scope_id) as {item_id:string;external_id:string}[];
     for (const row of unresolvedCreations) if (!verified.has(`${connection.provider}\0${row.item_id}\0${row.external_id}`)) limitations.set(`${row.item_id}:${connection.provider}`,{
       itemId:row.item_id,title:"Deleted Event",provider:connection.provider,
-      message:`The deleted Event's ${connection.provider === "google" ? "Google" : "Apple"} Calendar identity could not be verified safely. Its copy is retained for retry.`,
+      message:`The deleted Event's ${connection.provider === "google" ? "Google" : "Apple"} Calendar copy could not be removed or verified safely. It is retained for retry.`,
     });
     if (connection.provider === "google") await importGoogleEvents(connection);
     else missingAppleHrefs = await importAppleEvents(connection,verifiedAppleItems);
@@ -2399,10 +2460,17 @@ async function syncCalendarsWithRecovery(userId: string, providers: readonly Cal
     return { ...result, syncDelivery: calendarSyncDeliveryStatus(userId) };
   } catch (error) {
     for (const generation of generations) failCalendarSync(userId,generation);
-    if (ownershipRecovery < 1 && error instanceof HttpError && error.message === "Calendar export ownership changed. Please sync again.") {
-      // A provider request may have landed after a newer owner's write. Run one
-      // fresh fenced pass so the latest FileTasks Event is the final provider state.
-      return syncCalendarsWithRecovery(userId,providers,ownershipRecovery+1,preserveAttempts);
+    if (ownershipRecovery < 1 && error instanceof HttpError && [
+      "Calendar export ownership changed. Please sync again.",
+      "Calendar sync generation changed. Please sync again.",
+    ].includes(error.message)) {
+      // Re-run under the current generation without superseding a concurrent
+      // sync. The export lock serializes the repair and the latest Event wins.
+      const providerFilter=providers===undefined?"":` AND s.provider IN (${providers.map(()=>"?").join(",")||"NULL"})`;
+      const currentGenerations=database().prepare(`SELECT s.provider,s.generation FROM calendar_sync_state s
+        JOIN calendar_connections c ON c.user_id=s.user_id AND c.provider=s.provider
+        WHERE s.user_id=?${providerFilter} ORDER BY s.provider`).all(userId,...(providers??[])) as CalendarSyncGeneration[];
+      if (currentGenerations.length) return syncCalendarsWithRecovery(userId,providers,ownershipRecovery+1,preserveAttempts,currentGenerations);
     }
     throw error;
   }

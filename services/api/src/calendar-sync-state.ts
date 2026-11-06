@@ -97,7 +97,7 @@ export function dueCalendarSyncUsers(currentTime = nowMs()) {
       JOIN calendar_sync_state s ON s.user_id=cc.user_id AND s.provider=cc.provider
       JOIN calendar_connections c ON c.user_id=cc.user_id AND c.provider=cc.provider AND c.connection_scope_id=cc.connection_scope_id
       WHERE s.state='synced' AND cc.next_attempt_at<=?
-    ORDER BY userId,provider`).all(currentTime,currentTime).map((row:any)=>({...row,cleanup:Boolean(row.cleanup)})) as DueCalendarSync[];
+    ORDER BY 1,2`).all(currentTime,currentTime).map((row:any)=>({...row,cleanup:Boolean(row.cleanup)})) as DueCalendarSync[];
 }
 
 /** Claim only the exact due snapshot. A second worker or a newer manual sync wins atomically. */
