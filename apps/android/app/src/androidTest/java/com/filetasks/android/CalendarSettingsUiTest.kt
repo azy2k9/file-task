@@ -6,11 +6,9 @@ import android.content.Intent
 import android.net.Uri
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
-import androidx.compose.ui.test.onNode
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onRoot
-import androidx.compose.ui.test.assertExists
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
@@ -117,8 +115,8 @@ class CalendarSettingsUiTest {
             .getString("calendarData").contains("URL:${apiUrl.trimEnd('/')}/?event=${imported.single().id}"))
 
         compose.onNodeWithText("Done").performClick()
-        compose.onNodeWithText("Android UI imported Apple Event").assertExists()
-        compose.onNode(hasText("Files", substring = true)).performClick()
+        check(compose.onAllNodes(hasText("Android UI imported Apple Event")).fetchSemanticsNodes().isNotEmpty())
+        compose.onNodeWithText("Files").performClick()
         compose.onNodeWithText("Add an external link").performClick()
         compose.onNodeWithText("Name").performTextInput("Imported Event notes")
         compose.onNodeWithText("Web link").performTextInput("https://example.com/imported-event-notes")
