@@ -4100,6 +4100,54 @@ test("Apple REPORT href with a different UID blocks overwrite", async () => {
   } finally { appleEvents.clear(); }
 });
 
+test("undated Event cleanup retains an Apple copy when an omitted resource fails identity verification", async () => {
+  const owner = await account();
+  await request("/api/calendars", {token: owner.token, method: "POST", body: {
+    username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
+  }});
+  const event = (await (await request("/api/items", {token: owner.token, method: "POST", body: {
+    kind: "event", title: "Keep unverified Apple identity", scheduledDate: "2027-02-14",
+  }})).json()).item;
+  const copy = [...appleEvents.entries()].find(([, ics]) => ics.includes(`URL:${base}/?event=${event.id}`));
+  assert.ok(copy, "the dated local Event should have an Apple copy");
+  const path = copy[0];
+  const original = copy[1];
+  const originalUid = original.match(/^UID:([^\r\n]+)/m)?.[1];
+  assert.ok(originalUid);
+  const changedIdentity = original.replace(/^UID:[^\r\n]+/m, "UID:unexpected-provider-event");
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  try {
+    appleEvents.set(path, changedIdentity);
+    omittedAppleReports.add(path);
+    providerRequests = [];
+    const cleared = await request(`/api/items/${event.id}`, {token: owner.token, method: "PATCH", body: {
+      scheduledDate: null, scheduledTime: null,
+    }});
+    assert.equal(cleared.status, 200);
+    assert.ok(providerRequests.some((entry) => entry.method === "GET" && entry.path === path),
+      "the omitted Apple resource should be fetched and checked");
+    assert.equal(providerRequests.some((entry) => entry.method === "DELETE" && entry.path === path), false,
+      "a resource whose UID differs from the tracked copy must not be deleted");
+    assert.equal(appleEvents.get(path), changedIdentity);
+    const mapping = db.prepare("SELECT external_id,resource_uid FROM calendar_copies WHERE user_id=? AND provider='apple' AND item_id=?")
+      .get(owner.user.id, event.id);
+    assert.ok(mapping, "the unverified Calendar copy identity must be retained");
+    assert.equal(mapping.resource_uid, originalUid);
+    const retained = (await (await request(`/api/items/${event.id}`, {token: owner.token})).json()).item;
+    assert.equal(retained.scheduledDate, null);
+    assert.ok(retained.calendarSync.some((status) => status.provider === "apple"
+      && status.state === "limited" && status.limitationCode === "unverifiable-event"),
+    "the undated Event should retain the identity-verification limitation");
+    assert.ok((await (await request("/api/calendars", {token: owner.token})).json()).syncDelivery
+      .some((status) => status.provider === "apple" && status.state === "failed"),
+    "cleanup must not report a provider sync as complete while identity is unknown");
+  } finally {
+    omittedAppleReports.delete(path);
+    appleEvents.clear();
+    db.close();
+  }
+});
+
 test("Apple connected first does not export before Google recurrence validation", async () => {
   const owner = await account();
   await request("/api/calendars", {token: owner.token, method: "POST", body: {username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`}});

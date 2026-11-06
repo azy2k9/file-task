@@ -1884,6 +1884,13 @@ async function syncApple(connection: Connection, events: EventItem[], missingHre
   };
   for (const [itemId, copy] of maps) if (!liveIds.has(itemId) && copy.scope === connection.connection_scope_id) {
     const item = events.find((entry) => entry.id === itemId);
+    const identityLimitation = item?.calendarSync.find((status) => status.provider === "apple"
+      && ["identity-mismatch","unverifiable-event","transient-verification"].includes(status.limitationCode ?? ""));
+    if (item && !item.scheduledDate && identityLimitation) {
+      const message = identityLimitation.limitation ?? "The Apple Calendar copy could not be verified. Its identity is retained while cleanup is paused.";
+      limits.set(`${itemId}:apple`,{itemId,title:"Deleted Event",provider:"apple",message});
+      continue;
+    }
     if (item && !item.scheduledDate && isUndatedImportedSourceCopy(connection,itemId,copy.uid)) {
       reportSyncLimitation(limits,item,"apple","This imported Event no longer has a schedule. Its original Apple Calendar copy is preserved, while other Calendar copies are removed.");
       continue;
