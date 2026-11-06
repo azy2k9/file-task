@@ -648,7 +648,12 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
         confirmDelete?.let { item ->
             AlertDialog(
                 onDismissRequest = { if (!working) confirmDelete = null },
-                title = { Text("Delete ${item.kind.displayName.lowercase()}?") },
+                title = {
+                    Text(
+                        "Delete ${item.kind.displayName.lowercase()}?",
+                        modifier = Modifier.testTag("item.delete.title"),
+                    )
+                },
                 text = {
                     Column {
                         Text("“${item.title}” will be removed from your workspace.")

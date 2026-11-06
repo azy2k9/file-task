@@ -176,13 +176,15 @@ class RecurringAgendaUiTest {
             }.isSuccess
         }
         deleteButton.performClick()
-        waitFor("the delete confirmation to appear") {
-            compose.onAllNodes(hasTestTag("item.delete.confirm"), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
+        waitFor("the delete confirmation dialog to appear") {
+            compose.onAllNodes(hasTestTag("item.delete.title")).fetchSemanticsNodes().isNotEmpty()
         }
-        compose.onNodeWithTag("item.delete.confirm", useUnmergedTree = true).performClick()
+        val confirmDelete = compose.onNodeWithTag("item.delete.confirm")
+        confirmDelete.assertIsDisplayed()
+        confirmDelete.performClick()
         waitFor("the deleted item and confirmation dialog to leave the agenda") {
-            compose.onAllNodes(hasTestTag("agenda.item.${item.id}"), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
-                && compose.onAllNodes(hasTestTag("item.delete.confirm"), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
+            compose.onAllNodes(hasTestTag("agenda.item.${item.id}")).fetchSemanticsNodes().isEmpty()
+                && compose.onAllNodes(hasTestTag("item.delete.title")).fetchSemanticsNodes().isEmpty()
         }
     }
 
