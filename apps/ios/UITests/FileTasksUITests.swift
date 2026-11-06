@@ -78,6 +78,8 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         let addDate = app.switches["Add date"]
         scrollToHittable(addDate, toward: .down, message: "The seeded Event's date toggle should be visible.")
         XCTAssertEqual(addDate.value as? String, "1", "The seeded Event should start with a date.")
+        // SwiftUI exposes the labelled Toggle row and a nested switch in
+        // accessibility. Tapping the row can leave the switch unchanged.
         let addDateSwitch = addDate.switches.firstMatch
         if addDateSwitch.exists {
             addDateSwitch.tap()

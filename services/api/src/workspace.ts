@@ -262,7 +262,9 @@ function withFiles(items: WorkspaceItem[], userId: string) {
       limitationCode = "recurrence-edited";
       limitation = "This imported Recurrence rule was edited in FileTasks. Calendar sync is paused until the original Recurrence representation can be preserved.";
     }
-    if (scheduleEdited && state === "supported") {
+    // Clearing an imported Event's date removes its provider copies; there is
+    // no shifted schedule to validate while the Event is intentionally undated.
+    if (scheduleEdited && item.scheduledDate && state === "supported") {
       const scheduleLimitation = importedScheduleLimitation(String(row.timing_json),item,row.provider === "apple");
       if (scheduleLimitation) {
         state = "limited";

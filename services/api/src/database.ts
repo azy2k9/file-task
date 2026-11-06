@@ -88,6 +88,15 @@ export function database() {
         last_error_code TEXT,
         PRIMARY KEY(user_id,provider)
       );
+      CREATE TABLE IF NOT EXISTS calendar_sync_authorization (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL CHECK(provider IN ('google','apple')),
+        connection_scope_id TEXT NOT NULL,
+        credential_generation_id TEXT NOT NULL,
+        last_error TEXT NOT NULL,
+        recorded_at INTEGER NOT NULL,
+        PRIMARY KEY(user_id,provider)
+      );
       CREATE TABLE IF NOT EXISTS calendar_copies (
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         provider TEXT NOT NULL CHECK(provider IN ('google','apple')),
