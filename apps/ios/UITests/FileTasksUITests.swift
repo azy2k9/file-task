@@ -127,25 +127,25 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
     private func openToolbarMenu(_ name: String, select itemName: String) {
         let menu = app.buttons[name]
         XCTAssertTrue(menu.waitForExistence(timeout: 10))
-        let menuItem = app.buttons[itemName]
-        let visibleFrame = NSPredicate { _, _ in
-            guard menuItem.exists else { return false }
-            let frame = menuItem.frame
-            return frame.origin.x.isFinite && frame.origin.y.isFinite && frame.width > 0 && frame.height > 0
-                && self.app.frame.intersects(frame)
+        let embeddedMenuButton = menu.buttons.firstMatch
+        if embeddedMenuButton.exists && embeddedMenuButton.isHittable {
+            embeddedMenuButton.tap()
+        } else {
+            menu.tap()
         }
-        var menuOpened = false
-        for _ in 0..<3 {
-            // SwiftUI exposes a labelled wrapper that can lack a hit point.
-            menu.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
-            let menuReady = XCTNSPredicateExpectation(predicate: visibleFrame, object: menuItem)
-            if XCTWaiter.wait(for: [menuReady], timeout: 5) == .completed {
-                menuOpened = true
-                break
-            }
+
+        let menuItem = app.menuItems[itemName]
+        let menuButton = app.buttons[itemName]
+        let menuActionReady = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            (menuItem.exists && menuItem.isHittable) || (menuButton.exists && menuButton.isHittable)
+        }, object: app)
+        XCTAssertEqual(XCTWaiter.wait(for: [menuActionReady], timeout: 10), .completed,
+                       "The \(itemName) menu item should be hittable. Accessibility hierarchy: \(app.debugDescription)")
+        if menuItem.exists && menuItem.isHittable {
+            menuItem.tap()
+        } else {
+            menuButton.tap()
         }
-        XCTAssertTrue(menuOpened, "The \(itemName) menu item should have a visible frame. Accessibility hierarchy: \(app.debugDescription)")
-        menuItem.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
     }
 
     private func signInInApp(email: String) {
