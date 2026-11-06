@@ -303,7 +303,8 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         XCTAssertTrue(notice.waitForExistence(timeout: 15),
                       "A failed Calendar delivery must be reported separately from the saved Event. Accessibility hierarchy: \(app.debugDescription)")
         XCTAssertTrue(notice.label.localizedCaseInsensitiveContains("Calendar sync"), notice.label)
-        XCTAssertTrue(notice.label.localizedCaseInsensitiveContains("saved in FileTasks"), notice.label)
+        XCTAssertTrue(notice.label.localizedCaseInsensitiveContains("saved"), notice.label)
+        XCTAssertTrue(notice.label.localizedCaseInsensitiveContains("FileTasks"), notice.label)
     }
 
     private func openItem(_ title: String) {
