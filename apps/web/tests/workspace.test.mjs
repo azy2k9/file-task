@@ -25,6 +25,10 @@ let deliveryBase;
 let deliveryRequests = [];
 let deliveredKeys = new Set();
 let failNextEmail = 0;
+let failNextPushRevoke = 0;
+let holdNextPushRevoke = null;
+let pushRegistrationIds = new Map();
+let activePushRegistrations = new Set();
 let failNextGoogleRequest = null;
 let failNextAppleRequest = null;
 let loseNextGooglePostResponse = false;
@@ -413,6 +417,10 @@ async function startDeliveryFakeDuringSetup(setup) {
   deliveryRequests = [];
   deliveredKeys = new Set();
   failNextEmail = 0;
+  failNextPushRevoke = 0;
+  holdNextPushRevoke = null;
+  pushRegistrationIds = new Map();
+  activePushRegistrations = new Set();
   failNextGoogleRequest = null;
   failNextAppleRequest = null;
   providerRequests = [];
@@ -464,6 +472,20 @@ async function startDeliveryFakeDuringSetup(setup) {
     if (url.pathname === "/email" && body.operation === "deliver" && failNextEmail > 0) {
       failNextEmail--;
       response.writeHead(503).end();
+      return;
+    }
+    if (url.pathname === "/push" && body.operation === "revoke" && failNextPushRevoke > 0) {
+      failNextPushRevoke--;
+      response.writeHead(503).end();
+      return;
+    }
+    if (url.pathname === "/push" && body.operation === "revoke" && holdNextPushRevoke) {
+      const gate = holdNextPushRevoke;
+      holdNextPushRevoke = null;
+      gate.started();
+      await gate.releasePromise;
+      activePushRegistrations.delete(body.registrationId);
+      response.writeHead(200).end();
       return;
     }
     if (url.pathname === "/google-token") {
@@ -592,6 +614,16 @@ async function startDeliveryFakeDuringSetup(setup) {
         response.writeHead(204).end();
         return;
       }
+    }
+    if (url.pathname === "/push" && body.operation === "register") {
+      let registrationId = pushRegistrationIds.get(idempotencyKey);
+      if (!registrationId) {
+        registrationId = `fake-${crypto.randomUUID()}`;
+        pushRegistrationIds.set(idempotencyKey, registrationId);
+      }
+      activePushRegistrations.add(registrationId);
+      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ registrationId }));
+      return;
     }
     if (body.operation === "register") {
       response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ registrationId: `fake-${crypto.randomUUID()}` }));
@@ -1283,9 +1315,120 @@ test("Email and push deliveries retry with a stable idempotency key and can be r
   assert.equal(deliveredKeys.size, 2);
 
   assert.equal((await request(`/api/devices/push/${device.id}`, { token: owner.token, method: "DELETE" })).status, 204);
+  const cleanupDb = new DatabaseSync(join(directory, "workspace.sqlite"));
+  assert.equal(cleanupDb.prepare("SELECT count(*) AS count FROM push_cleanup_jobs").get().count, 1,
+    "revocation should be durably queued before provider cleanup runs");
+  cleanupDb.close();
+  await runReminderWorker();
   assert.equal(deliveryRequests.some(({ body }) => body.operation === "revoke" && body.registrationId), true);
   assert.equal((await request(`/api/devices/push/${device.id}`, { token: owner.token, method: "DELETE" })).status, 404);
   assert.equal(item.kind, "event");
+});
+
+test("push revoke is durable during provider outages and remains scoped to the signed-out device", async () => {
+  const owner = await account();
+  const providerStart = providerRequests.length;
+  const anotherSession = await request("/api/auth/login", { method: "POST", body: {
+    email: owner.user.email, password: "correct-horse-battery",
+  } });
+  const otherSession = await anotherSession.json();
+  const otherAccount = await account();
+  await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: { pushEnabled: true } });
+  await request("/api/settings/reminders", { token: otherAccount.token, method: "PATCH", body: { pushEnabled: true } });
+  const revokedResponse = await request("/api/devices/push", { token: owner.token, method: "POST", body: {
+    platform: "ios", token: `revoked-${crypto.randomUUID()}`,
+  } });
+  const retainedResponse = await request("/api/devices/push", { token: owner.token, method: "POST", body: {
+    platform: "ios", token: `retained-${crypto.randomUUID()}`,
+  } });
+  const otherDeviceResponse = await request("/api/devices/push", { token: otherAccount.token, method: "POST", body: {
+    platform: "android", token: `other-${crypto.randomUUID()}`,
+  } });
+  const revoked = (await revokedResponse.json()).device;
+  const retained = (await retainedResponse.json()).device;
+  const otherDevice = (await otherDeviceResponse.json()).device;
+  const beforeRevokeDb = new DatabaseSync(join(directory, "workspace.sqlite"));
+  const revokedRegistrationId = beforeRevokeDb.prepare("SELECT provider_id AS providerId FROM push_devices WHERE id=?").get(revoked.id).providerId;
+  const retainedRegistrationId = beforeRevokeDb.prepare("SELECT provider_id AS providerId FROM push_devices WHERE id=?").get(retained.id).providerId;
+  const otherRegistrationId = beforeRevokeDb.prepare("SELECT provider_id AS providerId FROM push_devices WHERE id=?").get(otherDevice.id).providerId;
+  beforeRevokeDb.close();
+
+  await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "task", title: "Push after sign-out", scheduledDate: "2020-02-03",
+    reminders: [{ delivery: "notification", amount: 0, unit: "days", time: "10:00" }],
+  } });
+  failNextPushRevoke = 1;
+  const revoke = await request(`/api/devices/push/${revoked.id}`, { token: owner.token, method: "DELETE" });
+  assert.equal(revoke.status, 204, "provider availability must not block local revocation");
+  assert.equal((await request("/api/auth/logout", { token: owner.token, method: "POST" })).status, 204);
+  assert.equal((await request("/api/items", { token: owner.token })).status, 401);
+  assert.equal((await request("/api/items", { token: otherSession.token })).status, 200,
+    "signing out one session must leave another session for the same account valid");
+  assert.equal((await request("/api/items", { token: otherAccount.token })).status, 200);
+
+  await runReminderWorker();
+  const pushCalls = providerRequests.slice(providerStart).filter(({ path }) => path === "/push");
+  const ownerDeliveries = pushCalls.filter(({ body }) => body.operation === "deliver");
+  assert.ok(ownerDeliveries.some(({ body }) => body.registrationId === retainedRegistrationId), "the still-registered device should continue receiving sends");
+  assert.equal(ownerDeliveries.some(({ body }) => body.registrationId === revokedRegistrationId), false,
+    "the revoked device must not receive a newly scheduled send");
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  assert.equal(db.prepare("SELECT count(*) AS count FROM push_devices WHERE id=?").get(revoked.id).count, 0);
+  assert.equal(db.prepare("SELECT count(*) AS count FROM push_devices WHERE provider_id=?").get(otherRegistrationId).count, 1,
+    "another account's registered device should remain unaffected");
+  assert.equal(db.prepare("SELECT count(*) AS count FROM push_cleanup_jobs").get().count, 1,
+    "failed provider cleanup must remain durable after the sign-out bearer is invalidated");
+  db.close();
+
+  await stopServer();
+  await stopDeliveryFake();
+  await startDeliveryFake();
+  await startServer();
+  await advanceTestClock(1_100);
+  await runReminderWorker();
+  const recoveredCleanup = providerRequests.find(({ body }) => body.operation === "revoke");
+  assert.equal(recoveredCleanup?.body.registrationId, revokedRegistrationId,
+    "the restarted worker should recover the right cleanup without the signed-out bearer token");
+  const restartedDb = new DatabaseSync(join(directory, "workspace.sqlite"));
+  assert.equal(restartedDb.prepare("SELECT count(*) AS count FROM push_cleanup_jobs").get().count, 0);
+  restartedDb.close();
+  assert.equal(otherDevice.platform, "android");
+  assert.equal(retained.platform, "ios");
+});
+
+test("a concurrent re-registration survives an in-flight push cleanup", async () => {
+  const owner = await account();
+  const registration = { platform: "ios", token: `reused-${crypto.randomUUID()}` };
+  const firstResponse = await request("/api/devices/push", { token: owner.token, method: "POST", body: registration });
+  const firstDevice = (await firstResponse.json()).device;
+  const firstDb = new DatabaseSync(join(directory, "workspace.sqlite"));
+  const registrationId = firstDb.prepare("SELECT provider_id AS providerId FROM push_devices WHERE id=?").get(firstDevice.id).providerId;
+  firstDb.close();
+  assert.equal((await request(`/api/devices/push/${firstDevice.id}`, { token: owner.token, method: "DELETE" })).status, 204);
+
+  let signalRevokeStarted;
+  let finishRevoke;
+  const revokeStarted = new Promise((resolve) => { signalRevokeStarted = resolve; });
+  const revokeRelease = new Promise((resolve) => { finishRevoke = resolve; });
+  holdNextPushRevoke = { started: signalRevokeStarted, releasePromise: revokeRelease };
+  const cleanupPromise = runReminderWorker();
+  await revokeStarted;
+
+  const reRegistrationPromise = request("/api/devices/push", { token: owner.token, method: "POST", body: registration });
+  await delay(100);
+  finishRevoke();
+  assert.equal((await cleanupPromise).status, 200);
+  const reRegistration = await reRegistrationPromise;
+  assert.equal(reRegistration.status, 201);
+
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  const currentRegistration = db.prepare("SELECT provider_id AS providerId FROM push_devices WHERE user_id=?").get(owner.user.id);
+  assert.equal(currentRegistration.providerId, registrationId);
+  assert.equal(activePushRegistrations.has(registrationId), true,
+    "registration must be restored after a cleanup request that was already in flight");
+  assert.equal(db.prepare("SELECT count(*) AS count FROM push_cleanup_jobs WHERE registration_id=?").get(registrationId).count, 0);
+  assert.equal(db.prepare("SELECT count(*) AS count FROM push_cleanup_completed WHERE registration_id=?").get(registrationId).count, 0);
+  db.close();
 });
 
 test("long-lead Reminders extend rolling Occurrence materialization beyond the former horizon", async () => {
