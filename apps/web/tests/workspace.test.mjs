@@ -2487,7 +2487,8 @@ test("editing the first Occurrence locally preserves its recurrence definition a
     assert.equal(unchangedLater.scheduledTime, "08:00");
     assert.deepEqual(unchangedLater.reminders, [{ delivery: "notification", amount: 1, unit: "days", time: "09:00" }]);
     assert.deepEqual(unchangedLater.files.map(({ id }) => id), [file.id]);
-    assert.ok(series.some(({ scheduledDate }) => scheduledDate === "2026-11-01"), "the moved first Occurrence must not reanchor the original series");
+    assert.ok(series.some(({ id, occurrenceDate }) => id === root.id && occurrenceDate === "2026-11-01"),
+      "the moved first Occurrence keeps its original recurrence identity");
 
     await setTestClock(previousClock.getTime() + 372 * 86_400_000);
     series = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === root.id);
@@ -2510,7 +2511,7 @@ test("turning an existing item into a recurrence creates its generation definiti
   assert.equal(created.status, 201);
   const item = (await created.json()).item;
   const updated = await request(`/api/items/${item.id}`, { token: owner.token, method: "PATCH", body: {
-    recurrence: { interval: 1, unit: "days", end: { type: "after", count: 3 } },
+    recurrence: { interval: 1, unit: "days", end: { type: "count", count: 3 } },
   } });
   assert.equal(updated.status, 200, await updated.clone().text());
   let items = (await (await request("/api/items", { token: owner.token })).json()).items;

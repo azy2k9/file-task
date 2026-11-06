@@ -477,7 +477,7 @@ function saveItemInTransaction(userId: string, body: Record<string, unknown>, id
         .run(userId,series,userId,series,userId,series);
     }
     const wholeSeries = scope === "series" || (scope === "following" && id === series);
-    const root = db.prepare("SELECT scheduled_date FROM items WHERE user_id=? AND id=?").get(userId,series);
+    const root = db.prepare("SELECT scheduled_date,scheduled_time FROM items WHERE user_id=? AND id=?").get(userId,series);
     const scheduleUnchanged = item.scheduledDate === existing?.scheduledDate && item.scheduledTime === existing?.scheduledTime;
     const recurrenceUnchanged = sameRecurrence(existing?.recurrence ?? null,item.recurrence);
     const preservesOccurrenceIdentity = scope === "series" && scheduleUnchanged && recurrenceUnchanged;
@@ -524,7 +524,9 @@ function saveItemInTransaction(userId: string, body: Record<string, unknown>, id
     }
     if (scope === "series" || (scope === "following" && id === series)) {
       for (const target of targets) db.prepare("UPDATE items SET occurrence_recurrence_json=NULL WHERE user_id=? AND id=?").run(userId,target.id);
-      saveSeriesDefinition(userId,series,item);
+      saveSeriesDefinition(userId,series,preservesOccurrenceIdentity
+        ? {...item,scheduledDate:String(root?.scheduled_date ?? item.scheduledDate),scheduledTime:root?.scheduled_time == null ? null : String(root.scheduled_time)}
+        : item);
     }
     if (item.recurrence) ensureOccurrences(userId);
     return getItem(userId, id);
@@ -615,6 +617,8 @@ function deleteItemInTransaction(userId: string, id: string, scope?: unknown) {
   const shortened: RecurrenceRule = { ...rule, end: { type: "date", date: String(previous.occurrence_date) } };
   db.prepare("UPDATE items SET recurrence_json=?,updated_at=? WHERE user_id=? AND id=?")
     .run(JSON.stringify(shortened), new Date().toISOString(), userId, rootId);
+  db.prepare("UPDATE item_series_definitions SET recurrence_json=? WHERE user_id=? AND series_root_id=?")
+    .run(JSON.stringify(shortened), userId, rootId);
   db.prepare("DELETE FROM items WHERE user_id=? AND series_root_id=? AND occurrence_date>=?").run(userId, rootId, selectedDate);
 }
 
