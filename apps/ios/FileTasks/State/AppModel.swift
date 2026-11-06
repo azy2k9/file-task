@@ -145,6 +145,11 @@ final class AppModel: ObservableObject {
             guard isCurrent(context) else { throw APIClientError.sessionChanged }
             upsert(saved)
             errorMessage = nil
+            // The mutation response describes the saved item, but scoped edits and
+            // recurring saves can change many server-generated Occurrences. Reload
+            // the authoritative agenda while preserving the saved response if that
+            // follow-up request fails.
+            await refreshItems(using: context)
             if draft.kind == .event {
                 await refreshCalendarSyncDelivery(using: context, outcome: .saved)
             }

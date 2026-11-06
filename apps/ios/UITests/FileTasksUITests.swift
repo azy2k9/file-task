@@ -49,6 +49,26 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         openItem("UI Runner No Reminders")
         assertNoReminders()
         cancelEditor()
+
+        createRecurringItem(kind: "Task", title: "UI Runner Recurring Task")
+        editOccurrence(
+            title: "UI Runner Recurring Task",
+            index: 1,
+            newTitle: "UI Runner Following Task",
+            scope: "This and following Occurrences"
+        )
+        assertOccurrenceRows(title: "UI Runner Recurring Task", atLeast: 1)
+        assertOccurrenceRows(title: "UI Runner Following Task", atLeast: 2)
+        editOccurrence(
+            title: "UI Runner Following Task",
+            index: 0,
+            newTitle: "UI Runner Whole Series Task",
+            scope: "Whole series"
+        )
+        assertOccurrenceRows(title: "UI Runner Recurring Task", atLeast: 1)
+        assertOccurrenceRows(title: "UI Runner Whole Series Task", atLeast: 2)
+
+        createRecurringItem(kind: "Event", title: "UI Runner Recurring Event")
     }
 
     private func configureLocalServerInApp() {
@@ -296,6 +316,87 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
 
     private func saveCurrentItem() {
         app.buttons["Save"].tap()
+    }
+
+    private func createRecurringItem(kind: String, title: String) {
+        startNewItem(kind: kind)
+        setTitle(title)
+
+        let addDate = element(identifier: "itemEditor.schedule.includesDate")
+        scrollToHittable(addDate, toward: .down, message: "A recurring item needs a schedule date.")
+        if (addDate.value as? String) != "1" { addDate.tap() }
+
+        let repeatToggle = element(identifier: "itemEditor.recurrence.enabled")
+        scrollToHittable(repeatToggle, toward: .down, message: "The editor should offer a Recurrence rule after adding a date.")
+        if (repeatToggle.value as? String) != "1" { repeatToggle.tap() }
+
+        let intervalPicker = element(identifier: "itemEditor.recurrence.interval")
+        scrollToHittable(intervalPicker, toward: .down)
+        intervalPicker.tap()
+        let daysOption = app.buttons["Days"]
+        XCTAssertTrue(daysOption.waitForExistence(timeout: 5), "The shared recurrence editor should offer a daily interval.")
+        daysOption.tap()
+
+        let endPicker = element(identifier: "itemEditor.recurrence.endType")
+        scrollToHittable(endPicker, toward: .down)
+        endPicker.tap()
+        let countOption = app.buttons["After occurrences"]
+        XCTAssertTrue(countOption.waitForExistence(timeout: 5), "The shared recurrence editor should offer an occurrence count.")
+        countOption.tap()
+
+        let countStepper = element(identifier: "itemEditor.recurrence.count")
+        scrollToHittable(countStepper, toward: .down)
+        let decrement = countStepper.buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", "Decrement")).firstMatch
+        XCTAssertTrue(decrement.exists, "The recurrence count should be editable in the real item editor.")
+        let displayedCount = countStepper.value as? String ?? countStepper.label
+        let count = displayedCount.components(separatedBy: CharacterSet.decimalDigits.inverted)
+            .compactMap(Int.init).last ?? 0
+        for _ in 0..<max(0, count - 3) { decrement.tap() }
+        let savedCount = (countStepper.value as? String ?? countStepper.label)
+            .components(separatedBy: CharacterSet.decimalDigits.inverted).compactMap(Int.init).last
+        XCTAssertEqual(savedCount, 3, "The recurring series should contain three upcoming Occurrences.")
+
+        saveCurrentItem()
+        let editor = app.navigationBars["Create \(kind)"]
+        let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: editor)
+        XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 30), .completed,
+                       "A successful recurring save should close the editor after refreshing the agenda. Accessibility hierarchy: \(app.debugDescription)")
+        assertOccurrenceRows(title: title, atLeast: 2)
+    }
+
+    private func editOccurrence(title: String, index: Int, newTitle: String, scope: String) {
+        let matchingRows = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", title))
+        let selectedRow = matchingRows.element(boundBy: index)
+        scrollToHittable(selectedRow, toward: .down, maxSwipes: 12,
+                         message: "The requested saved Occurrence should be available for a scoped edit.")
+        selectedRow.tap()
+        XCTAssertTrue(app.navigationBars["Edit Task"].waitForExistence(timeout: 5),
+                      "Tapping a recurring Task Occurrence should open the real editor.")
+        setTitle(newTitle)
+
+        let scopePicker = element(identifier: "itemEditor.scope")
+        scrollToHittable(scopePicker, toward: .down)
+        scopePicker.tap()
+        let scopeOption = app.buttons[scope]
+        XCTAssertTrue(scopeOption.waitForExistence(timeout: 5), "The editor should offer the requested recurring edit scope.")
+        scopeOption.tap()
+        saveCurrentItem()
+
+        let editor = app.navigationBars["Edit Task"]
+        let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: editor)
+        XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 30), .completed,
+                       "A successful scoped save should close the editor after refreshing every affected Occurrence.")
+    }
+
+    private func assertOccurrenceRows(title: String, atLeast count: Int) {
+        let rows = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", title))
+        let secondRow = rows.element(boundBy: 1)
+        if count > 1 {
+            scrollToHittable(secondRow, toward: .down, maxSwipes: 12,
+                             message: "The refreshed agenda should show more than one saved Occurrence titled \(title).")
+        }
+        XCTAssertGreaterThanOrEqual(rows.count, count,
+                                    "The real iOS agenda should show at least \(count) server-generated Occurrences titled \(title). Accessibility hierarchy: \(app.debugDescription)")
     }
 
     private func assertCalendarDeliveryNotice() {

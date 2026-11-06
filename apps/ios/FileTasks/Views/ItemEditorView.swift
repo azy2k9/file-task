@@ -96,6 +96,7 @@ struct ItemEditorView: View {
 
                 Section {
                     Toggle("Add date", isOn: $includesDate)
+                        .accessibilityIdentifier("itemEditor.schedule.includesDate")
                         .onChange(of: includesDate) { isEnabled in
                             if !isEnabled { includesTime = false }
                         }
@@ -125,6 +126,7 @@ struct ItemEditorView: View {
                             } else { recurrence = nil }
                         }
                     ))
+                    .accessibilityIdentifier("itemEditor.recurrence.enabled")
                     .disabled(!includesDate)
                 if let rule = recurrence {
                         Stepper("Every \(rule.interval)", value: Binding(
@@ -140,6 +142,7 @@ struct ItemEditorView: View {
                         )) {
                             ForEach(RecurrenceUnit.allCases) { unit in Text(unit.rawValue.capitalized).tag(unit) }
                         }
+                        .accessibilityIdentifier("itemEditor.recurrence.interval")
                         if rule.unit == .weeks {
                             HStack {
                                 ForEach(0..<7, id: \.self) { weekday in
@@ -159,10 +162,12 @@ struct ItemEditorView: View {
                             Text("On date").tag("date")
                             Text("After occurrences").tag("count")
                         }
+                        .accessibilityIdentifier("itemEditor.recurrence.endType")
                         if recurrenceEndType == "date" {
                             DatePicker("End date", selection: $recurrenceEndDate, displayedComponents: .date)
                         } else if recurrenceEndType == "count" {
                             Stepper("Occurrences: \(recurrenceCount)", value: $recurrenceCount, in: 1...10_000)
+                                .accessibilityIdentifier("itemEditor.recurrence.count")
                         }
                     }
                 }
@@ -172,6 +177,7 @@ struct ItemEditorView: View {
                         Picker("Edit scope", selection: $scope) {
                             ForEach(EditScope.allCases) { option in Text(option.title).tag(option) }
                         }
+                        .accessibilityIdentifier("itemEditor.scope")
                     }
                 }
 

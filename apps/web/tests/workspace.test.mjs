@@ -3067,6 +3067,17 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, save/re
   assert.equal(noRemindersEvent.kind, "event");
   assert.deepEqual(noRemindersEvent.reminders, []);
 
+  const recurringTaskRows = items.filter(({ title }) => title === "UI Runner Whole Series Task");
+  assert.equal(recurringTaskRows.length, 2, "The iOS scoped saves should leave both affected Task Occurrences in the shared API.");
+  assert.ok(recurringTaskRows.every(({ recurrence }) => recurrence?.end?.type === "count" && recurrence.end.count === 2),
+    "The refreshed Task rows should retain the server-generated two-Occurrence Recurrence rule.");
+  assert.equal(items.filter(({ title }) => title === "UI Runner Recurring Task").length, 1,
+    "The unrelated earlier Task Occurrence should retain its original value.");
+  assert.equal(items.filter(({ title }) => title === "UI Runner Following Task").length, 0,
+    "The following series edit should update both affected loaded rows.");
+  assert.equal(items.filter(({ title }) => title === "UI Runner Recurring Event").length, 3,
+    "The iOS-created Event should be visible with its server-generated Occurrences.");
+
   uiAcceptanceBrowser = await launchUIAcceptanceBrowser();
   try {
     uiAcceptanceContext = await createUIAcceptanceContext(uiAcceptanceBrowser);
@@ -3082,6 +3093,10 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, save/re
       await expect(page.getByRole("heading", { name: noRemindersTitle, exact: true }).first()).toBeVisible();
       await page.getByRole("button", { name: "Tasks", exact: true }).click();
       await expect(page.getByRole("heading", { name: reverseTaskTitle, exact: true }).first()).toBeVisible();
+      await expect(page.getByRole("heading", { name: "UI Runner Recurring Task", exact: true })).toHaveCount(1);
+      await expect(page.getByRole("heading", { name: "UI Runner Whole Series Task", exact: true })).toHaveCount(2);
+      await page.getByRole("button", { name: "Events", exact: true }).click();
+      await expect(page.getByRole("heading", { name: "UI Runner Recurring Event", exact: true })).toHaveCount(3);
     } finally {
       await closeUIAcceptanceContext();
     }
