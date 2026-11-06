@@ -123,25 +123,18 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
     private func openToolbarMenu(_ name: String, select itemName: String) {
         let menu = app.buttons[name]
         XCTAssertTrue(menu.waitForExistence(timeout: 10))
-        let menuItem = app.buttons[itemName]
-        let visibleFrame = NSPredicate { _, _ in
-            guard menuItem.exists else { return false }
-            let frame = menuItem.frame
-            return frame.origin.x.isFinite && frame.origin.y.isFinite && frame.width > 0 && frame.height > 0
-                && self.app.frame.intersects(frame)
-        }
-        var menuOpened = false
-        for _ in 0..<3 {
-            // SwiftUI exposes a labelled wrapper that can lack a hit point.
-            menu.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
-            let menuReady = XCTNSPredicateExpectation(predicate: visibleFrame, object: menuItem)
-            if XCTWaiter.wait(for: [menuReady], timeout: 5) == .completed {
-                menuOpened = true
-                break
-            }
-        }
-        XCTAssertTrue(menuOpened, "The \(itemName) menu item should have a visible frame. Accessibility hierarchy: \(app.debugDescription)")
-        menuItem.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        menu.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+
+        let menuItem = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == %@", itemName))
+            .firstMatch
+        let menuItemReady = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true AND hittable == true"),
+            object: menuItem
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [menuItemReady], timeout: 10), .completed,
+                       "The \(itemName) menu item should be hittable. Accessibility hierarchy: \(app.debugDescription)")
+        menuItem.tap()
     }
 
     private func signInInApp(email: String) {
