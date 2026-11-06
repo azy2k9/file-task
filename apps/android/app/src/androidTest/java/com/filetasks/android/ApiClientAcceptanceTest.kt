@@ -109,6 +109,7 @@ class ApiClientAcceptanceTest {
             title = "Undated Android Event $namespace",
             details = "Keep its File",
             scheduledDate = "2026-11-04",
+            scheduledTime = null,
         ))
         api.attachFile(token, file, rememberedEvent)
         val undatedEvent = api.updateItem(token, rememberedEvent, ItemFields(
