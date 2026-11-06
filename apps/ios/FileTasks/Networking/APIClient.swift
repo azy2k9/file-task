@@ -68,12 +68,30 @@ struct APIClient {
         return response.settings
     }
 
-    func calendarSyncDelivery(token: String) async throws -> [CalendarSyncDeliveryStatus] {
-        let response: CalendarSyncDeliveryResponse = try decode(
-            CalendarSyncDeliveryResponse.self,
+    func calendarStatus(token: String) async throws -> CalendarStatus {
+        try decode(
+            CalendarStatus.self,
             from: try await perform(path: ["api", "calendars"], method: "GET", token: token)
         )
-        return response.syncDelivery
+    }
+
+    func connectAppleCalendar(username: String, password: String, calendarURL: String?, token: String) async throws {
+        let payload = AppleCalendarPayload(username: username, password: password, calendarUrl: calendarURL)
+        _ = try await perform(
+            path: ["api", "calendars"], method: "POST", token: token,
+            body: try encoder.encode(payload)
+        )
+    }
+
+    func disconnectCalendar(provider: String, token: String) async throws {
+        _ = try await perform(path: ["api", "calendars", provider], method: "DELETE", token: token)
+    }
+
+    func syncCalendars(token: String) async throws -> CalendarSyncResult {
+        try decode(
+            CalendarSyncResult.self,
+            from: try await perform(path: ["api", "calendars", "sync"], method: "POST", token: token)
+        )
     }
 
     func updateReminderSettings(_ settings: ReminderSettings, token: String, applyToExisting: Bool) async throws -> ReminderSettings {
@@ -246,6 +264,9 @@ struct APIClient {
         do {
             (data, response) = try await session.data(for: request)
         } catch {
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                throw APIClientError.cancelled
+            }
             throw APIClientError.transport(error.localizedDescription)
         }
 
@@ -308,7 +329,11 @@ private struct CompletionPayload: Encodable {
 
 private struct FilesResponse: Decodable { let files: [WorkspaceFile] }
 private struct ReminderSettingsResponse: Decodable { let settings: ReminderSettings }
-private struct CalendarSyncDeliveryResponse: Decodable { let syncDelivery: [CalendarSyncDeliveryStatus] }
+private struct AppleCalendarPayload: Encodable {
+    let username: String
+    let password: String
+    let calendarUrl: String?
+}
 private struct ReminderSettingsPayload: Encodable {
     let taskReminders: [ReminderRule]
     let eventReminders: [ReminderRule]
@@ -326,13 +351,14 @@ private struct LinkFilePayload: Encodable { let name: String; let url: String }
 private struct UploadPayload: Encodable { let name: String; let contentType: String; let sizeBytes: Int }
 private struct AttachmentPayload: Encodable { let itemId: String; let scope: String }
 
-enum APIClientError: LocalizedError {
+enum APIClientError: LocalizedError, Equatable {
     case transport(String)
     case invalidResponse
     case invalidPayload(String)
     case httpStatus(Int, String?)
     case missingToken
     case sessionChanged
+    case cancelled
 
     var statusCode: Int? {
         if case let .httpStatus(code, _) = self { return code }
@@ -353,6 +379,8 @@ enum APIClientError: LocalizedError {
             return "Your sign-in has expired. Sign in again to continue."
         case .sessionChanged:
             return "Your sign-in changed before this request finished. Try again."
+        case .cancelled:
+            return "The calendar request was cancelled."
         }
     }
 }

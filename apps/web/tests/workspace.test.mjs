@@ -455,7 +455,8 @@ async function startDeliveryFakeDuringSetup(setup) {
     providerRequests.push({ path: url.pathname, method: request.method, body, text: bodyText, query: url.search, headers: request.headers });
     const idempotencyKey = request.headers["idempotency-key"];
     deliveryRequests.push({ path: request.url, body, idempotencyKey });
-    if (failNextGoogleRequest?.path === url.pathname && failNextGoogleRequest.method === request.method) {
+    if (failNextGoogleRequest?.path === url.pathname && failNextGoogleRequest.method === request.method
+      && (!failNextGoogleRequest.summary || failNextGoogleRequest.summary === body.summary)) {
       const { status = 503 } = failNextGoogleRequest;
       failNextGoogleRequest = null;
       response.writeHead(status).end();
@@ -2846,7 +2847,7 @@ test("interruption closes setup admission and waits for an in-flight setup to se
   assert.equal(cleanupFinished, true);
 });
 
-test("iOS UI acceptance: registration, cross-type Reminder preservation, save/reopen and browser read", {
+test("iOS UI acceptance: registration, cross-type Reminder preservation, calendar sync and browser read", {
   skip: process.env.FILETASKS_RUN_IOS_UI_ACCEPTANCE !== "1",
 }, async () => {
   await setTestClock("2026-10-13T12:00:00.000Z");
@@ -2877,7 +2878,50 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, save/re
   assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
     cookie: authorization.cookie, redirect: "manual",
   })).status, 303);
-  failNextGoogleRequest = { method: "POST", path: "/google/calendar/v3/calendars/primary/events", status: 503 };
+
+  googleEvents.set("native-imported-google-event", {
+    id: "native-imported-google-event",
+    summary: "Native imported Google Event",
+    description: "Shared fake provider import",
+    start: { date: "2026-10-20" },
+    end: { date: "2026-10-21" },
+  });
+  const calendarEventTitle = "Native calendar sync authority";
+  const missingCopyTitle = "Native calendar missing copy";
+  const firstEventResponse = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: calendarEventTitle, details: "FileTasks-owned details", scheduledDate: "2026-10-14", scheduledTime: "10:30",
+  } });
+  assert.equal(firstEventResponse.status, 201);
+  const firstEvent = (await firstEventResponse.json()).item;
+  const importedItems = (await (await request("/api/items", { token: owner.token })).json()).items;
+  const importedEvent = importedItems.find(({ title }) => title === "Native imported Google Event");
+  assert.ok(importedEvent, "the shared Google fake should import an Event into FileTasks");
+  const secondEventResponse = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: missingCopyTitle, details: "Restore the deleted provider copy", scheduledDate: "2026-10-15", scheduledTime: "11:00",
+  } });
+  assert.equal(secondEventResponse.status, 201);
+  const secondEvent = (await secondEventResponse.json()).item;
+  const contextFileResponse = await request("/api/files", { token: owner.token, method: "POST", body: {
+    name: "Native calendar sync notes", url: "https://example.com/calendar-notes.pdf",
+  } });
+  assert.equal(contextFileResponse.status, 201);
+  const contextFile = (await contextFileResponse.json()).file;
+  assert.equal((await request(`/api/files/${contextFile.id}/attachments`, {
+    token: owner.token, method: "POST", body: { itemId: importedEvent.id },
+  })).status, 201);
+
+  const editedCopy = [...googleEvents.entries()].find(([, event]) => event.summary === calendarEventTitle);
+  const deletedCopy = [...googleEvents.entries()].find(([, event]) => event.summary === missingCopyTitle);
+  assert.ok(editedCopy, "the shared Google fake should contain the first FileTasks Calendar copy");
+  assert.ok(deletedCopy, "the shared Google fake should contain the second FileTasks Calendar copy");
+  googleEvents.set(editedCopy[0], { ...editedCopy[1], summary: "Provider changed this title", description: "Provider changed these details" });
+  googleEvents.delete(deletedCopy[0]);
+
+  failNextGoogleRequest = {
+    method: "POST", path: "/google/calendar/v3/calendars/primary/events", status: 503,
+    summary: "UI Runner Event Default",
+  };
+  failNextAppleRequest = { method: "PROPFIND", path: "/apple/calendar/", status: 503 };
 
   const simulatorId = process.env.FILETASKS_IOS_UI_SIMULATOR_ID;
   assert.ok(simulatorId, "The focused runner must create and pass a disposable iOS Simulator id.");
@@ -2891,12 +2935,32 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, save/re
       "-parallel-testing-enabled", "NO",
       // Simulator ad hoc signing supplies the app's Keychain entitlements.
       "test",
-    ], process.env, repoRoot, { detached: true });
+    ], {
+      ...process.env,
+      FILETASKS_IOS_UI_APPLE_URL: `${deliveryBase}/apple/calendar/`,
+    }, repoRoot, { detached: true });
+    assert.equal(failNextAppleRequest, null, "the native Apple Calendar UI should surface and then recover from the provider failure");
   } catch (error) {
     throw new Error(`${error.message}\nRecent test server output:\n${logs.slice(-10000)}`, { cause: error });
   } finally {
     failNextGoogleRequest = null;
+    failNextAppleRequest = null;
   }
+
+  const restoredCopies = [...googleEvents.values()];
+  const authoritativeCopy = restoredCopies.find(({ summary }) => summary === calendarEventTitle);
+  const recreatedCopy = restoredCopies.find(({ summary }) => summary === missingCopyTitle);
+  assert.ok(authoritativeCopy, "native Sync Calendar should restore the FileTasks title after a provider edit");
+  assert.ok(recreatedCopy, "native Sync Calendar should recreate an externally deleted Calendar copy");
+  assert.equal(authoritativeCopy.description.includes(`?event=${firstEvent.id}`), true, "the restored copy should retain its FileTasks backlink");
+  assert.equal(recreatedCopy.description.includes(`?event=${secondEvent.id}`), true, "the recreated copy should include its FileTasks backlink");
+  assert.equal(restoredCopies.filter(({ summary }) => summary === calendarEventTitle).length, 1, "the provider fake should contain one copy for each FileTasks Event");
+  assert.equal(restoredCopies.filter(({ summary }) => summary === missingCopyTitle).length, 1, "restoring a missing copy should not duplicate it");
+  const calendarItems = (await (await request("/api/items", { token: owner.token })).json()).items;
+  assert.equal(calendarItems.filter(({ title }) => title === calendarEventTitle).length, 1);
+  assert.equal(calendarItems.filter(({ title }) => title === missingCopyTitle).length, 1);
+  assert.equal(calendarItems.filter(({ title }) => title === "Native imported Google Event").length, 1,
+    "the native refresh should retain the provider-imported Event without duplicating it");
 
   const registeredAccount = await request("/api/auth/login", {
     method: "POST",

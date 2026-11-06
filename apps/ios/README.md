@@ -75,7 +75,7 @@ npx playwright install chromium
 npm run test:ios-ui
 ```
 
-The runner creates and removes a blank disposable iPhone Simulator, then runs the SwiftUI app against the same temporary API, SQLite database, controlled clock, and delivery/calendar/storage fakes as the web acceptance harness. It registers a second account in the app, signs out, signs into the harness account, changes a new item from Task to Event, checks Event defaults after reopening, preserves a deliberate Reminder edit, and confirms both saved Events in the browser. It configures `http://localhost:3107` and the local HTTP opt-in through the app's Server settings. The focused command does not reuse or erase an existing simulator and does not require Android.
+The runner creates and removes a blank disposable iPhone Simulator, then runs the SwiftUI app against the same temporary API, SQLite database, controlled clock, and delivery/calendar/storage fakes as the web acceptance harness. It registers a second account in the app, signs out, signs into the harness account, reads connected-calendar status, runs native Sync Calendar after a fake provider edit and deletion, verifies the restored copies and FileTasks backlinks, and opens the associated Event through the existing Files workflow. It then changes a new item from Task to Event, checks Event defaults after reopening, preserves a deliberate Reminder edit, and confirms the saved Events in the browser. It configures `http://localhost:3107` and the local HTTP opt-in through the app's Server settings. The focused command does not reuse or erase an existing simulator and does not require Android.
 
 Run the complete shared acceptance harness from the repository root on a Mac with Swift/Xcode command-line tools, Android SDK, and a booted Android emulator:
 
@@ -93,6 +93,7 @@ The harness keeps the API and fake calendar, delivery, and object-storage provid
 - Optional local date and time, including undated and all-day items.
 - Pull-to-refresh for changes made from another client.
 - Files section with external links, private R2 uploads, Attachments to multiple Tasks and Events, and separate Attachment/File deletion actions.
+- Connected calendar status, Apple Calendar connect/disconnect, Google Calendar browser handoff, and manual Sync Calendar from account settings.
 - Bearer-token authentication with the token stored in the iOS Keychain.
 
 Failed saves leave the editor fields in place so the person can retry. A failed refresh leaves the last loaded items visible and displays the error.

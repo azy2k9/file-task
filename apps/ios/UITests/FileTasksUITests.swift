@@ -14,8 +14,41 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
     func testRegistrationSignInCrossTypeReminderPreservation() {
         configureLocalServerInApp()
         registerSecondAccountInApp()
+        exerciseCalendarSettingsForSecondAccount()
         signOutInApp()
         signInInApp(email: sharedEmail)
+
+        openToolbarMenu("Account options", select: "Connected calendars")
+        let connectedCalendar = app.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS %@", "Google Calendar")
+        ).firstMatch
+        XCTAssertTrue(connectedCalendar.waitForExistence(timeout: 10),
+                      "Calendar settings should show the account-scoped Google connection. Accessibility hierarchy: \(app.debugDescription)")
+        XCTAssertTrue(app.buttons["calendar.disconnect.google"].exists,
+                      "The connected Google calendar should offer a native disconnect action.")
+        let syncCalendar = app.buttons["calendar.sync"]
+        XCTAssertTrue(syncCalendar.waitForExistence(timeout: 5))
+        syncCalendar.tap()
+        let syncNotice = element(identifier: "calendar.action.notice")
+        XCTAssertTrue(syncNotice.waitForExistence(timeout: 30),
+                      "Native Sync Calendar should report its result. Accessibility hierarchy: \(app.debugDescription)")
+        XCTAssertTrue(syncNotice.label.localizedCaseInsensitiveContains("Synced Google Calendar"), syncNotice.label)
+        app.buttons["Done"].tap()
+        XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Native calendar sync authority")).firstMatch.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Native imported Google Event")).firstMatch.waitForExistence(timeout: 10),
+                      "Provider-imported Events should use the existing native Agenda workflow.")
+
+        let filesSection = app.segmentedControls.buttons["Files"]
+        if filesSection.exists { filesSection.tap() }
+        XCTAssertTrue(app.staticTexts["Native calendar sync notes"].waitForExistence(timeout: 10),
+                      "Calendar Events and their Files should remain visible through the existing Files section.")
+        let linkedEvent = app.buttons["Event: Native imported Google Event"]
+        XCTAssertTrue(linkedEvent.waitForExistence(timeout: 10))
+        linkedEvent.tap()
+        XCTAssertTrue(app.navigationBars["Edit Event"].waitForExistence(timeout: 5))
+        cancelEditor()
+        let agendaSection = app.segmentedControls.buttons["Agenda"]
+        if agendaSection.exists { agendaSection.tap() }
 
         createEventBySwitchingFromTask(title: "UI Runner Event Default")
         assertReminder(amount: 3, unit: "weeks")
@@ -49,6 +82,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         openItem("UI Runner No Reminders")
         assertNoReminders()
         cancelEditor()
+        changeServerClearsSession()
     }
 
     private func configureLocalServerInApp() {
@@ -101,6 +135,62 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
                       "Registration must complete through the installed app. Accessibility hierarchy: \(app.debugDescription)")
         XCTAssertTrue(app.staticTexts["Your workspace is empty"].waitForExistence(timeout: 30),
                       "The newly registered workspace should finish loading before opening its menu. Accessibility hierarchy: \(app.debugDescription)")
+    }
+
+    private func exerciseCalendarSettingsForSecondAccount() {
+        openToolbarMenu("Account options", select: "Connected calendars")
+        XCTAssertTrue(app.buttons["calendar.connect.google"].waitForExistence(timeout: 5),
+                      "An account without a Google connection should be offered the secure browser handoff.")
+        XCTAssertTrue(app.buttons["calendar.connect.apple"].exists,
+                      "An account without an Apple connection should be offered the native Apple form.")
+
+        let username = app.textFields["calendar.apple.username"]
+        let passwordField = app.secureTextFields["calendar.apple.password"]
+        let calendarURL = app.textFields["calendar.apple.url"]
+        let fakeURL = ProcessInfo.processInfo.environment["FILETASKS_IOS_UI_APPLE_URL"] ?? ""
+        XCTAssertFalse(fakeURL.isEmpty, "The shared provider fake URL must be passed to the real iOS app.")
+        replaceText(in: username, with: "person@example.com")
+        replaceText(in: passwordField, with: "app-specific-password")
+        replaceText(in: calendarURL, with: fakeURL)
+
+        let connectApple = app.buttons["calendar.connect.apple"]
+        scrollToHittable(connectApple, toward: .down)
+        connectApple.tap()
+        let providerError = element(identifier: "calendar.action.error")
+        XCTAssertTrue(providerError.waitForExistence(timeout: 20),
+                      "The native screen should surface the provider's failed connection check.")
+        XCTAssertTrue(providerError.label.localizedCaseInsensitiveContains("verify"), providerError.label)
+
+        scrollToHittable(connectApple, toward: .down)
+        connectApple.tap()
+        let disconnectApple = app.buttons["calendar.disconnect.apple"]
+        scrollToHittable(disconnectApple, toward: .down)
+        XCTAssertTrue(disconnectApple.waitForExistence(timeout: 30),
+                      "The native screen should show the Apple connection after the fake provider recovers.")
+        disconnectApple.tap()
+        scrollToHittable(connectApple, toward: .down)
+        XCTAssertTrue(connectApple.waitForExistence(timeout: 15),
+                      "Disconnecting Apple Calendar should refresh status for the current account.")
+
+        let cancelApple = app.buttons["calendar.cancel.apple"]
+        scrollToHittable(cancelApple, toward: .down)
+        cancelApple.tap()
+        let cancellation = element(identifier: "calendar.action.notice")
+        XCTAssertTrue(cancellation.waitForExistence(timeout: 5))
+        XCTAssertTrue(cancellation.label.localizedCaseInsensitiveContains("cancelled"), cancellation.label)
+        app.buttons["Done"].tap()
+    }
+
+    private func changeServerClearsSession() {
+        openToolbarMenu("Account options", select: "Server settings")
+        let origin = app.textFields["https://api.example.com"]
+        XCTAssertTrue(origin.waitForExistence(timeout: 5))
+        replaceText(in: origin, with: "http://localhost:3108")
+        dismissKeyboardIfShown()
+        app.buttons["Save"].tap()
+        XCTAssertTrue(app.textFields["Email"].waitForExistence(timeout: 10),
+                      "Changing servers should sign out rather than send the saved bearer token to the new server.")
+        XCTAssertFalse(app.buttons["Account options"].exists)
     }
 
     private func signOutInApp() {

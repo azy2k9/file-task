@@ -14,6 +14,10 @@ final class AppModel: ObservableObject {
     @Published private(set) var hasRegisteredPushDevice = false
     @Published private(set) var pushDeviceRevoked = false
     @Published private(set) var calendarSyncDelivery: [CalendarSyncDeliveryStatus] = []
+    @Published private(set) var calendarConnections: [CalendarConnection] = []
+    @Published private(set) var calendarSyncLimitations: [CalendarSyncLimitation] = []
+    @Published private(set) var calendarStatusError: String?
+    @Published private(set) var calendarActionNotice: String?
     @Published private(set) var calendarSyncNotice: String?
     @Published private(set) var isRestoring = true
     @Published private(set) var isAuthenticating = false
@@ -37,6 +41,7 @@ final class AppModel: ObservableObject {
     private var calendarDeliveryRequestID = 0
     private var calendarNoticeVersion = 0
     private var authenticationAttemptID: UUID?
+    private var googleHandoffAwaitingReturn = false
 
     init(settings: APISettings, tokenStore: KeychainTokenStore = KeychainTokenStore()) {
         self.settings = settings
@@ -120,10 +125,98 @@ final class AppModel: ObservableObject {
             ))
         } catch {
             errorMessage = error.localizedDescription
+            calendarStatusError = error.localizedDescription
             if !hasLoadedReminderSettingsForCurrentSession {
                 reminderSettingsLoadError = error.localizedDescription
             }
         }
+    }
+
+    func applicationDidBecomeActive() async {
+        guard user != nil else { return }
+        await refreshItems()
+        guard googleHandoffAwaitingReturn else { return }
+        guard calendarStatusError == nil else { return }
+        googleHandoffAwaitingReturn = false
+        if !calendarConnections.contains(where: { $0.provider == "google" }) {
+            calendarActionNotice = "Google Calendar was not connected to this FileTasks account. The browser flow may have been cancelled, used a different account, or failed on the server."
+        } else {
+            calendarActionNotice = "Google Calendar is connected to this FileTasks account."
+        }
+    }
+
+    func noteGoogleCalendarHandoffOpened() {
+        googleHandoffAwaitingReturn = true
+        calendarActionNotice = "Continue in Safari. Sign in to the intended FileTasks account, then connect Google Calendar there."
+    }
+
+    func connectAppleCalendar(username: String, password: String, calendarURL: String?) async throws {
+        let context = try currentCalendarContext()
+        do {
+            try await APIClient(baseURL: context.baseURL).connectAppleCalendar(
+                username: username, password: password, calendarURL: calendarURL, token: context.token
+            )
+            guard isCurrent(context) else { throw APIClientError.sessionChanged }
+            calendarActionNotice = "Apple Calendar connected."
+            calendarStatusError = nil
+            await refreshItems(using: context)
+        } catch {
+            handleCalendarActionError(error, for: context)
+            throw error
+        }
+    }
+
+    func disconnectCalendar(provider: String) async throws {
+        let context = try currentCalendarContext()
+        do {
+            try await APIClient(baseURL: context.baseURL).disconnectCalendar(provider: provider, token: context.token)
+            guard isCurrent(context) else { throw APIClientError.sessionChanged }
+            calendarActionNotice = "\(provider == "google" ? "Google" : "Apple") Calendar disconnected."
+            calendarStatusError = nil
+            await refreshItems(using: context)
+        } catch {
+            handleCalendarActionError(error, for: context)
+            throw error
+        }
+    }
+
+    func syncCalendars() async throws {
+        let context = try currentCalendarContext()
+        do {
+            let result = try await APIClient(baseURL: context.baseURL).syncCalendars(token: context.token)
+            guard isCurrent(context) else { throw APIClientError.sessionChanged }
+            if result.synced.isEmpty {
+                calendarActionNotice = result.message ?? "No connected calendars were synchronized."
+            } else {
+                let providers = result.synced.map { $0 == "google" ? "Google" : "Apple" }
+                let limitations = result.syncLimitations?.count ?? 0
+                let limitationNote = limitations == 0 ? "" : " \(limitations) Event sync \(limitations == 1 ? "limitation" : "limitations") need attention."
+                calendarActionNotice = "Synced \(providers.joined(separator: " and ")) Calendar\(providers.count == 1 ? "" : "s").\(limitationNote)"
+            }
+            calendarStatusError = nil
+            await refreshItems(using: context)
+        } catch {
+            handleCalendarActionError(error, for: context)
+            throw error
+        }
+    }
+
+    func recordCalendarActionCancellation() {
+        calendarActionNotice = "Calendar connection cancelled. Refresh status before retrying in case the server received the request."
+        calendarStatusError = nil
+    }
+
+    func recordAppleSetupCancellation() {
+        calendarActionNotice = "Apple Calendar setup cancelled. No connection request was sent."
+        calendarStatusError = nil
+    }
+
+    func dismissCalendarActionNotice() {
+        calendarActionNotice = nil
+    }
+
+    func setCalendarStatusError(_ message: String) {
+        calendarStatusError = message
     }
 
     func save(_ draft: ItemDraft, editing item: WorkspaceItem?) async throws {
@@ -482,6 +575,15 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func refreshCalendarStatus() async {
+        guard user != nil else { return }
+        do {
+            await refreshCalendarSyncDelivery(using: try currentCalendarContext())
+        } catch {
+            calendarStatusError = error.localizedDescription
+        }
+    }
+
     private enum CalendarMutationOutcome: Equatable {
         case saved
         case deleted
@@ -495,9 +597,13 @@ final class AppModel: ObservableObject {
         calendarDeliveryRequestID += 1
         let requestID = calendarDeliveryRequestID
         do {
-            let statuses = try await APIClient(baseURL: context.baseURL).calendarSyncDelivery(token: context.token)
+            let status = try await APIClient(baseURL: context.baseURL).calendarStatus(token: context.token)
             guard isCurrent(context), calendarDeliveryRequestID == requestID else { return }
-            calendarSyncDelivery = statuses
+            calendarConnections = status.calendars
+            calendarSyncLimitations = status.syncLimitations
+            calendarSyncDelivery = status.syncDelivery
+            calendarStatusError = nil
+            let statuses = status.syncDelivery
             if statuses.isEmpty {
                 guard let outcome else {
                     calendarSyncNotice = nil
@@ -538,7 +644,13 @@ final class AppModel: ObservableObject {
             }
             calendarNoticeVersion += 1
         } catch {
-            guard isCurrent(context), calendarDeliveryRequestID == requestID, let outcome else { return }
+            guard isCurrent(context), calendarDeliveryRequestID == requestID else { return }
+            if let apiError = error as? APIClientError, apiError.statusCode == 401 {
+                handle(error, for: context)
+                return
+            }
+            calendarStatusError = error.localizedDescription
+            guard let outcome else { return }
             calendarNoticeVersion += 1
             calendarSyncNotice = outcome == .deleted
                 ? "Deleted from FileTasks. Calendar removal status is not available yet."
@@ -555,6 +667,18 @@ final class AppModel: ObservableObject {
             token: token,
             baseURL: try settings.validatedBaseURL()
         )
+    }
+
+    private func currentCalendarContext() throws -> SessionContext {
+        do {
+            return try currentContext()
+        } catch {
+            calendarStatusError = error.localizedDescription
+            if let apiError = error as? APIClientError, apiError == .missingToken {
+                clearSession(error: error)
+            }
+            throw error
+        }
     }
 
     private func isCurrent(_ context: SessionContext) -> Bool {
@@ -578,13 +702,28 @@ final class AppModel: ObservableObject {
         isLoadingItems = false
         errorMessage = nil
         calendarSyncDelivery = []
+        calendarConnections = []
+        calendarSyncLimitations = []
+        calendarStatusError = nil
+        calendarActionNotice = nil
         calendarSyncNotice = nil
+        googleHandoffAwaitingReturn = false
         return SessionContext(generation: sessionGeneration, token: token, baseURL: baseURL)
     }
 
     private func handle(_ error: Error, for context: SessionContext) {
         guard isCurrent(context) else { return }
         handle(error, forGeneration: context.generation)
+    }
+
+    private func handleCalendarActionError(_ error: Error, for context: SessionContext) {
+        guard isCurrent(context) else { return }
+        if let apiError = error as? APIClientError, apiError == .cancelled {
+            recordCalendarActionCancellation()
+            return
+        }
+        calendarStatusError = error.localizedDescription
+        handle(error, for: context)
     }
 
     private func handle(_ error: Error, forGeneration generation: Int) {
@@ -630,7 +769,12 @@ final class AppModel: ObservableObject {
         pushDeviceRevoked = false
         errorMessage = nil
         calendarSyncDelivery = []
+        calendarConnections = []
+        calendarSyncLimitations = []
+        calendarStatusError = nil
+        calendarActionNotice = nil
         calendarSyncNotice = nil
+        googleHandoffAwaitingReturn = false
     }
 
     private func upsert(_ item: WorkspaceItem) {

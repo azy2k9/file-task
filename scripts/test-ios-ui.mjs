@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
-const testName = "iOS UI acceptance: registration, cross-type Reminder preservation, save/reopen and browser read";
+const testName = "iOS UI acceptance: registration, cross-type Reminder preservation, calendar sync and browser read";
 let activeChild;
 let interruptedSignal;
 let interruptionPromise;

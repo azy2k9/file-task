@@ -3,6 +3,7 @@ import SwiftUI
 struct RootView: View {
     @EnvironmentObject private var settings: APISettings
     @EnvironmentObject private var model: AppModel
+    @Environment(\.scenePhase) private var scenePhase
     @State private var showingServerSettings = false
 
     var body: some View {
@@ -30,6 +31,10 @@ struct RootView: View {
         }
         .task {
             await model.restoreSession()
+        }
+        .onChange(of: scenePhase) { phase in
+            guard phase == .active else { return }
+            Task { await model.applicationDidBecomeActive() }
         }
     }
 }

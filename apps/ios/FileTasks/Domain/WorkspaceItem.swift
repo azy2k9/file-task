@@ -121,6 +121,42 @@ struct CalendarSyncDeliveryStatus: Codable, Equatable, Identifiable {
     var id: String { provider }
 }
 
+struct CalendarConnection: Decodable, Equatable, Identifiable {
+    let provider: String
+    let accountLabel: String
+    let connectedAt: String
+
+    var id: String { provider }
+
+    enum CodingKeys: String, CodingKey {
+        case provider
+        case accountLabel = "account_label"
+        case connectedAt = "connected_at"
+    }
+}
+
+struct CalendarSyncLimitation: Decodable, Equatable, Identifiable {
+    let itemId: String
+    let title: String
+    let provider: String
+    let message: String
+
+    var id: String { "\(itemId):\(provider)" }
+}
+
+struct CalendarStatus: Decodable, Equatable {
+    let calendars: [CalendarConnection]
+    let syncLimitations: [CalendarSyncLimitation]
+    let syncDelivery: [CalendarSyncDeliveryStatus]
+}
+
+struct CalendarSyncResult: Decodable, Equatable {
+    let synced: [String]
+    let message: String?
+    let eventCount: Int?
+    let syncLimitations: [CalendarSyncLimitation]?
+}
+
 struct WorkspaceItem: Codable, Identifiable, Equatable {
     let id: String
     let kind: WorkspaceItemKind
