@@ -64,6 +64,16 @@ export function database() {
         PRIMARY KEY(user_id,item_id,provider,connection_scope_id),
         FOREIGN KEY(user_id,item_id) REFERENCES items(user_id,id) ON DELETE CASCADE
       );
+      CREATE TABLE IF NOT EXISTS apple_creation_reservations (
+        user_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        provider TEXT NOT NULL CHECK(provider = 'apple'),
+        connection_scope_id TEXT NOT NULL,
+        resource_uid TEXT NOT NULL,
+        PRIMARY KEY(user_id,item_id,provider,connection_scope_id),
+        UNIQUE(user_id,provider,connection_scope_id,resource_uid),
+        FOREIGN KEY(user_id,item_id) REFERENCES items(user_id,id) ON DELETE CASCADE
+      );
       CREATE TABLE IF NOT EXISTS user_preferences (
         user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
         task_reminders TEXT NOT NULL DEFAULT '[]', event_reminders TEXT NOT NULL DEFAULT '[]',

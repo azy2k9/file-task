@@ -608,6 +608,12 @@ async function startDeliveryFakeDuringSetup(setup) {
         const existed = appleEvents.has(url.pathname);
         if (request.headers["if-none-match"] === "*" && existed) { response.writeHead(412).end(); return; }
         appleEvents.set(url.pathname, bodyText);
+        if (holdNextCalendarCreation?.provider === "apple") {
+          const gate = holdNextCalendarCreation;
+          holdNextCalendarCreation = null;
+          gate.created();
+          await gate.releasePromise;
+        }
         response.writeHead(existed ? 204 : 201).end();
         return;
       }
@@ -3340,6 +3346,193 @@ test("overlapping Google recovery creates one mapped replacement", async () => {
     assert.ok(googleEvents.has(mappings[0].external_id), "the sole remote Event must be mapped");
     assert.notEqual(mappings[0].external_id, source.id);
   } finally { googleInventoryBarrier?.release(); googleInventoryBarrier = null; googleEvents.clear(); db.close(); }
+});
+
+test("concurrent save and Sync Calendar requests keep one Google and Apple copy", async () => {
+  const owner = await account();
+  const created = await request("/api/items", {token: owner.token, method: "POST", body: {
+    kind: "event", title: "Concurrent provider save", scheduledDate: "2027-02-12",
+  }});
+  assert.equal(created.status, 201);
+  const item = (await created.json()).item;
+  const fileResponse = await request("/api/files", {token: owner.token, method: "POST", body: {
+    name: "Concurrent save notes", url: "https://example.com/concurrent-save-notes",
+  }});
+  assert.equal(fileResponse.status, 201);
+  const file = (await fileResponse.json()).file;
+  assert.equal((await request(`/api/files/${file.id}/attachments`, {token: owner.token, method: "POST", body: {itemId: item.id}})).status, 201);
+  const auth = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie: auth.cookie, redirect: "manual"})).status, 303);
+  assert.equal((await request("/api/calendars", {token: owner.token, method: "POST", body: {
+    username: "concurrent@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/concurrent/`,
+  }})).status, 201);
+
+  let releaseGoogle;
+  let arriveGoogle;
+  let releaseApple;
+  let arriveApple;
+  const googleReady = new Promise((resolve) => { releaseGoogle = resolve; });
+  const googleArrived = new Promise((resolve) => { arriveGoogle = resolve; });
+  const appleReady = new Promise((resolve) => { releaseApple = resolve; });
+  const appleArrived = new Promise((resolve) => { arriveApple = resolve; });
+  googleInventoryBarrier = {arrivals: 0, ready: googleReady, release: releaseGoogle, arrived: arriveGoogle};
+  appleInventoryBarrier = {arrivals: 0, ready: appleReady, release: releaseApple, arrived: arriveApple};
+  try {
+    const requests = [
+      request(`/api/items/${item.id}`, {token: owner.token, method: "PATCH", body: {title: "Concurrent provider save updated"}}),
+      request("/api/calendars/sync", {token: owner.token, method: "POST"}),
+    ];
+    const timeout = setTimeout(() => { releaseGoogle(); releaseApple(); }, 5000);
+    await Promise.all([googleArrived, appleArrived]);
+    assert.equal(googleInventoryBarrier.arrivals, 2, "both overlapping requests must reach the shared Google fake");
+    assert.equal(appleInventoryBarrier.arrivals, 2, "both overlapping requests must reach the shared Apple fake");
+    releaseGoogle();
+    releaseApple();
+    const responses = await Promise.all(requests);
+    clearTimeout(timeout);
+    assert.ok(responses.every((response) => response.status === 200), (await Promise.all(responses.map((response) => response.clone().text()))).join("\n"));
+    const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+    try {
+      for (const provider of ["google", "apple"]) {
+        assert.equal(db.prepare("SELECT count(*) AS count FROM calendar_copies WHERE user_id=? AND provider=? AND item_id=?").get(owner.user.id,provider,item.id).count, 1);
+      }
+      assert.equal([...googleEvents.values()].filter((entry) => entry.description?.includes(item.id)).length, 1, "concurrent sync must keep one Google resource for this Event");
+      assert.equal([...appleEvents.values()].filter((entry) => entry.includes(`?event=${item.id}`)).length, 1, "concurrent sync must keep one Apple resource for this Event");
+      const saved = (await (await request("/api/items", {token: owner.token})).json()).items.find((entry) => entry.id === item.id);
+      assert.equal(saved.title, "Concurrent provider save updated");
+      assert.deepEqual(saved.files.map(({id}) => id), [file.id], "the intended Event keeps its File association");
+      assert.ok([...googleEvents.values()].find((entry) => entry.description?.includes(item.id)), "the Google Calendar copy keeps its Event backlink");
+      assert.ok([...appleEvents.values()].find((entry) => entry.includes(`?event=${item.id}`)), "the Apple Calendar copy keeps its Event backlink");
+    } finally { db.close(); }
+  } finally {
+    releaseGoogle();
+    releaseApple();
+    googleInventoryBarrier = null;
+    appleInventoryBarrier = null;
+  }
+});
+
+test("a blocked Google calendar does not serialize a different account", async () => {
+  const first = await account();
+  const second = await account();
+  const connect = async (owner) => {
+    const auth = await beginGoogleAuthorization(owner);
+    assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie: auth.cookie, redirect: "manual"})).status, 303);
+  };
+  const firstEventResponse = await request("/api/items", {token: first.token, method: "POST", body: {
+    kind: "event", title: "Blocked account copy", scheduledDate: "2027-02-14",
+  }});
+  const secondEventResponse = await request("/api/items", {token: second.token, method: "POST", body: {
+    kind: "event", title: "Independent account copy", scheduledDate: "2027-02-15",
+  }});
+  const firstEvent = (await firstEventResponse.json()).item;
+  const secondEvent = (await secondEventResponse.json()).item;
+  await connect(first);
+  await connect(second);
+
+  let signalCreated;
+  let release;
+  const providerCreated = new Promise((resolve) => { signalCreated = resolve; });
+  const releasePromise = new Promise((resolve) => { release = resolve; });
+  let firstSync;
+  let secondSync;
+  holdNextCalendarCreation = {provider: "google", created: signalCreated, releasePromise, release};
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  try {
+    firstSync = request("/api/calendars/sync", {token: first.token, method: "POST"});
+    await providerCreated;
+    secondSync = request("/api/calendars/sync", {token: second.token, method: "POST"});
+    let timer;
+    const result = await Promise.race([
+      secondSync.then((response) => ({response})),
+      new Promise((resolve) => { timer = setTimeout(() => resolve({timedOut: true}), 3000); }),
+    ]);
+    clearTimeout(timer);
+    assert.ok(result.response, "another account should sync while the first provider create is held at the shared fake");
+    assert.equal(result.response.status, 200, await result.response.text());
+    assert.equal(db.prepare("SELECT count(*) AS count FROM calendar_copies WHERE user_id=? AND provider='google' AND item_id=?").get(second.user.id,secondEvent.id).count, 1);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM calendar_copies WHERE user_id=? AND provider='google' AND item_id=?").get(first.user.id,firstEvent.id).count, 0,
+      "the held first account should not commit before its provider response");
+    release();
+    const firstResponse = await firstSync;
+    assert.equal(firstResponse.status, 200);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM calendar_copies WHERE user_id=? AND provider='google' AND item_id=?").get(first.user.id,firstEvent.id).count, 1);
+  } finally {
+    release();
+    await firstSync?.catch(() => {});
+    await secondSync?.catch(() => {});
+    holdNextCalendarCreation = null;
+    db.close();
+  }
+});
+
+test("Google and Apple provider creations recover their reserved copy after a server restart", async () => {
+  const owner = await account();
+  const created = await request("/api/items", {token: owner.token, method: "POST", body: {
+    kind: "event", title: "Interrupted provider creation", scheduledDate: "2027-02-13",
+  }});
+  assert.equal(created.status, 201);
+  const item = (await created.json()).item;
+  const fileResponse = await request("/api/files", {token: owner.token, method: "POST", body: {
+    name: "Recovery notes", url: "https://example.com/recovery-notes",
+  }});
+  const file = (await fileResponse.json()).file;
+  assert.equal((await request(`/api/files/${file.id}/attachments`, {token: owner.token, method: "POST", body: {itemId: item.id}})).status, 201);
+  const auth = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`, {cookie: auth.cookie, redirect: "manual"})).status, 303);
+  assert.equal((await request("/api/calendars", {token: owner.token, method: "POST", body: {
+    username: "recovery@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/recovery/`,
+  }})).status, 201);
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  let activeGate;
+  try {
+    for (const provider of ["google", "apple"]) {
+      let signalCreated;
+      let release;
+      const providerCreated = new Promise((resolve) => { signalCreated = resolve; });
+      const releasePromise = new Promise((resolve) => { release = resolve; });
+      activeGate = {provider, created: signalCreated, releasePromise, release};
+      holdNextCalendarCreation = activeGate;
+      const interrupted = request("/api/calendars/sync", {token: owner.token, method: "POST"})
+        .then((response) => ({response}), (error) => ({error}));
+      await providerCreated;
+      assert.equal(db.prepare("SELECT count(*) AS count FROM calendar_copies WHERE user_id=? AND provider=? AND item_id=?").get(owner.user.id,provider,item.id).count, 0,
+        `${provider} creation must be observable before its local identity is committed`);
+      const createdResource = provider === "google"
+        ? [...googleEvents.values()].find((entry) => entry.description?.includes(item.id))?.id
+        : [...appleEvents.entries()].find(([,entry]) => entry.includes(`?event=${item.id}`))?.[0];
+      assert.ok(createdResource, `${provider} provider should have committed the copy before local completion`);
+      if (provider === "google") assert.equal([...googleEvents.values()].filter((entry) => entry.description?.includes(item.id)).length, 1, "Google provider has committed the reserved Event");
+      else assert.equal([...appleEvents.values()].filter((entry) => entry.includes(`?event=${item.id}`)).length, 1, "Apple provider has committed the reserved Event");
+
+      await stopServer();
+      release();
+      activeGate = undefined;
+      await interrupted;
+      await startServer();
+      const retry = await request("/api/calendars/sync", {token: owner.token, method: "POST"});
+      assert.equal(retry.status, 200, await retry.text());
+      assert.equal(db.prepare("SELECT count(*) AS count FROM calendar_copies WHERE user_id=? AND provider=? AND item_id=?").get(owner.user.id,provider,item.id).count, 1,
+        `${provider} retry must recover the reserved Calendar copy`);
+      const mapping = db.prepare("SELECT external_id FROM calendar_copies WHERE user_id=? AND provider=? AND item_id=?").get(owner.user.id,provider,item.id);
+      assert.equal(provider === "google" ? mapping.external_id : new URL(mapping.external_id).pathname, createdResource,
+        `${provider} retry must track the same provider resource that existed before interruption`);
+      const resourceCount = provider === "google"
+        ? [...googleEvents.values()].filter((entry) => entry.description?.includes(item.id)).length
+        : [...appleEvents.values()].filter((entry) => entry.includes(`?event=${item.id}`)).length;
+      assert.equal(resourceCount, 1, `${provider} retry must not create a second resource`);
+    }
+
+    const saved = (await (await request("/api/items", {token: owner.token})).json()).items.find((entry) => entry.id === item.id);
+    assert.deepEqual(saved.files.map(({id}) => id), [file.id], "recovery preserves the Event's File association");
+    assert.ok([...googleEvents.values()].find((entry) => entry.description?.includes(item.id)), "recovered Google copy keeps its Event backlink");
+    assert.ok([...appleEvents.values()].find((entry) => entry.includes(`?event=${item.id}`)), "recovered Apple copy keeps its Event backlink");
+    assert.deepEqual((await (await request("/api/calendars", {token: owner.token})).json()).syncDelivery, [], "visible sync status resolves after retry");
+  } finally {
+    activeGate?.release();
+    holdNextCalendarCreation = null;
+    db.close();
+  }
 });
 
 test("Google recovery reconciles a persisted replacement after a lost response", async () => {
