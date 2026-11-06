@@ -43,6 +43,7 @@ let googleEvents = new Map();
 let googleCalendarId = "primary";
 let googleEventVersions = new Map();
 let googleInstances = new Map();
+let googleInstanceVersions = new Map();
 let googleExceptions = new Map();
 let googleInstanceRequests = [];
 let appleEvents = new Map();
@@ -483,6 +484,7 @@ async function startDeliveryFakeDuringSetup(setup) {
   googleEventPages = null;
   googleEvents = new Map();
   googleInstances = new Map();
+  googleInstanceVersions = new Map();
   googleExceptions = new Map();
   googleInstanceRequests = [];
   appleEvents = new Map();
@@ -555,6 +557,12 @@ async function startDeliveryFakeDuringSetup(setup) {
       return;
     }
     if (url.pathname.startsWith(`/google/calendar/v3/calendars/${googleCalendarId}/events`) || url.pathname.startsWith("/google/calendar/v3/calendars/primary/events")) {
+      const privateProperties = body.extendedProperties?.private;
+      if (privateProperties !== undefined && (privateProperties === null || typeof privateProperties !== "object" || Array.isArray(privateProperties)
+        || Object.values(privateProperties).some(value => typeof value !== "string"))) {
+        response.writeHead(400).end("Google private extended property values must be strings.");
+        return;
+      }
       const parts = url.pathname.split("/");
       const eventId = parts[parts.length - 1] === "events" || parts.at(-1) === "instances" ? null : parts.at(-1);
       if (request.method === "GET" && url.pathname.endsWith("/events")) {
@@ -586,6 +594,14 @@ async function startDeliveryFakeDuringSetup(setup) {
         response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ items }));
         return;
       }
+      if (request.method === "GET" && eventId && googleInstances.has(eventId)) {
+        const instance = googleInstances.get(eventId);
+        const version = googleInstanceVersions.get(eventId) ?? 1;
+        googleInstanceVersions.set(eventId,version);
+        response.writeHead(200,{"Content-Type":"application/json",ETag:`"google-instance-${eventId}-${version}"`})
+          .end(JSON.stringify({...instance,id:eventId}));
+        return;
+      }
       if (request.method === "GET" && eventId) {
         const event = googleEvents.get(eventId);
         if (!event) {
@@ -606,8 +622,13 @@ async function startDeliveryFakeDuringSetup(setup) {
           if (!googleInstances.has(eventId)) {
             response.writeHead(404).end(); return;
           }
+          const gate = holdNextCalendarUpdate?.provider === "google" && (!holdNextCalendarUpdate.eventId || holdNextCalendarUpdate.eventId === eventId) ? holdNextCalendarUpdate : null;
+          if (gate) { holdNextCalendarUpdate = null; gate.started(); await gate.releasePromise; }
+          const version = googleInstanceVersions.get(eventId) ?? 1;
+          if (request.headers["if-match"] && request.headers["if-match"] !== `"google-instance-${eventId}-${version}"`) { response.writeHead(412).end(); return; }
           googleExceptions.set(eventId, { ...body, id: eventId });
           googleInstances.set(eventId, { ...googleInstances.get(eventId), ...body, id: eventId });
+          googleInstanceVersions.set(eventId,version+1);
           response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ id: eventId }));
           return;
         }
@@ -2494,6 +2515,58 @@ test("recurring Google exceptions use immutable original starts after moves and 
   assert.equal(appleEvents.size, 0);
 });
 
+test("a stale Google sync cannot overwrite a newer edited recurring Occurrence", async () => {
+  const owner=await account();
+  const seriesStart=new Date(testClock.getTime()+86_400_000).toISOString().slice(0,10);
+  const created=await request("/api/items",{token:owner.token,method:"POST",body:{kind:"event",title:"Weekly series",scheduledDate:seriesStart,
+    recurrence:{interval:1,unit:"weeks",end:{type:"count",count:5}}}});
+  const root=(await created.json()).item;
+  const occurrence=(await (await request("/api/items",{token:owner.token})).json()).items
+    .find(item=>item.seriesId===root.id&&item.id!==root.id);
+  const auth=await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`,{cookie:auth.cookie,redirect:"manual"})).status,303);
+  assert.equal((await request("/api/calendars/sync",{token:owner.token,method:"POST"})).status,200);
+  const instance={id:`instance-${occurrence.id}`,originalStartTime:{date:`${occurrence.occurrenceDate}`},start:{date:occurrence.occurrenceDate}};
+  googleInstances.set(instance.id,instance);
+  const edited=await request(`/api/items/${occurrence.id}`,{token:owner.token,method:"PATCH",body:{title:"Earlier occurrence title",scope:"occurrence"}});
+  assert.equal(edited.status,200);
+  const db=new DatabaseSync(join(directory,"workspace.sqlite"));
+  const replica=await startCalendarApiReplica(3113);
+  const requestReplica=(path,options={})=>fetch(`http://localhost:${replica.port}${path}`,{
+    method:options.method??"GET",headers:{Authorization:`Bearer ${owner.token}`,...(options.body?{"Content-Type":"application/json"}:{})},
+    ...(options.body?{body:JSON.stringify(options.body)}:{}),
+  });
+  let release; let started; let staleSync; let stopped=false;
+  const held=new Promise(resolve=>{started=resolve;});
+  const releasePromise=new Promise(resolve=>{release=resolve;});
+  holdNextCalendarUpdate={provider:"google",eventId:instance.id,started,releasePromise};
+  try {
+    staleSync=requestReplica("/api/calendars/sync",{method:"POST"}).then(response=>({response}),error=>({error}));
+    await held;
+    db.prepare("UPDATE items SET title=?,updated_at=? WHERE user_id=? AND id=?").run("Latest occurrence title",new Date().toISOString(),owner.user.id,occurrence.id);
+    db.prepare("UPDATE calendar_export_locks SET owner_token='occurrence-takeover',fence=fence+1,lease_until=0 WHERE user_id=? AND provider='google'").run(owner.user.id);
+    const takeover=await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    assert.equal(takeover.status,200,await takeover.text());
+    release(); holdNextCalendarUpdate=null;
+    await staleSync;
+    await stopCalendarApiReplica(replica); stopped=true;
+    assert.equal(googleExceptions.get(instance.id).summary,"Latest occurrence title");
+    const occurrencePatches=providerRequests.filter(entry=>entry.path.endsWith(`/events/${instance.id}`)&&entry.method==="PATCH");
+    assert.ok(occurrencePatches.length>=3,"both generations should conditionally patch the same Occurrence");
+    assert.ok(occurrencePatches.every(entry=>Boolean(entry.headers["if-match"])),"every Google Occurrence PATCH uses If-Match");
+    const rootCopy=[...googleEvents.values()].find(event=>event.extendedProperties?.private?.filetasksItemId===root.id);
+    assert.ok(rootCopy,"the root Calendar copy remains mapped to the recurring Event");
+    assert.equal(googleExceptions.get(instance.id).extendedProperties.private.filetasksSyncGeneration,
+      rootCopy.extendedProperties.private.filetasksSyncGeneration,
+      "the Occurrence records the generation of its newer root Calendar copy");
+  } finally {
+    release?.(); holdNextCalendarUpdate=null;
+    await staleSync?.catch(()=>{});
+    if(!stopped) await stopCalendarApiReplica(replica);
+    db.close();
+  }
+});
+
 test("recurring items create independent Occurrences and honor occurrence and series edit scopes", async () => {
   const owner = await account();
   const created = await request("/api/items", { token: owner.token, method: "POST", body: {
@@ -3794,6 +3867,59 @@ test("deleting while a reserved creation is held before provider commit retains 
   }
 });
 
+test("Apple cleanup retains an unresolved create through takeover, delete, and its late commit", async () => {
+  const owner=await account();
+  const eventDate=new Date(testClock.getTime()+86_400_000).toISOString().slice(0,10);
+  const created=await request("/api/items",{token:owner.token,method:"POST",body:{kind:"event",title:"Apple held creation",scheduledDate:eventDate}});
+  const item=(await created.json()).item;
+  assert.equal((await request("/api/calendars",{token:owner.token,method:"POST",body:{username:"held-create@example.com",password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/held-create-${item.id}/`}})).status,201);
+  const db=new DatabaseSync(join(directory,"workspace.sqlite"));
+  let release; let started;
+  const held=new Promise(resolve=>{started=resolve;});
+  const releasePromise=new Promise(resolve=>{release=resolve;});
+  let exporting;
+  try {
+    holdNextCalendarCreation={provider:"apple",beforeCommit:true,created:started,releasePromise,release};
+    exporting=request("/api/calendars/sync",{token:owner.token,method:"POST"}).then(response=>({response}),error=>({error}));
+    await held;
+    assert.equal(db.prepare("SELECT active_attempts FROM apple_creation_reservations WHERE user_id=? AND item_id=?").get(owner.user.id,item.id).active_attempts,1);
+
+    db.prepare("UPDATE calendar_sync_state SET generation=generation+1,state='pending',attempts=0,next_attempt_at=0,last_attempt_at=NULL,last_error=NULL WHERE user_id=? AND provider='apple'").run(owner.user.id);
+    db.prepare("UPDATE calendar_export_locks SET owner_token='apple-takeover',fence=fence+1,lease_until=0 WHERE user_id=? AND provider='apple'").run(owner.user.id);
+    const takeover=await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    assert.equal(takeover.status,200,await takeover.text());
+    const mapping=db.prepare("SELECT external_id FROM calendar_copies WHERE user_id=? AND provider='apple' AND item_id=?").get(owner.user.id,item.id);
+    assert.ok(mapping,"the takeover maps the resource created while the first PUT remains unresolved");
+    const hasCopy=()=>[...appleEvents.values()].some(ics=>ics.includes(`?event=${item.id}`));
+    assert.equal(hasCopy(),true);
+    assert.equal(db.prepare("SELECT active_attempts FROM apple_creation_reservations WHERE user_id=? AND item_id=?").get(owner.user.id,item.id).active_attempts,1,
+      "the takeover completion must not clear the older in-flight attempt");
+
+    const deleted=await request(`/api/items/${item.id}`,{token:owner.token,method:"DELETE"});
+    assert.equal(deleted.status,204);
+    const tombstone=db.prepare("SELECT uncertain,pending_attempts FROM calendar_creation_cleanup WHERE user_id=? AND provider='apple' AND item_id=?").get(owner.user.id,item.id);
+    assert.deepEqual(tombstone,{uncertain:1,pending_attempts:1},"deletion retains the unresolved provider request identity");
+    assert.equal(hasCopy(),false,"delete removes the mapped copy but keeps the tombstone while the older PUT is unresolved");
+
+    release(); holdNextCalendarCreation=null;
+    await exporting;
+    assert.equal(hasCopy(),true,"the old provider create commits after the delete completed");
+    assert.equal(db.prepare("SELECT pending_attempts FROM calendar_creation_cleanup WHERE user_id=? AND provider='apple' AND item_id=?").get(owner.user.id,item.id).pending_attempts,0,
+      "the late response resolves only its own in-flight attempt");
+    const retry=await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    assert.equal(retry.status,200,await retry.text());
+    assert.equal(hasCopy(),false,"cleanup deletes the late provider commit");
+    assert.equal(db.prepare("SELECT count(*) AS count FROM calendar_creation_cleanup WHERE user_id=? AND provider='apple' AND item_id=?").get(owner.user.id,item.id).count,0);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM calendar_imports WHERE user_id=? AND provider='apple' AND item_id=?").get(owner.user.id,item.id).count,0,
+      "the deleted Apple Event is not reimported");
+    assert.equal(db.prepare("SELECT count(*) AS count FROM items WHERE user_id=? AND id=?").get(owner.user.id,item.id).count,0);
+  } finally {
+    release?.(); holdNextCalendarCreation=null;
+    await exporting?.catch(()=>{});
+    db.close();
+  }
+});
+
 test("mapped Google and Apple updates stay fenced through takeover and late worker crash", async () => {
   const db=new DatabaseSync(join(directory,"workspace.sqlite"));
   try {
@@ -3833,7 +3959,7 @@ test("mapped Google and Apple updates stay fenced through takeover and late work
         if (provider === "google") {
           const providerEvent=[...googleEvents.values()].find(event=>event.description?.includes(item.id));
           assert.equal(providerEvent.summary,latestTitle,"the newer generation commits its authoritative payload");
-          assert.ok(providerEvent.extendedProperties.private.filetasksSyncGeneration>0,"the provider copy records the committed generation");
+          assert.ok(Number(providerEvent.extendedProperties.private.filetasksSyncGeneration)>0,"the provider copy records the committed generation as a string");
         } else {
           const providerEvent=[...appleEvents.values()].find(ics=>ics.includes(`?event=${item.id}`));
           assert.ok(providerEvent.includes(`SUMMARY:${latestTitle}`),"the newer Apple generation commits its authoritative payload");
@@ -3864,7 +3990,7 @@ test("mapped Google and Apple updates stay fenced through takeover and late work
   }
 });
 
-test("consecutive Calendar failures retain exponential retry attempts until success", async () => {
+test("Calendar retry deadlines increase and the worker runs only when delivery is due", async () => {
   const owner=await account();
   const auth=await beginGoogleAuthorization(owner);
   assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(auth.state)}&code=fake-code`,{cookie:auth.cookie,redirect:"manual"})).status,303);
@@ -3873,12 +3999,28 @@ test("consecutive Calendar failures retain exponential retry attempts until succ
     const inventoryPath="/google/calendar/v3/calendars/primary/events";
     failNextGoogleRequest={path:inventoryPath,method:"GET"};
     await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    const first=db.prepare("SELECT attempts,next_attempt_at FROM calendar_sync_state WHERE user_id=? AND provider='google'").get(owner.user.id);
+    assert.equal(first.attempts,1);
+    assert.equal(first.next_attempt_at,testClock.getTime()+30_000,"the first failure schedules the base delay");
+    const workerHeaders={Authorization:"Bearer test-worker-secret"};
+    const early=await request("/api/internal/reminders/deliver",{method:"POST",headers:workerHeaders});
+    assert.equal(early.status,200,await early.text());
+    assert.equal((await early.json()).calendarSync.attempted,0,"the worker ignores a retry before its deadline");
     assert.equal(db.prepare("SELECT attempts FROM calendar_sync_state WHERE user_id=? AND provider='google'").get(owner.user.id).attempts,1);
+
+    await advanceTestClock(first.next_attempt_at-testClock.getTime());
     failNextGoogleRequest={path:inventoryPath,method:"GET"};
-    await request("/api/calendars/sync",{token:owner.token,method:"POST"});
-    assert.equal(db.prepare("SELECT attempts FROM calendar_sync_state WHERE user_id=? AND provider='google'").get(owner.user.id).attempts,2,
-      "a worker retry must advance the existing failure count instead of resetting its backoff");
-    const success=await request("/api/calendars/sync",{token:owner.token,method:"POST"});
+    const retried=await request("/api/internal/reminders/deliver",{method:"POST",headers:workerHeaders});
+    assert.equal(retried.status,200,await retried.text());
+    const second=db.prepare("SELECT attempts,next_attempt_at FROM calendar_sync_state WHERE user_id=? AND provider='google'").get(owner.user.id);
+    assert.equal(second.attempts,2,"the due worker preserves the prior failure count");
+    assert.equal(second.next_attempt_at,testClock.getTime()+60_000,"the second failure doubles the retry delay");
+    assert.ok(second.next_attempt_at>first.next_attempt_at,"each failure moves the retry deadline forward");
+    const beforeSecondDeadline=await request("/api/internal/reminders/deliver",{method:"POST",headers:workerHeaders});
+    assert.equal((await beforeSecondDeadline.json()).calendarSync.attempted,0,"the worker waits through the longer second delay");
+
+    await advanceTestClock(second.next_attempt_at-testClock.getTime());
+    const success=await request("/api/internal/reminders/deliver",{method:"POST",headers:workerHeaders});
     assert.equal(success.status,200,await success.text());
     assert.equal(db.prepare("SELECT attempts FROM calendar_sync_state WHERE user_id=? AND provider='google'").get(owner.user.id).attempts,0,
       "successful delivery resets the retry count");

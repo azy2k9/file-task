@@ -13,7 +13,6 @@ export function database() {
     const path = resolve(/* turbopackIgnore: true */ repositoryRoot, databasePath);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     const db = new DatabaseSync(path);
-    db.exec("DROP TRIGGER IF EXISTS preserve_calendar_creation_before_item_delete");
     db.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA foreign_keys = ON;
@@ -63,6 +62,7 @@ export function database() {
         event_id TEXT NOT NULL,
         ownership_token TEXT NOT NULL,
         attempted INTEGER NOT NULL DEFAULT 0 CHECK(attempted IN (0,1)),
+        active_attempts INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(user_id,item_id,provider,connection_scope_id),
         FOREIGN KEY(user_id,item_id) REFERENCES items(user_id,id) ON DELETE CASCADE
       );
@@ -73,6 +73,7 @@ export function database() {
         connection_scope_id TEXT NOT NULL,
         resource_uid TEXT NOT NULL,
         attempted INTEGER NOT NULL DEFAULT 0 CHECK(attempted IN (0,1)),
+        active_attempts INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(user_id,item_id,provider,connection_scope_id),
         UNIQUE(user_id,provider,connection_scope_id,resource_uid),
         FOREIGN KEY(user_id,item_id) REFERENCES items(user_id,id) ON DELETE CASCADE
@@ -85,6 +86,7 @@ export function database() {
         external_id TEXT NOT NULL,
         ownership_token TEXT,
         uncertain INTEGER NOT NULL DEFAULT 0 CHECK(uncertain IN (0,1)),
+        pending_attempts INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(user_id,provider,connection_scope_id,item_id)
       );
       CREATE TABLE IF NOT EXISTS calendar_export_locks (
@@ -301,23 +303,39 @@ export function database() {
     db.exec("DROP TABLE IF EXISTS calendar_oauth_states");
     const copyColumns = new Set(db.prepare("PRAGMA table_info(calendar_copies)").all().map((column) => String(column.name)));
     if (!copyColumns.has("resource_uid")) db.exec("ALTER TABLE calendar_copies ADD COLUMN resource_uid TEXT");
-    for (const [table,column] of [["google_creation_reservations","attempted"],["apple_creation_reservations","attempted"],["calendar_creation_cleanup","uncertain"]]) {
-      const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((entry) => String(entry.name)));
-      if (!columns.has(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0 CHECK(${column} IN (0,1))`);
-    }
-    db.exec(`CREATE TRIGGER preserve_calendar_creation_before_item_delete
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const [table,column] of [["google_creation_reservations","attempted"],["apple_creation_reservations","attempted"],["calendar_creation_cleanup","uncertain"],
+        ["google_creation_reservations","active_attempts"],["apple_creation_reservations","active_attempts"],["calendar_creation_cleanup","pending_attempts"]]) {
+        const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((entry) => String(entry.name)));
+        if (!columns.has(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0${column === "attempted" || column === "uncertain" ? " CHECK("+column+" IN (0,1))" : ""}`);
+      }
+      // Older rows recorded only a boolean. Preserve that uncertainty across the
+      // schema upgrade until a later provider reconciliation can resolve it.
+      db.exec(`UPDATE google_creation_reservations SET active_attempts=MAX(active_attempts,attempted);
+        UPDATE apple_creation_reservations SET active_attempts=MAX(active_attempts,attempted);
+        UPDATE calendar_creation_cleanup SET pending_attempts=MAX(pending_attempts,uncertain)`);
+      // Replace the deletion trigger in the same write transaction as the attempt
+      // migration. No process can delete an Event between the snapshot and swap.
+      db.exec("DROP TRIGGER IF EXISTS preserve_calendar_creation_before_item_delete");
+      db.exec(`CREATE TRIGGER preserve_calendar_creation_before_item_delete
       BEFORE DELETE ON items BEGIN
-        INSERT INTO calendar_creation_cleanup(user_id,provider,connection_scope_id,item_id,external_id,ownership_token,uncertain)
-          SELECT r.user_id,'google',r.connection_scope_id,r.item_id,r.event_id,r.ownership_token,r.attempted
+        INSERT INTO calendar_creation_cleanup(user_id,provider,connection_scope_id,item_id,external_id,ownership_token,uncertain,pending_attempts)
+          SELECT r.user_id,'google',r.connection_scope_id,r.item_id,r.event_id,r.ownership_token,CASE WHEN r.active_attempts>0 THEN 1 ELSE r.attempted END,r.active_attempts
           FROM google_creation_reservations r WHERE r.user_id=OLD.user_id AND r.item_id=OLD.id
         ON CONFLICT(user_id,provider,connection_scope_id,item_id) DO UPDATE SET
-          external_id=excluded.external_id,ownership_token=excluded.ownership_token,uncertain=MAX(calendar_creation_cleanup.uncertain,excluded.uncertain);
-        INSERT INTO calendar_creation_cleanup(user_id,provider,connection_scope_id,item_id,external_id,ownership_token,uncertain)
-          SELECT r.user_id,'apple',r.connection_scope_id,r.item_id,r.resource_uid,NULL,r.attempted
+          external_id=excluded.external_id,ownership_token=excluded.ownership_token,uncertain=MAX(calendar_creation_cleanup.uncertain,excluded.uncertain),pending_attempts=MAX(calendar_creation_cleanup.pending_attempts,excluded.pending_attempts);
+        INSERT INTO calendar_creation_cleanup(user_id,provider,connection_scope_id,item_id,external_id,ownership_token,uncertain,pending_attempts)
+          SELECT r.user_id,'apple',r.connection_scope_id,r.item_id,r.resource_uid,NULL,CASE WHEN r.active_attempts>0 THEN 1 ELSE r.attempted END,r.active_attempts
           FROM apple_creation_reservations r WHERE r.user_id=OLD.user_id AND r.item_id=OLD.id
         ON CONFLICT(user_id,provider,connection_scope_id,item_id) DO UPDATE SET
-          external_id=excluded.external_id,uncertain=MAX(calendar_creation_cleanup.uncertain,excluded.uncertain);
+          external_id=excluded.external_id,uncertain=MAX(calendar_creation_cleanup.uncertain,excluded.uncertain),pending_attempts=MAX(calendar_creation_cleanup.pending_attempts,excluded.pending_attempts);
       END`);
+      db.exec("COMMIT");
+    } catch (error) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the trigger replacement error. */ }
+      throw error;
+    }
     const attachmentColumns = new Set(db.prepare("PRAGMA table_info(attachments)").all().map((column) => String(column.name)));
     if (!attachmentColumns.has("scope")) db.exec("ALTER TABLE attachments ADD COLUMN scope TEXT NOT NULL DEFAULT 'occurrence' CHECK(scope IN ('occurrence','series'))");
     globalDatabase.filetasksDatabase = db;

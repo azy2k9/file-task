@@ -19,7 +19,7 @@ export function enqueueCalendarSync(userId: string) {
 }
 
 /** Advance connected-provider generations before a sync pass so stale workers cannot settle newer delivery. */
-export function beginCalendarSync(userId: string, providers?: readonly CalendarSyncProvider[]): CalendarSyncGeneration[] {
+export function beginCalendarSync(userId: string, providers?: readonly CalendarSyncProvider[], preserveAttempts = false): CalendarSyncGeneration[] {
   const db = database();
   const currentTime = nowMs();
   const filter = providers === undefined ? "" : ` AND provider IN (${providers.map(() => "?").join(",") || "NULL"})`;
@@ -30,8 +30,9 @@ export function beginCalendarSync(userId: string, providers?: readonly CalendarS
     db.prepare(`INSERT OR IGNORE INTO calendar_sync_state(user_id,provider,generation,state,attempts,next_attempt_at)
       SELECT user_id,provider,0,'pending',0,? FROM calendar_connections WHERE user_id=?${filter}`)
       .run(currentTime,userId,...params);
-    db.prepare(`UPDATE calendar_sync_state SET generation=generation+1,state='pending',next_attempt_at=?
-      WHERE user_id=?${filter}`).run(currentTime,userId,...params);
+    db.prepare(`UPDATE calendar_sync_state SET generation=generation+1,state='pending',next_attempt_at=?,
+      attempts=CASE WHEN ? THEN attempts ELSE 0 END
+      WHERE user_id=?${filter}`).run(currentTime,preserveAttempts ? 1 : 0,userId,...params);
     const generations = db.prepare(`SELECT s.provider,s.generation FROM calendar_sync_state s
       JOIN calendar_connections c ON c.user_id=s.user_id AND c.provider=s.provider
       WHERE s.user_id=?${stateFilter} ORDER BY s.provider`).all(userId,...params) as CalendarSyncGeneration[];
