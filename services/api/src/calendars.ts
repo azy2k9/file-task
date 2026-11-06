@@ -474,7 +474,7 @@ function withAppleSyncGeneration(ics: string, generation: number) {
   const value = `X-FILETASKS-SYNC-GENERATION:${generation}`;
   if (index >= 0) parsed.lines[index] = value;
   else parsed.lines.splice(parsed.end++,0,value);
-  return `${parsed.lines.join("\r\n")}\r\n`;
+  return parsed.lines.join("\r\n").replace(/(?:\r\n)*$/,"\r\n");
 }
 
 function appleSyncGeneration(ics: string) {
@@ -1985,7 +1985,7 @@ async function syncGoogle(connection: Connection, events: EventItem[], limits: M
     if (ownershipToken) extended.private.filetasksOwnershipToken = ownershipToken;
     const event = { ...extras,...(intent ? { id: intent.eventId } : {}),summary, description: `${details}${backlinkText && !details.includes(backlinkText) ? `\n\n${backlinkText}` : ""}`,
       ...bounds,...(recurrence ? { recurrence } : {}) };
-    let response: Response;
+    let response: Response | undefined;
     let updateETag: string | undefined;
     let mappedMissing = false;
     if (mapped) {
@@ -2022,8 +2022,9 @@ async function syncGoogle(connection: Connection, events: EventItem[], limits: M
         if (!intent) throw error;
         response = new Response(null, { status: 409 });
       }
-      if (requestReturned && (!intent || !response.ok)) attempt.finish(intent?.eventId ?? mapped ?? "");
+      if (requestReturned && (!intent || !response?.ok)) attempt.finish(intent?.eventId ?? mapped ?? "");
     }
+    if (!response) throw new HttpError(502,"The Google Calendar copy could not be synchronized safely.");
     assertActiveScope(connection);
     if (mapped && response.status === 404 && (!metadata || (metadata.provider === "google" && metadata.source_account_id === (connection.calendar_url ?? "primary") && metadata.state === "supported" && !item.recurrence && retainedGoogleSingle(metadata)) || (metadata.provider === "apple" && metadata.state === "supported" && !item.recurrence && verifiedAppleItems.has(item.id)))) {
       // Rotate only the reservation for the copy whose absence was just confirmed.

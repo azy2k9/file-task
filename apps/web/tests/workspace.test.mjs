@@ -51,6 +51,7 @@ let appleEventVersions = new Map();
 let holdNextCalendarUpdate = null;
 let holdNextAppleBody = null;
 let holdNextAppleDelete = null;
+let holdNextCalendarCreation = null;
 let omittedAppleReports = new Set();
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
@@ -491,6 +492,7 @@ async function startDeliveryFakeDuringSetup(setup) {
   googleInstanceRequests = [];
   appleEvents = new Map();
   appleEventVersions = new Map();
+  holdNextCalendarCreation = null;
   holdNextAppleBody = null;
   holdNextAppleDelete = null;
   deliveryServer = createServer(async (request, response) => {
