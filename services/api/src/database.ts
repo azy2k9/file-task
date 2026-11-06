@@ -13,6 +13,7 @@ export function database() {
     const path = resolve(/* turbopackIgnore: true */ repositoryRoot, databasePath);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     const db = new DatabaseSync(path);
+    db.exec("DROP TRIGGER IF EXISTS preserve_calendar_creation_before_item_delete");
     db.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA foreign_keys = ON;
@@ -61,6 +62,7 @@ export function database() {
         connection_scope_id TEXT NOT NULL,
         event_id TEXT NOT NULL,
         ownership_token TEXT NOT NULL,
+        attempted INTEGER NOT NULL DEFAULT 0 CHECK(attempted IN (0,1)),
         PRIMARY KEY(user_id,item_id,provider,connection_scope_id),
         FOREIGN KEY(user_id,item_id) REFERENCES items(user_id,id) ON DELETE CASCADE
       );
@@ -70,6 +72,7 @@ export function database() {
         provider TEXT NOT NULL CHECK(provider = 'apple'),
         connection_scope_id TEXT NOT NULL,
         resource_uid TEXT NOT NULL,
+        attempted INTEGER NOT NULL DEFAULT 0 CHECK(attempted IN (0,1)),
         PRIMARY KEY(user_id,item_id,provider,connection_scope_id),
         UNIQUE(user_id,provider,connection_scope_id,resource_uid),
         FOREIGN KEY(user_id,item_id) REFERENCES items(user_id,id) ON DELETE CASCADE
@@ -81,6 +84,7 @@ export function database() {
         item_id TEXT NOT NULL,
         external_id TEXT NOT NULL,
         ownership_token TEXT,
+        uncertain INTEGER NOT NULL DEFAULT 0 CHECK(uncertain IN (0,1)),
         PRIMARY KEY(user_id,provider,connection_scope_id,item_id)
       );
       CREATE TABLE IF NOT EXISTS calendar_export_locks (
@@ -93,17 +97,6 @@ export function database() {
         PRIMARY KEY(user_id,provider,connection_scope_id)
       );
       CREATE INDEX IF NOT EXISTS calendar_export_locks_lease ON calendar_export_locks(lease_until);
-      CREATE TRIGGER IF NOT EXISTS preserve_calendar_creation_before_item_delete
-      BEFORE DELETE ON items BEGIN
-        INSERT INTO calendar_creation_cleanup(user_id,provider,connection_scope_id,item_id,external_id,ownership_token)
-          SELECT r.user_id,'google',r.connection_scope_id,r.item_id,r.event_id,r.ownership_token
-          FROM google_creation_reservations r WHERE r.user_id=OLD.user_id AND r.item_id=OLD.id
-        ON CONFLICT(user_id,provider,connection_scope_id,item_id) DO UPDATE SET external_id=excluded.external_id,ownership_token=excluded.ownership_token;
-        INSERT INTO calendar_creation_cleanup(user_id,provider,connection_scope_id,item_id,external_id,ownership_token)
-          SELECT r.user_id,'apple',r.connection_scope_id,r.item_id,r.resource_uid,NULL
-          FROM apple_creation_reservations r WHERE r.user_id=OLD.user_id AND r.item_id=OLD.id
-        ON CONFLICT(user_id,provider,connection_scope_id,item_id) DO UPDATE SET external_id=excluded.external_id;
-      END;
       CREATE TABLE IF NOT EXISTS user_preferences (
         user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
         task_reminders TEXT NOT NULL DEFAULT '[]', event_reminders TEXT NOT NULL DEFAULT '[]',
@@ -308,6 +301,23 @@ export function database() {
     db.exec("DROP TABLE IF EXISTS calendar_oauth_states");
     const copyColumns = new Set(db.prepare("PRAGMA table_info(calendar_copies)").all().map((column) => String(column.name)));
     if (!copyColumns.has("resource_uid")) db.exec("ALTER TABLE calendar_copies ADD COLUMN resource_uid TEXT");
+    for (const [table,column] of [["google_creation_reservations","attempted"],["apple_creation_reservations","attempted"],["calendar_creation_cleanup","uncertain"]]) {
+      const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((entry) => String(entry.name)));
+      if (!columns.has(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0 CHECK(${column} IN (0,1))`);
+    }
+    db.exec(`CREATE TRIGGER preserve_calendar_creation_before_item_delete
+      BEFORE DELETE ON items BEGIN
+        INSERT INTO calendar_creation_cleanup(user_id,provider,connection_scope_id,item_id,external_id,ownership_token,uncertain)
+          SELECT r.user_id,'google',r.connection_scope_id,r.item_id,r.event_id,r.ownership_token,r.attempted
+          FROM google_creation_reservations r WHERE r.user_id=OLD.user_id AND r.item_id=OLD.id
+        ON CONFLICT(user_id,provider,connection_scope_id,item_id) DO UPDATE SET
+          external_id=excluded.external_id,ownership_token=excluded.ownership_token,uncertain=MAX(calendar_creation_cleanup.uncertain,excluded.uncertain);
+        INSERT INTO calendar_creation_cleanup(user_id,provider,connection_scope_id,item_id,external_id,ownership_token,uncertain)
+          SELECT r.user_id,'apple',r.connection_scope_id,r.item_id,r.resource_uid,NULL,r.attempted
+          FROM apple_creation_reservations r WHERE r.user_id=OLD.user_id AND r.item_id=OLD.id
+        ON CONFLICT(user_id,provider,connection_scope_id,item_id) DO UPDATE SET
+          external_id=excluded.external_id,uncertain=MAX(calendar_creation_cleanup.uncertain,excluded.uncertain);
+      END`);
     const attachmentColumns = new Set(db.prepare("PRAGMA table_info(attachments)").all().map((column) => String(column.name)));
     if (!attachmentColumns.has("scope")) db.exec("ALTER TABLE attachments ADD COLUMN scope TEXT NOT NULL DEFAULT 'occurrence' CHECK(scope IN ('occurrence','series'))");
     globalDatabase.filetasksDatabase = db;

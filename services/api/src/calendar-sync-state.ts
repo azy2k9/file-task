@@ -30,7 +30,7 @@ export function beginCalendarSync(userId: string, providers?: readonly CalendarS
     db.prepare(`INSERT OR IGNORE INTO calendar_sync_state(user_id,provider,generation,state,attempts,next_attempt_at)
       SELECT user_id,provider,0,'pending',0,? FROM calendar_connections WHERE user_id=?${filter}`)
       .run(currentTime,userId,...params);
-    db.prepare(`UPDATE calendar_sync_state SET generation=generation+1,state='pending',attempts=0,next_attempt_at=?,last_attempt_at=NULL,last_error=NULL
+    db.prepare(`UPDATE calendar_sync_state SET generation=generation+1,state='pending',next_attempt_at=?
       WHERE user_id=?${filter}`).run(currentTime,userId,...params);
     const generations = db.prepare(`SELECT s.provider,s.generation FROM calendar_sync_state s
       JOIN calendar_connections c ON c.user_id=s.user_id AND c.provider=s.provider
@@ -44,7 +44,7 @@ export function beginCalendarSync(userId: string, providers?: readonly CalendarS
 }
 
 export function completeCalendarSync(userId: string, generation: CalendarSyncGeneration) {
-  database().prepare(`UPDATE calendar_sync_state SET state='synced',next_attempt_at=NULL,last_error=NULL
+  database().prepare(`UPDATE calendar_sync_state SET state='synced',attempts=0,next_attempt_at=NULL,last_attempt_at=NULL,last_error=NULL
     WHERE user_id=? AND provider=? AND generation=?`).run(userId,generation.provider,generation.generation);
 }
 
