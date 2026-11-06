@@ -1315,6 +1315,11 @@ test("Email and push deliveries retry with a stable idempotency key and can be r
   assert.equal(deliveredKeys.size, 2);
 
   assert.equal((await request(`/api/devices/push/${device.id}`, { token: owner.token, method: "DELETE" })).status, 204);
+  const cleanupDb = new DatabaseSync(join(directory, "workspace.sqlite"));
+  assert.equal(cleanupDb.prepare("SELECT count(*) AS count FROM push_cleanup_jobs").get().count, 1,
+    "revocation should be durably queued before provider cleanup runs");
+  cleanupDb.close();
+  await runReminderWorker();
   assert.equal(deliveryRequests.some(({ body }) => body.operation === "revoke" && body.registrationId), true);
   assert.equal((await request(`/api/devices/push/${device.id}`, { token: owner.token, method: "DELETE" })).status, 404);
   assert.equal(item.kind, "event");
@@ -1365,11 +1370,12 @@ test("push revoke is durable during provider outages and remains scoped to the s
   const pushCalls = providerRequests.slice(providerStart).filter(({ path }) => path === "/push");
   const ownerDeliveries = pushCalls.filter(({ body }) => body.operation === "deliver");
   assert.ok(ownerDeliveries.some(({ body }) => body.registrationId === retainedRegistrationId), "the still-registered device should continue receiving sends");
-  assert.ok(ownerDeliveries.some(({ body }) => body.registrationId === otherRegistrationId), "another account's registered device should remain unaffected");
   assert.equal(ownerDeliveries.some(({ body }) => body.registrationId === revokedRegistrationId), false,
     "the revoked device must not receive a newly scheduled send");
   const db = new DatabaseSync(join(directory, "workspace.sqlite"));
   assert.equal(db.prepare("SELECT count(*) AS count FROM push_devices WHERE id=?").get(revoked.id).count, 0);
+  assert.equal(db.prepare("SELECT count(*) AS count FROM push_devices WHERE provider_id=?").get(otherRegistrationId).count, 1,
+    "another account's registered device should remain unaffected");
   assert.equal(db.prepare("SELECT count(*) AS count FROM push_cleanup_jobs").get().count, 1,
     "failed provider cleanup must remain durable after the sign-out bearer is invalidated");
   db.close();
