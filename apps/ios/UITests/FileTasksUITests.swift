@@ -330,8 +330,27 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         scrollToHittable(repeatToggle, toward: .down, message: "The editor should offer a Recurrence rule after adding a date.")
         if (repeatToggle.value as? String) != "1" { repeatToggle.tap() }
 
+        let recurrenceEnabled = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", "1"),
+            object: repeatToggle
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [recurrenceEnabled], timeout: 10), .completed,
+                       "The Repeat control should turn on before its recurrence controls are used. Accessibility hierarchy: \(app.debugDescription)")
+
         let intervalPicker = element(identifier: "itemEditor.recurrence.interval")
+        let intervalPickerExists = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true"),
+            object: intervalPicker
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [intervalPickerExists], timeout: 10), .completed,
+                       "Turning on Repeat should create the interval picker. Accessibility hierarchy: \(app.debugDescription)")
         scrollToHittable(intervalPicker, toward: .down)
+        let intervalPickerIsHittable = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true AND hittable == true"),
+            object: intervalPicker
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [intervalPickerIsHittable], timeout: 10), .completed,
+                       "The recurrence interval picker should be hittable before selecting it. Accessibility hierarchy: \(app.debugDescription)")
         intervalPicker.tap()
         let daysOption = app.buttons["Days"]
         XCTAssertTrue(daysOption.waitForExistence(timeout: 5), "The shared recurrence editor should offer a daily interval.")
