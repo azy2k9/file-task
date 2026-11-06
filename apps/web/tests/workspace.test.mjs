@@ -452,6 +452,43 @@ async function startDeliveryFakeDuringSetup(setup) {
     }
     const isJson = request.headers["content-type"]?.includes("application/json");
     const body = isJson && bodyText ? JSON.parse(bodyText) : {};
+    if (request.method === "GET" && url.pathname === "/test/google-events") {
+      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify([...googleEvents.values()]));
+      return;
+    }
+    if (url.pathname === "/google-auth") {
+      const redirectUri = url.searchParams.get("redirect_uri");
+      const state = url.searchParams.get("state");
+      if (!redirectUri || !state) {
+        response.writeHead(400).end("Missing Google authorization parameters.");
+        return;
+      }
+      const success = new URL(redirectUri);
+      if (success.origin !== base || success.pathname !== "/api/calendars/google/callback") {
+        response.writeHead(400).end("Unexpected Google authorization callback.");
+        return;
+      }
+      success.searchParams.set("state", state);
+      success.searchParams.set("code", "fake-code");
+      const cancellation = new URL(success);
+      cancellation.searchParams.delete("code");
+      cancellation.searchParams.set("error", "access_denied");
+      const escapeAttribute = (value) => value.replaceAll("&", "&amp;").replaceAll('"', "&quot;")
+        .replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+      response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(
+        `<!doctype html>
+<html lang="en">
+  <head><meta name="viewport" content="width=device-width"><title>Google Calendar test authorization</title></head>
+  <body>
+    <h1>Google Calendar access</h1>
+    <p>Choose whether to authorize this FileTasks account.</p>
+    <p><a href="${escapeAttribute(cancellation.href)}">Cancel authorization</a></p>
+    <p><a href="${escapeAttribute(success.href)}">Allow Google Calendar</a></p>
+  </body>
+</html>`,
+      );
+      return;
+    }
     providerRequests.push({ path: url.pathname, method: request.method, body, text: bodyText, query: url.search, headers: request.headers });
     const idempotencyKey = request.headers["idempotency-key"];
     deliveryRequests.push({ path: request.url, body, idempotencyKey });
@@ -994,6 +1031,26 @@ async function beginGoogleAuthorization(owner) {
     cookie: mergeCookies(owner.cookie, transactionCookie),
   };
 }
+
+test("the iOS UI Google authorization fake offers cancel and approve callbacks", async () => {
+  const state = "ios-ui-browser-state";
+  const authorizationUrl = new URL(`${deliveryBase}/google-auth`);
+  authorizationUrl.searchParams.set("redirect_uri", `${base}/api/calendars/google/callback`);
+  authorizationUrl.searchParams.set("state", state);
+  const response = await fetch(authorizationUrl);
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  const links = [...html.matchAll(/href="([^"]+)"/g)].map(([, href]) => new URL(href.replaceAll("&amp;", "&")));
+  assert.equal(links.length, 2);
+  assert.equal(links[0].searchParams.get("state"), state);
+  assert.equal(links[0].searchParams.get("error"), "access_denied");
+  assert.equal(links[0].searchParams.has("code"), false);
+  assert.equal(links[1].searchParams.get("state"), state);
+  assert.equal(links[1].searchParams.get("code"), "fake-code");
+  assert.equal(links[1].searchParams.has("error"), false);
+  assert.match(html, /Cancel authorization/);
+  assert.match(html, /Allow Google Calendar/);
+});
 
 test("a person can create a Task on one client and view it on another after signing in", async () => {
   const owner = await account();
@@ -2938,6 +2995,7 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, calenda
     ], {
       ...process.env,
       TEST_RUNNER_FILETASKS_IOS_UI_APPLE_URL: `${deliveryBase}/apple/calendar/`,
+      TEST_RUNNER_FILETASKS_IOS_UI_PROVIDER_STATE_URL: `${deliveryBase}/test/google-events`,
     }, repoRoot, { detached: true });
     assert.equal(failNextAppleRequest, null, "the native Apple Calendar UI should surface and then recover from the provider failure");
   } catch (error) {

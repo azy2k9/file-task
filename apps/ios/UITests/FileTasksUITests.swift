@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 
 final class FileTasksReminderDefaultsUITests: XCTestCase {
@@ -11,7 +12,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         app.launch()
     }
 
-    func testRegistrationSignInCrossTypeReminderPreservation() {
+    func testRegistrationSignInCrossTypeReminderPreservation() async throws {
         configureLocalServerInApp()
         registerSecondAccountInApp()
         exerciseCalendarSettingsForSecondAccount()
@@ -33,6 +34,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         XCTAssertTrue(syncNotice.waitForExistence(timeout: 30),
                       "Native Sync Calendar should report its result. Accessibility hierarchy: \(app.debugDescription)")
         XCTAssertTrue(syncNotice.label.localizedCaseInsensitiveContains("Synced Google Calendar"), syncNotice.label)
+        try await assertGoogleProviderCopiesRestored()
         app.buttons["Done"].tap()
         XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Native calendar sync authority")).firstMatch.waitForExistence(timeout: 10))
         XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Native imported Google Event")).firstMatch.waitForExistence(timeout: 10),
@@ -144,15 +146,54 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
                       "An account without a Google connection should be offered the secure browser handoff.")
         scrollToHittable(connectGoogle, toward: .down)
         connectGoogle.tap()
+        let safari = XCUIApplication(bundleIdentifier: "com.apple.mobilesafari")
+        let browserEmail = safari.textFields["Email"]
+        if browserEmail.waitForExistence(timeout: 15) {
+            browserEmail.tap()
+            browserEmail.typeText(registrationEmail)
+            let browserPassword = safari.secureTextFields["Password"]
+            XCTAssertTrue(browserPassword.waitForExistence(timeout: 5),
+                          "Safari should expose the FileTasks sign-in form. Accessibility hierarchy: \(safari.debugDescription)")
+            browserPassword.tap()
+            browserPassword.typeText(password)
+            let signInButtons = safari.buttons.matching(NSPredicate(format: "label == %@", "Sign in")).allElementsBoundByIndex
+            guard let submitSignIn = signInButtons.last else {
+                XCTFail("Safari should expose the FileTasks sign-in action. Accessibility hierarchy: \(safari.debugDescription)")
+                return
+            }
+            submitSignIn.tap()
+        }
+        XCTAssertTrue(safari.staticTexts[registrationEmail].waitForExistence(timeout: 20),
+                      "Google authorization must use the same FileTasks account as the native app. Accessibility hierarchy: \(safari.debugDescription)")
+
+        authorizeGoogleFromSafari(safari, link: "Cancel authorization")
         app.activate()
         let handoffNotice = element(identifier: "calendar.action.notice")
-        XCTAssertTrue(handoffNotice.waitForExistence(timeout: 15),
-                      "Returning from Safari should refresh the native calendar status after the Google handoff.")
+        let cancellationNotice = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS[cd] %@", "Google Calendar was not connected"),
+            object: handoffNotice
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [cancellationNotice], timeout: 15), .completed,
+                       "Returning from a cancelled Safari authorization should refresh native calendar status.")
         XCTAssertTrue(handoffNotice.label.localizedCaseInsensitiveContains("not connected"), handoffNotice.label)
         XCTAssertTrue(connectGoogle.exists,
-                      "An incomplete or cancelled browser flow must not connect Google to the native account.")
+                      "Cancelling Google authorization must leave the native account disconnected.")
         XCTAssertTrue(app.buttons["calendar.connect.apple"].exists,
                       "An account without an Apple connection should be offered the native Apple form.")
+
+        safari.activate()
+        authorizeGoogleFromSafari(safari, link: "Allow Google Calendar")
+        app.activate()
+        let connectedGoogle = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Google Calendar")).firstMatch
+        XCTAssertTrue(connectedGoogle.waitForExistence(timeout: 20),
+                      "Completing browser authorization should connect Google to the same native account. Accessibility hierarchy: \(app.debugDescription)")
+        XCTAssertTrue(app.buttons["calendar.disconnect.google"].waitForExistence(timeout: 5),
+                      "The native app should offer account-scoped Google disconnect after the browser callback completes.")
+        let disconnectGoogle = app.buttons["calendar.disconnect.google"]
+        scrollToHittable(disconnectGoogle, toward: .up)
+        disconnectGoogle.tap()
+        XCTAssertTrue(connectGoogle.waitForExistence(timeout: 15),
+                      "The native account should return to a disconnected state after Google is disconnected.")
 
         let username = app.textFields["calendar.apple.username"]
         let passwordField = app.secureTextFields["calendar.apple.password"]
@@ -174,9 +215,9 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         scrollToHittable(connectApple, toward: .down)
         connectApple.tap()
         let disconnectApple = app.buttons["calendar.disconnect.apple"]
-        scrollToHittable(disconnectApple, toward: .down)
         XCTAssertTrue(disconnectApple.waitForExistence(timeout: 30),
                       "The native screen should show the Apple connection after the fake provider recovers.")
+        scrollToHittable(disconnectApple, toward: .up)
         disconnectApple.tap()
         scrollToHittable(connectApple, toward: .down)
         XCTAssertTrue(connectApple.waitForExistence(timeout: 15),
@@ -189,6 +230,59 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         XCTAssertTrue(cancellation.waitForExistence(timeout: 5))
         XCTAssertTrue(cancellation.label.localizedCaseInsensitiveContains("cancelled"), cancellation.label)
         app.buttons["Done"].tap()
+    }
+
+    private func authorizeGoogleFromSafari(_ safari: XCUIApplication, link: String) {
+        let settings = safari.buttons["Settings"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 15),
+                      "The signed-in FileTasks website should be available in Safari. Accessibility hierarchy: \(safari.debugDescription)")
+        settings.tap()
+
+        let connectGoogle = safari.buttons["Connect Google Calendar"]
+        scrollBrowserToHittable(connectGoogle, safari: safari)
+        connectGoogle.tap()
+
+        let authorizationChoice = safari.links[link]
+        XCTAssertTrue(authorizationChoice.waitForExistence(timeout: 15),
+                      "The fake Google authorization page should offer the requested choice. Accessibility hierarchy: \(safari.debugDescription)")
+        authorizationChoice.tap()
+        XCTAssertTrue(safari.buttons["Settings"].waitForExistence(timeout: 15),
+                      "The Google callback should return Safari to FileTasks.")
+    }
+
+    private func scrollBrowserToHittable(_ target: XCUIElement, safari: XCUIApplication) {
+        for _ in 0...8 {
+            if target.isHittable { return }
+            safari.swipeUp()
+        }
+        XCTAssertTrue(target.isHittable,
+                      "The browser calendar action should become visible. Accessibility hierarchy: \(safari.debugDescription)")
+    }
+
+    private func assertGoogleProviderCopiesRestored() async throws {
+        let stateURL = ProcessInfo.processInfo.environment["FILETASKS_IOS_UI_PROVIDER_STATE_URL"] ?? ""
+        guard let url = URL(string: stateURL), url.scheme != nil, url.host != nil else {
+            XCTFail("The shared Google provider state URL must be passed to the iOS UI test.")
+            return
+        }
+
+        let (data, response) = try await URLSession.shared.data(from: url)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200,
+                       "The shared provider fake should return its calendar Events.")
+        guard let events = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            XCTFail("The shared provider fake should return a JSON Event list.")
+            return
+        }
+
+        for title in ["Native calendar sync authority", "Native calendar missing copy"] {
+            let copies = events.filter { $0["summary"] as? String == title }
+            XCTAssertEqual(copies.count, 1,
+                           "Native Sync Calendar should restore exactly one Google copy titled \(title).")
+            guard let copy = copies.first else { continue }
+            let description = copy["description"] as? String ?? ""
+            XCTAssertTrue(description.contains("?event="),
+                          "The restored Google copy titled \(title) should retain its FileTasks Event backlink.")
+        }
     }
 
     private func changeServerClearsSession() {
