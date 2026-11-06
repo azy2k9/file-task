@@ -2450,6 +2450,88 @@ test("recurring items create independent Occurrences and honor occurrence and se
   assert.equal(afterSeriesEdit.find(({ id }) => id === occurrenceId)?.completed, true);
 });
 
+test("editing the first Occurrence locally preserves its recurrence definition and series identity", async () => {
+  const owner = await account();
+  const previousClock = new Date(testClock);
+  try {
+    const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "task", title: "Original series title", details: "Original series details", scheduledDate: "2026-11-01", scheduledTime: "08:00",
+      recurrence: { interval: 1, unit: "days", end: { type: "never" } },
+      reminders: [{ delivery: "notification", amount: 1, unit: "days", time: "09:00" }],
+    } });
+    assert.equal(created.status, 201);
+    const root = (await created.json()).item;
+    const file = (await (await request("/api/files", { token: owner.token, method: "POST", body: { name: "Series notes", url: "https://example.com/series-notes" } })).json()).file;
+    assert.equal((await request(`/api/files/${file.id}/attachments`, { token: owner.token, method: "POST", body: { itemId: root.id, scope: "series" } })).status, 201);
+    assert.equal((await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: { completed: true } })).status, 200);
+    let series = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === root.id);
+    const laterBefore = series.find(({ id }) => id !== root.id);
+    assert.ok(laterBefore);
+
+    const localEdit = await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: {
+      title: "First Occurrence only", details: "Local details", scheduledDate: "2026-10-20", scheduledTime: "12:30",
+      recurrence: null, reminders: [{ delivery: "notification", amount: 2, unit: "hours", time: "10:30" }], scope: "occurrence",
+    } });
+    assert.equal(localEdit.status, 200, await localEdit.clone().text());
+    const editedRoot = (await localEdit.json()).item;
+    assert.equal(editedRoot.id, root.id);
+    assert.equal(editedRoot.seriesId, root.id);
+    assert.equal(editedRoot.occurrenceDate, "2026-11-01", "moving the first Occurrence must retain its original recurrence identity");
+    assert.equal(editedRoot.scheduledDate, "2026-10-20");
+    assert.equal(editedRoot.recurrence, null, "the first Occurrence can keep a local recurrence choice");
+    assert.equal(editedRoot.completed, true);
+    assert.deepEqual(editedRoot.files.map(({ id }) => id), [file.id]);
+
+    series = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === root.id);
+    const unchangedLater = series.find(({ id }) => id === laterBefore.id);
+    assert.ok(unchangedLater, "the later Occurrence keeps its stable id");
+    assert.equal(unchangedLater.title, "Original series title");
+    assert.equal(unchangedLater.scheduledTime, "08:00");
+    assert.deepEqual(unchangedLater.reminders, [{ delivery: "notification", amount: 1, unit: "days", time: "09:00" }]);
+    assert.deepEqual(unchangedLater.files.map(({ id }) => id), [file.id]);
+    assert.ok(series.some(({ id, occurrenceDate }) => id === root.id && occurrenceDate === "2026-11-01"),
+      "the moved first Occurrence keeps its original recurrence identity");
+
+    await setTestClock(previousClock.getTime() + 372 * 86_400_000);
+    series = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === root.id);
+    const generated = series.find(({ occurrenceDate }) => occurrenceDate === "2028-01-01");
+    assert.ok(generated, "advancing the controlled clock should materialize a date beyond the original rolling horizon");
+    assert.notEqual(generated.id, root.id);
+    assert.equal(generated.title, "Original series title");
+    assert.equal(generated.scheduledDate, "2028-01-01");
+    assert.equal(generated.scheduledTime, "08:00");
+    assert.deepEqual(generated.reminders, [{ delivery: "notification", amount: 1, unit: "days", time: "09:00" }]);
+    assert.deepEqual(generated.files.map(({ id }) => id), [file.id]);
+  } finally { await setTestClock(previousClock); }
+});
+
+test("turning an existing item into a recurrence creates its generation definition", async () => {
+  const owner = await account();
+  const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "task", title: "Existing task", details: "Keep this definition", scheduledDate: "2027-02-01", scheduledTime: "09:00",
+  } });
+  assert.equal(created.status, 201);
+  const item = (await created.json()).item;
+  const updated = await request(`/api/items/${item.id}`, { token: owner.token, method: "PATCH", body: {
+    recurrence: { interval: 1, unit: "days", end: { type: "count", count: 3 } },
+  } });
+  assert.equal(updated.status, 200, await updated.clone().text());
+  let items = (await (await request("/api/items", { token: owner.token })).json()).items;
+  let series = items.filter(({ seriesId }) => seriesId === item.id);
+  assert.equal(series.length, 3);
+  assert.deepEqual(series.map(({ scheduledDate }) => scheduledDate), ["2027-02-01", "2027-02-02", "2027-02-03"]);
+  const occurrenceIds = series.map(({ id }) => id).sort();
+
+  const previousClock = new Date(testClock);
+  try {
+    await setTestClock(previousClock.getTime() + 372 * 86_400_000);
+    items = (await (await request("/api/items", { token: owner.token })).json()).items;
+    series = items.filter(({ seriesId }) => seriesId === item.id);
+    assert.equal(series.length, 3, "the persisted count ending remains in effect after subsequent reads");
+    assert.deepEqual(series.map(({ id }) => id).sort(), occurrenceIds, "existing Occurrence identities remain stable");
+  } finally { await setTestClock(previousClock); }
+});
+
 test("a series Attachment is available from every Occurrence and can be removed from the whole series", async () => {
   const owner = await account();
   const created = await request("/api/items", { token: owner.token, method: "POST", body: {

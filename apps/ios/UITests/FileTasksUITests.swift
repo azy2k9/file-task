@@ -18,6 +18,11 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         signInInApp(email: sharedEmail)
 
         createEventBySwitchingFromTask(title: "UI Runner Event Default")
+        let addDate = app.switches["Add date"]
+        scrollToHittable(addDate, toward: .down, message: "The Event used for Calendar delivery failure coverage must be dated.")
+        if addDate.value as? String != "1" {
+            addDate.tap()
+        }
         assertReminder(amount: 3, unit: "weeks")
         saveCurrentItem()
         assertCalendarDeliveryNotice()

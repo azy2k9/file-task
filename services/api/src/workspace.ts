@@ -18,9 +18,12 @@ function fromRow(row: Record<string, unknown>): WorkspaceItem {
     scheduledDate: row.scheduled_date == null ? null : String(row.scheduled_date),
     scheduledTime: row.scheduled_time == null ? null : String(row.scheduled_time),
     completed: row.completed == null ? null : Boolean(row.completed), files: [],
-    recurrence: json(row.root_recurrence_json ?? row.recurrence_json, null),
+    recurrence: row.occurrence_recurrence_json != null
+      ? json(row.occurrence_recurrence_json, null)
+      : json(row.series_definition_recurrence_json ?? row.root_recurrence_json ?? row.recurrence_json, null),
     reminders: json(row.reminders_json, []),
-    seriesId: row.series_root_id == null || (row.root_recurrence_json ?? row.recurrence_json) == null ? null : String(row.series_root_id),
+    seriesId: row.series_root_id == null || (row.series_definition_recurrence_json ?? row.root_recurrence_json ?? row.recurrence_json) == null
+      ? null : String(row.series_root_id),
     isOccurrence: row.series_root_id != null && String(row.id) !== String(row.series_root_id), calendarSync: [],
     occurrenceDate: row.occurrence_date == null ? null : String(row.occurrence_date),
     createdAt: String(row.created_at), updatedAt: String(row.updated_at),
@@ -172,7 +175,8 @@ function occurrenceDates(startValue: string, rule: RecurrenceRule, leadDays = 0)
 
 function ensureOccurrences(userId: string) {
   const db = database();
-  const roots = db.prepare("SELECT * FROM items WHERE user_id=? AND series_root_id=id AND recurrence_json IS NOT NULL").all(userId);
+  const roots = db.prepare(`SELECT d.*,i.id,i.kind FROM item_series_definitions d JOIN items i
+    ON i.user_id=d.user_id AND i.id=d.series_root_id WHERE d.user_id=?`).all(userId);
   for (const row of roots) {
     const rule = json<RecurrenceRule | null>(row.recurrence_json, null);
     if (!rule || typeof row.scheduled_date !== "string") continue;
@@ -190,6 +194,19 @@ function ensureOccurrences(userId: string) {
         SELECT user_id,?,provider FROM calendar_import_split_blocks WHERE user_id=? AND item_id=?`).run(id,userId,row.id);
     }
   }
+}
+
+function saveSeriesDefinition(userId: string, rootId: string, item: Pick<WorkspaceItem,
+  "scheduledDate" | "scheduledTime" | "title" | "details" | "recurrence" | "reminders">) {
+  if (!item.recurrence || !item.scheduledDate) {
+    database().prepare("DELETE FROM item_series_definitions WHERE user_id=? AND series_root_id=?").run(userId,rootId);
+    return;
+  }
+  database().prepare(`INSERT INTO item_series_definitions(user_id,series_root_id,scheduled_date,scheduled_time,title,details,recurrence_json,reminders_json)
+    VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(user_id,series_root_id) DO UPDATE SET scheduled_date=excluded.scheduled_date,
+    scheduled_time=excluded.scheduled_time,title=excluded.title,details=excluded.details,recurrence_json=excluded.recurrence_json,
+    reminders_json=excluded.reminders_json`).run(userId,rootId,item.scheduledDate,item.scheduledTime,item.title,item.details,
+      JSON.stringify(item.recurrence),JSON.stringify(item.reminders));
 }
 
 function withFiles(items: WorkspaceItem[], userId: string) {
@@ -350,8 +367,9 @@ export function calendarSyncLimitations(userId: string) {
 
 export function listItems(userId: string) {
   ensureOccurrences(userId);
-  const rows = database().prepare(`SELECT i.*, root.recurrence_json AS root_recurrence_json FROM items i
-    LEFT JOIN items root ON root.id=i.series_root_id WHERE i.user_id=? AND NOT EXISTS(
+  const rows = database().prepare(`SELECT i.*, root.recurrence_json AS root_recurrence_json, d.recurrence_json AS series_definition_recurrence_json FROM items i
+    LEFT JOIN items root ON root.user_id=i.user_id AND root.id=i.series_root_id
+    LEFT JOIN item_series_definitions d ON d.user_id=i.user_id AND d.series_root_id=i.series_root_id WHERE i.user_id=? AND NOT EXISTS(
       SELECT 1 FROM occurrence_exclusions x WHERE x.user_id=i.user_id AND x.series_root_id=i.series_root_id AND x.occurrence_date=i.occurrence_date)
     ORDER BY i.scheduled_date IS NULL,i.scheduled_date,i.scheduled_time,i.created_at,i.id`).all(userId);
   return withFiles(rows.map(fromRow), userId);
@@ -359,15 +377,17 @@ export function listItems(userId: string) {
 
 export function listItemsForCalendarSync(userId: string) {
   ensureOccurrences(userId);
-  const rows = database().prepare(`SELECT i.*, root.recurrence_json AS root_recurrence_json FROM items i
-    LEFT JOIN items root ON root.id=i.series_root_id WHERE i.user_id=?
+  const rows = database().prepare(`SELECT i.*, root.recurrence_json AS root_recurrence_json, d.recurrence_json AS series_definition_recurrence_json FROM items i
+    LEFT JOIN items root ON root.user_id=i.user_id AND root.id=i.series_root_id
+    LEFT JOIN item_series_definitions d ON d.user_id=i.user_id AND d.series_root_id=i.series_root_id WHERE i.user_id=?
     ORDER BY i.scheduled_date IS NULL,i.scheduled_date,i.scheduled_time,i.created_at,i.id`).all(userId);
   return withFiles(rows.map(fromRow), userId);
 }
 
 export function getItem(userId: string, id: string) {
-  const row = database().prepare(`SELECT i.*, root.recurrence_json AS root_recurrence_json FROM items i
-    LEFT JOIN items root ON root.id=i.series_root_id WHERE i.user_id=? AND i.id=? AND (i.id=i.series_root_id OR NOT EXISTS(
+  const row = database().prepare(`SELECT i.*, root.recurrence_json AS root_recurrence_json, d.recurrence_json AS series_definition_recurrence_json FROM items i
+    LEFT JOIN items root ON root.user_id=i.user_id AND root.id=i.series_root_id
+    LEFT JOIN item_series_definitions d ON d.user_id=i.user_id AND d.series_root_id=i.series_root_id WHERE i.user_id=? AND i.id=? AND (i.id=i.series_root_id OR NOT EXISTS(
       SELECT 1 FROM occurrence_exclusions x WHERE x.user_id=i.user_id AND x.series_root_id=i.series_root_id AND x.occurrence_date=i.occurrence_date))`).get(userId, id);
   if (!row) throw new HttpError(404, "This item could not be found.");
   return withFiles([fromRow(row)], userId)[0];
@@ -425,6 +445,7 @@ function saveItemInTransaction(userId: string, body: Record<string, unknown>, id
       recurrence_json,reminders_json,series_root_id,occurrence_date,uses_reminder_default) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       item.id,userId,item.kind,item.title,item.details,item.scheduledDate,item.scheduledTime,item.completed === null ? null : Number(item.completed),
       item.createdAt,item.updatedAt,item.recurrence ? JSON.stringify(item.recurrence) : null,JSON.stringify(item.reminders),rootId,item.recurrence ? item.scheduledDate : null,Number(usesDefault));
+    if (item.recurrence) saveSeriesDefinition(userId,item.id,item);
     return getItem(userId, item.id);
   }
   const rootId = existing?.seriesId ?? (existing?.recurrence ? existing.id : null);
@@ -456,7 +477,7 @@ function saveItemInTransaction(userId: string, body: Record<string, unknown>, id
         .run(userId,series,userId,series,userId,series);
     }
     const wholeSeries = scope === "series" || (scope === "following" && id === series);
-    const root = db.prepare("SELECT scheduled_date FROM items WHERE user_id=? AND id=?").get(userId,series);
+    const root = db.prepare("SELECT scheduled_date,scheduled_time FROM items WHERE user_id=? AND id=?").get(userId,series);
     const scheduleUnchanged = item.scheduledDate === existing?.scheduledDate && item.scheduledTime === existing?.scheduledTime;
     const recurrenceUnchanged = sameRecurrence(existing?.recurrence ?? null,item.recurrence);
     const preservesOccurrenceIdentity = scope === "series" && scheduleUnchanged && recurrenceUnchanged;
@@ -488,26 +509,47 @@ function saveItemInTransaction(userId: string, body: Record<string, unknown>, id
           SELECT user_id,?,provider FROM calendar_import_metadata WHERE user_id=? AND item_id=?
           UNION SELECT user_id,?,provider FROM calendar_import_split_blocks WHERE user_id=? AND item_id=?`).run(id,userId,series,id,userId,series);
         db.prepare("UPDATE items SET recurrence_json=NULL,series_root_id=? WHERE user_id=? AND id=?").run(series,userId,series);
+        db.prepare("DELETE FROM item_series_definitions WHERE user_id=? AND series_root_id=?").run(userId,series);
+        if (followingDates.length > 0) saveSeriesDefinition(userId,id,{...item,scheduledDate:followingDates[0],recurrence:splitRule});
         db.prepare(`INSERT OR IGNORE INTO attachments(file_id,item_id,created_at,scope)
           SELECT file_id,?,created_at,'series' FROM attachments WHERE item_id=? AND scope='series'`).run(id,series);
       } else {
         for (const target of targets) db.prepare("UPDATE items SET series_root_id=?,recurrence_json=NULL WHERE user_id=? AND id=?").run(series,userId,target.id);
         db.prepare("UPDATE items SET series_root_id=?,recurrence_json=NULL WHERE user_id=? AND id=?").run(series,userId,series);
+        db.prepare("DELETE FROM item_series_definitions WHERE user_id=? AND series_root_id=?").run(userId,series);
       }
     }
     if (wholeSeries && !item.recurrence) for (const target of targets) {
       if (String(target.id) !== series) db.prepare("DELETE FROM items WHERE user_id=? AND id=?").run(userId,target.id);
     }
+    if (scope === "series" || (scope === "following" && id === series)) {
+      for (const target of targets) db.prepare("UPDATE items SET occurrence_recurrence_json=NULL WHERE user_id=? AND id=?").run(userId,target.id);
+      saveSeriesDefinition(userId,series,preservesOccurrenceIdentity
+        ? {...item,scheduledDate:String(root?.scheduled_date ?? item.scheduledDate),scheduledTime:root?.scheduled_time == null ? null : String(root.scheduled_time)}
+        : item);
+    }
     if (item.recurrence) ensureOccurrences(userId);
     return getItem(userId, id);
   }
-  if (existing?.seriesId && scope === "occurrence" && id !== existing.seriesId) {
+  if (existing?.seriesId && scope === "occurrence" && id === existing.seriesId) {
+    // The series root is also its first Occurrence. Keep the root's recurrence
+    // template and immutable occurrence key while changing only local fields.
+    const old = db.prepare("SELECT reminders_json,uses_reminder_default,completed FROM items WHERE user_id=? AND id=?").get(userId,id);
+    const reminders = body.reminders === undefined ? String(old?.reminders_json ?? "[]") : JSON.stringify(item.reminders);
+    const followsDefault = body.reminders === undefined ? Number(old?.uses_reminder_default ?? 1) : Number(JSON.stringify(item.reminders) === JSON.stringify(itemReminderDefaults(userId,item.kind)));
+    const completed = body.completed === undefined ? old?.completed ?? (item.completed === null ? null : Number(item.completed)) : item.completed === null ? null : Number(item.completed);
+    db.prepare(`UPDATE items SET title=?,details=?,scheduled_date=?,scheduled_time=?,completed=?,updated_at=?,reminders_json=?,uses_reminder_default=?,
+      occurrence_recurrence_json=CASE WHEN ? THEN ? ELSE occurrence_recurrence_json END WHERE user_id=? AND id=?`).run(
+      item.title,item.details,item.scheduledDate,item.scheduledTime,completed,item.updatedAt,reminders,followsDefault,
+      Number(body.recurrence !== undefined),JSON.stringify(item.recurrence),userId,id);
+  } else if (existing?.seriesId && scope === "occurrence") {
     write(id, false, item.scheduledDate);
-    db.prepare("UPDATE items SET recurrence_json=NULL,series_root_id=?,occurrence_date=? WHERE user_id=? AND id=?")
-      .run(existing.seriesId, existing.occurrenceDate ?? existing.scheduledDate, userId, id);
+    db.prepare("UPDATE items SET recurrence_json=NULL,series_root_id=?,occurrence_date=?,occurrence_recurrence_json=? WHERE user_id=? AND id=?")
+      .run(existing.seriesId, existing.occurrenceDate ?? existing.scheduledDate, JSON.stringify(item.recurrence), userId, id);
   } else write(id, !rootId || id === rootId);
   if (item.recurrence && !rootId) db.prepare("UPDATE items SET series_root_id=id,occurrence_date=scheduled_date,recurrence_json=? WHERE id=?").run(JSON.stringify(item.recurrence),id);
-  if (existing?.recurrence && !item.recurrence) db.prepare("DELETE FROM items WHERE series_root_id=? AND id<>?").run(existing.id,id);
+  if (item.recurrence && (!rootId || id === rootId)) saveSeriesDefinition(userId,id,item);
+  if (existing?.recurrence && !item.recurrence && !existing.seriesId) db.prepare("DELETE FROM items WHERE series_root_id=? AND id<>?").run(existing.id,id);
   if (item.recurrence) ensureOccurrences(userId);
   return getItem(userId, id);
 }
@@ -575,6 +617,8 @@ function deleteItemInTransaction(userId: string, id: string, scope?: unknown) {
   const shortened: RecurrenceRule = { ...rule, end: { type: "date", date: String(previous.occurrence_date) } };
   db.prepare("UPDATE items SET recurrence_json=?,updated_at=? WHERE user_id=? AND id=?")
     .run(JSON.stringify(shortened), new Date().toISOString(), userId, rootId);
+  db.prepare("UPDATE item_series_definitions SET recurrence_json=? WHERE user_id=? AND series_root_id=?")
+    .run(JSON.stringify(shortened), userId, rootId);
   db.prepare("DELETE FROM items WHERE user_id=? AND series_root_id=? AND occurrence_date>=?").run(userId, rootId, selectedDate);
 }
 
