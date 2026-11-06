@@ -1946,7 +1946,7 @@ test("an authorization failure while removing an undated Event copy stays visibl
     assert.equal(response.status, 200);
     assert.equal(failNextGoogleRequest, null);
     assert.ok(result.syncLimitations.some((limitation) => limitation.title === "Deleted Event" && limitation.itemId === event.id
-      && limitation.provider === "google" && /retained for retry/i.test(limitation.message)),
+      && limitation.provider === "google" && /identity is retained and retries continue automatically/i.test(limitation.message)),
     "a permanent or authorization DELETE failure must remain a visible cleanup limitation");
     assert.equal(googleEvents.has(copy[0]), true);
     assert.equal(mapping(), copy[0]);
@@ -2011,6 +2011,16 @@ test("a DELETE authorization failure remains classified if a later Google operat
     delivery = (await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery;
     assert.equal(delivery.find((entry) => entry.provider === "google")?.reauthorizationRequired, true,
       "a later generic DELETE failure must not erase an unresolved authorization classification");
+    failGoogleRequests = [
+      { method: "DELETE", path: `/google/calendar/v3/calendars/primary/events/${deletedCopy[0]}`, status: 503 },
+    ];
+    assert.equal((await request(`/api/items/${editedEvent.id}`, { token: owner.token, method: "PATCH", body: {
+      title: "Another Event changed while authorization is unresolved",
+    } })).status, 200);
+    assert.equal(failGoogleRequests.length, 0);
+    delivery = (await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery;
+    assert.equal(delivery.find((entry) => entry.provider === "google")?.reauthorizationRequired, true,
+      "enqueueing another Event mutation must preserve unresolved authorization through a generic failure");
   } finally {
     failGoogleRequests = [];
     db.close();

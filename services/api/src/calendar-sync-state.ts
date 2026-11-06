@@ -15,7 +15,9 @@ export function enqueueCalendarSync(userId: string) {
     ON CONFLICT(user_id,provider) DO UPDATE SET
       generation=calendar_sync_state.generation+1,
       state='pending',attempts=0,next_attempt_at=excluded.next_attempt_at,
-      last_attempt_at=NULL,last_error=NULL,last_error_code=NULL`).run(currentTime,userId);
+      last_attempt_at=NULL,
+      last_error=CASE WHEN calendar_sync_state.last_error_code='authorization' THEN calendar_sync_state.last_error ELSE NULL END,
+      last_error_code=CASE WHEN calendar_sync_state.last_error_code='authorization' THEN calendar_sync_state.last_error_code ELSE NULL END`).run(currentTime,userId);
 }
 
 /** Ensure connected providers have retry rows and snapshot their generations before a sync pass. */
