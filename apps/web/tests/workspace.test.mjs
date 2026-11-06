@@ -49,6 +49,8 @@ let googleInstanceRequests = [];
 let appleEvents = new Map();
 let appleEventVersions = new Map();
 let holdNextCalendarUpdate = null;
+let holdNextAppleBody = null;
+let holdNextAppleDelete = null;
 let omittedAppleReports = new Set();
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
@@ -488,6 +490,9 @@ async function startDeliveryFakeDuringSetup(setup) {
   googleExceptions = new Map();
   googleInstanceRequests = [];
   appleEvents = new Map();
+  appleEventVersions = new Map();
+  holdNextAppleBody = null;
+  holdNextAppleDelete = null;
   deliveryServer = createServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
@@ -686,7 +691,16 @@ async function startDeliveryFakeDuringSetup(setup) {
         else {
           const version = appleEventVersions.get(url.pathname) ?? 1;
           appleEventVersions.set(url.pathname,version);
-          response.writeHead(200, { "Content-Type": "text/calendar", ETag: `"apple-${version}"` }).end(resource);
+          const gate = holdNextAppleBody?.path === url.pathname ? holdNextAppleBody : null;
+          if (gate) holdNextAppleBody = null;
+          response.writeHead(200, { "Content-Type": "text/calendar", ETag: `"apple-${version}"` });
+          if (gate) {
+            const split = Math.max(1,Math.floor(resource.length/2));
+            response.write(resource.slice(0,split));
+            gate.started();
+            await gate.releasePromise;
+            response.end(resource.slice(split));
+          } else response.end(resource);
         }
         return;
       }
@@ -704,7 +718,11 @@ async function startDeliveryFakeDuringSetup(setup) {
         if (gate) { holdNextCalendarUpdate = null; gate.started(); await gate.releasePromise; }
         const version = appleEventVersions.get(url.pathname) ?? 1;
         if (request.headers["if-none-match"] === "*" && existed) { response.writeHead(412).end(); return; }
-        if (request.headers["if-match"] && request.headers["if-match"] !== `"apple-${version}"`) { response.writeHead(412).end(); return; }
+        if (request.headers["if-match"] && (!existed || request.headers["if-match"] !== `"apple-${version}"`)) {
+          gate?.completed?.();
+          response.writeHead(412).end();
+          return;
+        }
         if (holdNextCalendarCreation?.provider === "apple") {
           const gate = holdNextCalendarCreation;
           holdNextCalendarCreation = null;
@@ -717,10 +735,19 @@ async function startDeliveryFakeDuringSetup(setup) {
           appleEventVersions.set(url.pathname,version+1);
         }
         response.writeHead(existed ? 204 : 201).end();
+        gate?.completed?.();
         return;
       }
       if (request.method === "DELETE") {
+        const version = appleEventVersions.get(url.pathname) ?? 1;
+        if (request.headers["if-match"] && (!appleEvents.has(url.pathname) || request.headers["if-match"] !== `"apple-${version}"`)) {
+          response.writeHead(412).end();
+          return;
+        }
         appleEvents.delete(url.pathname);
+        appleEventVersions.set(url.pathname,version+1);
+        const gate = holdNextAppleDelete?.path === url.pathname ? holdNextAppleDelete : null;
+        if (gate) { holdNextAppleDelete = null; gate.started(); await gate.releasePromise; }
         response.writeHead(204).end();
         return;
       }
@@ -3916,6 +3943,176 @@ test("Apple cleanup retains an unresolved create through takeover, delete, and i
   } finally {
     release?.(); holdNextCalendarCreation=null;
     await exporting?.catch(()=>{});
+    db.close();
+  }
+});
+
+async function seedMappedAppleCopy(owner,item,calendarName) {
+  const calendarUrl=`${deliveryBase}/apple/${calendarName}/`;
+  const connected=await request("/api/calendars",{token:owner.token,method:"POST",body:{username:`${calendarName}@example.com`,password:"app-specific-password",calendarUrl}});
+  assert.equal(connected.status,201,await connected.text());
+  const db=new DatabaseSync(join(directory,"workspace.sqlite"));
+  try {
+    const connection=db.prepare("SELECT connection_scope_id FROM calendar_connections WHERE user_id=? AND provider='apple'").get(owner.user.id);
+    assert.ok(connection?.connection_scope_id);
+    const resourceUid=`mapped-${item.id}@filetasks`;
+    const externalId=`${calendarUrl}${encodeURIComponent(resourceUid)}.ics`;
+    const path=new URL(externalId).pathname;
+    const ics=appleCalendarFixture({uid:resourceUid,date:item.scheduledDate.replaceAll("-","")})
+      .replace("SUMMARY:Imported calendar event",`URL:${base}/?event=${item.id}\r\nSUMMARY:${item.title}`);
+    db.prepare(`INSERT INTO apple_creation_reservations(user_id,item_id,provider,connection_scope_id,resource_uid,attempted,active_attempts)
+      VALUES(?,?,'apple',?,?,1,0)`).run(owner.user.id,item.id,connection.connection_scope_id,resourceUid);
+    db.prepare(`INSERT INTO calendar_copies(user_id,provider,item_id,external_id,resource_uid,connection_scope_id)
+      VALUES(?,'apple',?,?,?,?)`).run(owner.user.id,item.id,externalId,resourceUid,connection.connection_scope_id);
+    appleEvents.set(path,ics);
+    appleEventVersions.set(path,1);
+    return {path,externalId,resourceUid,connectionScopeId:connection.connection_scope_id,ics};
+  } finally { db.close(); }
+}
+
+test("a mapped Apple deletion is settled after a crash between provider deletion and local cleanup", async () => {
+  const owner=await account();
+  const created=await request("/api/items",{token:owner.token,method:"POST",body:{kind:"event",title:"Mapped deletion recovery",scheduledDate:"2027-03-04"}});
+  assert.equal(created.status,201);
+  const item=(await created.json()).item;
+  const copy=await seedMappedAppleCopy(owner,item,`mapped-delete-${item.id}`);
+
+  const db=new DatabaseSync(join(directory,"workspace.sqlite"));
+  let gate;
+  let crashedWorker;
+  let recoveryWorker;
+  let interrupted;
+  try {
+    const mapping=db.prepare("SELECT external_id,resource_uid,connection_scope_id FROM calendar_copies WHERE user_id=? AND provider='apple' AND item_id=?").get(owner.user.id,item.id);
+    assert.equal(mapping.external_id,copy.externalId);
+    assert.equal(mapping.resource_uid,copy.resourceUid);
+    assert.equal(mapping.connection_scope_id,copy.connectionScopeId);
+    const path=copy.path;
+
+    // Keep the real deletion tombstone and mapping, as if the process stopped
+    // after Apple accepted DELETE but before the local cleanup transaction.
+    db.prepare("DELETE FROM items WHERE user_id=? AND id=?").run(owner.user.id,item.id);
+    assert.equal(db.prepare("SELECT external_id FROM calendar_creation_cleanup WHERE user_id=? AND provider='apple' AND item_id=?").get(owner.user.id,item.id).external_id,mapping.resource_uid);
+
+    let started;
+    let release;
+    const startedPromise=new Promise(resolve=>{started=resolve;});
+    const releasePromise=new Promise(resolve=>{release=resolve;});
+    gate={path,started,releasePromise,release};
+    holdNextAppleDelete=gate;
+    crashedWorker=await startCalendarApiReplica(3120);
+    interrupted=fetch(`http://localhost:${crashedWorker.port}/api/calendars/sync`,{method:"POST",headers:{Authorization:`Bearer ${owner.token}`}})
+      .then(response=>({response}),error=>({error}));
+    await startedPromise;
+    assert.equal(appleEvents.has(path),false,"Apple has accepted the deletion while the cleanup request is still waiting for its response");
+    assert.ok(db.prepare("SELECT 1 FROM calendar_copies WHERE user_id=? AND provider='apple' AND item_id=? AND resource_uid=?").get(owner.user.id,item.id,mapping.resource_uid),
+      "the local mapping remains until the provider response is committed");
+    assert.ok(db.prepare("SELECT 1 FROM calendar_creation_cleanup WHERE user_id=? AND provider='apple' AND item_id=?").get(owner.user.id,item.id),
+      "the durable cleanup tombstone remains through the crash window");
+
+    await stopCalendarApiReplica(crashedWorker);
+    crashedWorker=undefined;
+    gate.release();
+    holdNextAppleDelete=null;
+    await interrupted;
+    interrupted=undefined;
+
+    recoveryWorker=await startCalendarApiReplica(3121);
+    const retry=await fetch(`http://localhost:${recoveryWorker.port}/api/calendars/sync`,{method:"POST",headers:{Authorization:`Bearer ${owner.token}`}});
+    assert.equal(retry.status,200,await retry.text());
+    assert.equal(db.prepare("SELECT 1 FROM calendar_creation_cleanup WHERE user_id=? AND provider='apple' AND item_id=?").get(owner.user.id,item.id),undefined,
+      "restart verifies the provider's 404 and settles the cleanup tombstone");
+    assert.equal(db.prepare("SELECT 1 FROM calendar_copies WHERE user_id=? AND provider='apple' AND item_id=?").get(owner.user.id,item.id),undefined,
+      "restart removes only the mapped copy whose Apple identity was verified absent");
+    assert.equal(appleEvents.has(path),false);
+  } finally {
+    gate?.release();
+    holdNextAppleDelete=null;
+    if(interrupted) await interrupted;
+    if(crashedWorker) await stopCalendarApiReplica(crashedWorker);
+    if(recoveryWorker) await stopCalendarApiReplica(recoveryWorker);
+    db.close();
+  }
+});
+
+test("streamed Apple cleanup rejects a replaced resource and a stale connection", async () => {
+  const db=new DatabaseSync(join(directory,"workspace.sqlite"));
+  let replica;
+  let gate;
+  let syncing;
+  try {
+    for (const scenario of ["replacement","reconnect"]) {
+      const owner=await account();
+      const created=await request("/api/items",{token:owner.token,method:"POST",body:{kind:"event",title:`Streamed cleanup ${scenario}`,scheduledDate:"2027-03-05"}});
+      assert.equal(created.status,201);
+      const item=(await created.json()).item;
+      const calendarName=`streamed-${scenario}-${item.id}`;
+      const copy=await seedMappedAppleCopy(owner,item,calendarName);
+      const connect=(name)=>request("/api/calendars",{token:owner.token,method:"POST",body:{username:`${name}@example.com`,password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/${name}/`}});
+      const mapping=db.prepare("SELECT external_id,resource_uid FROM calendar_copies WHERE user_id=? AND provider='apple' AND item_id=?").get(owner.user.id,item.id);
+      assert.equal(mapping.external_id,copy.externalId);
+      assert.equal(mapping.resource_uid,copy.resourceUid);
+      const path=copy.path;
+      const original=copy.ics;
+      db.prepare("DELETE FROM items WHERE user_id=? AND id=?").run(owner.user.id,item.id);
+
+      let started;
+      let release;
+      const startedPromise=new Promise(resolve=>{started=resolve;});
+      const releasePromise=new Promise(resolve=>{release=resolve;});
+      gate={path,started,releasePromise,release};
+      holdNextAppleBody=gate;
+      replica=await startCalendarApiReplica(scenario==="replacement" ? 3122 : 3123);
+      const deleteStart=providerRequests.filter(entry=>entry.path===path&&entry.method==="DELETE").length;
+      syncing=fetch(`http://localhost:${replica.port}/api/calendars/sync`,{method:"POST",headers:{Authorization:`Bearer ${owner.token}`}})
+        .then(response=>({response}),error=>({error}));
+      await startedPromise;
+
+      if (scenario==="replacement") {
+        const replacement=original.replace(`?event=${item.id}`,"?event=replacement-owned");
+        assert.notEqual(replacement,original);
+        appleEvents.set(path,replacement);
+        appleEventVersions.set(path,(appleEventVersions.get(path)??1)+1);
+        gate.release();
+        gate=undefined;
+        holdNextAppleBody=null;
+        const result=await syncing;
+        syncing=undefined;
+        assert.ok(result.response,"the provider replacement should complete as a failed safe cleanup request");
+        assert.equal(result.response.status,502,await result.response.text());
+        const deletes=providerRequests.filter(entry=>entry.path===path&&entry.method==="DELETE").slice(deleteStart);
+        assert.equal(deletes.length,1,"the verifier must attempt one conditional delete for the version it read");
+        assert.equal(deletes[0].headers["if-match"],`"apple-${(appleEventVersions.get(path)??1)-1}"`,
+          "Apple DELETE must carry the ETag from the streamed response");
+        assert.equal(appleEvents.get(path),replacement,"the replacement that changed during the body read must survive the stale ETag");
+        assert.ok(db.prepare("SELECT 1 FROM calendar_creation_cleanup WHERE user_id=? AND provider='apple' AND item_id=?").get(owner.user.id,item.id),
+          "a rejected conditional delete keeps cleanup pending for a later verification");
+        assert.ok(db.prepare("SELECT 1 FROM calendar_copies WHERE user_id=? AND provider='apple' AND item_id=? AND resource_uid=?").get(owner.user.id,item.id,mapping.resource_uid),
+          "the failed delete retains the exact local mapping");
+      } else {
+        const replacementName=`streamed-reconnected-${item.id}`;
+        assert.equal((await connect(replacementName)).status,201,"reconnect changes the active Apple connection while the old response body is streaming");
+        gate.release();
+        gate=undefined;
+        holdNextAppleBody=null;
+        const result=await syncing;
+        syncing=undefined;
+        assert.ok(result.response,"the stale sync should return its ownership error");
+        assert.equal(result.response.status,409,await result.response.text());
+        assert.equal(providerRequests.filter(entry=>entry.path===path&&entry.method==="DELETE").length,deleteStart,
+          "the old connection must be revalidated after the streamed body and before deletion");
+        assert.equal(appleEvents.get(path),original,"reconnect cannot delete the old resource with stale credentials");
+        assert.ok(db.prepare("SELECT 1 FROM calendar_copies WHERE user_id=? AND provider='apple' AND item_id=? AND resource_uid=?").get(owner.user.id,item.id,mapping.resource_uid),
+          "the old connection mapping remains intact when the stale cleanup is rejected");
+      }
+      await stopCalendarApiReplica(replica);
+      replica=undefined;
+    }
+  } finally {
+    gate?.release();
+    holdNextAppleBody=null;
+    if(syncing) await syncing;
+    if(replica) await stopCalendarApiReplica(replica);
     db.close();
   }
 });

@@ -891,7 +891,7 @@ async function reconcileDeletedCreationReservations(connection: Connection) {
           AND NOT EXISTS (SELECT 1 FROM calendar_creation_attempts a WHERE a.user_id=calendar_creation_cleanup.user_id AND a.provider=calendar_creation_cleanup.provider AND a.connection_scope_id=calendar_creation_cleanup.connection_scope_id AND a.item_id=calendar_creation_cleanup.item_id AND a.external_id=calendar_creation_cleanup.external_id AND a.status IN ('active','uncertain'))
           AND EXISTS (SELECT 1 FROM calendar_connections WHERE user_id=? AND provider='google' AND connection_scope_id=? AND credential_generation_id=?)`)
           .run(connection.user_id,connection.connection_scope_id,row.item_id,row.external_id,connection.user_id,connection.connection_scope_id,connection.credential_generation_id);
-        verifiedItems.add(row.item_id);
+        verifiedItems.add(`${connection.provider}\0${row.item_id}\0${row.external_id}`);
         scheduleUncertainCreationCleanup(connection,row.item_id,row.external_id);
         continue;
       }
@@ -907,7 +907,7 @@ async function reconcileDeletedCreationReservations(connection: Connection) {
         AND NOT EXISTS (SELECT 1 FROM calendar_creation_attempts a WHERE a.user_id=calendar_creation_cleanup.user_id AND a.provider=calendar_creation_cleanup.provider AND a.connection_scope_id=calendar_creation_cleanup.connection_scope_id AND a.item_id=calendar_creation_cleanup.item_id AND a.external_id=calendar_creation_cleanup.external_id AND a.status IN ('active','uncertain'))
         AND EXISTS (SELECT 1 FROM calendar_connections WHERE user_id=? AND provider='google' AND connection_scope_id=? AND credential_generation_id=?)`)
         .run(connection.user_id,connection.connection_scope_id,row.item_id,row.external_id,connection.user_id,connection.connection_scope_id,connection.credential_generation_id);
-      verifiedItems.add(row.item_id);
+      verifiedItems.add(`${connection.provider}\0${row.item_id}\0${row.external_id}`);
       scheduleUncertainCreationCleanup(connection,row.item_id,row.external_id);
     }
     return verifiedItems;
@@ -929,22 +929,28 @@ async function reconcileDeletedCreationReservations(connection: Connection) {
         AND NOT EXISTS (SELECT 1 FROM calendar_creation_attempts a WHERE a.user_id=calendar_creation_cleanup.user_id AND a.provider=calendar_creation_cleanup.provider AND a.connection_scope_id=calendar_creation_cleanup.connection_scope_id AND a.item_id=calendar_creation_cleanup.item_id AND a.external_id=calendar_creation_cleanup.external_id AND a.status IN ('active','uncertain'))
         AND EXISTS (SELECT 1 FROM calendar_connections WHERE user_id=? AND provider='apple' AND connection_scope_id=? AND credential_generation_id=?)`)
         .run(connection.user_id,connection.connection_scope_id,row.item_id,row.external_id,connection.user_id,connection.connection_scope_id,connection.credential_generation_id);
-      verifiedItems.add(row.item_id);
+      verifiedItems.add(`${connection.provider}\0${row.item_id}\0${row.external_id}`);
       scheduleUncertainCreationCleanup(connection,row.item_id,row.external_id);
       continue;
     }
     if (!current.ok) throw new HttpError(502,"A deleted Event's Apple Calendar copy could not be verified. Sync will retry.");
+    const etag=current.headers.get("etag");
+    if (!etag) throw new HttpError(502,"Apple Calendar did not provide a version for safe cleanup. Sync will retry.");
     const ics = await current.text();
     const component = directAppleEventComponents(ics)?.[0]?.join("\r\n");
     if (!component || icsProperty(component,"UID") !== row.external_id || icsProperty(component,"URL") !== filetasksEventUrl(row.item_id)) continue;
-    const deleted = await calendarFetch(target,{method:"DELETE",headers:{Authorization:authorization},redirect:"error"});
+    // The body may have streamed for a long time. Revalidate the active
+    // connection, generation, and lease after it completes, then bind deletion
+    // to the exact version whose ownership was verified.
+    assertActiveScope(connection);
+    const deleted = await calendarFetch(target,{method:"DELETE",headers:{Authorization:authorization,"If-Match":etag},redirect:"error"});
     assertActiveScope(connection);
     if (!deleted.ok && deleted.status !== 404 && deleted.status !== 410) throw new HttpError(502,"A deleted Event's Apple Calendar copy could not be removed. Sync will retry.");
     database().prepare(`DELETE FROM calendar_creation_cleanup WHERE pending_attempts=0 AND user_id=? AND provider='apple' AND connection_scope_id=? AND item_id=? AND external_id=?
       AND NOT EXISTS (SELECT 1 FROM calendar_creation_attempts a WHERE a.user_id=calendar_creation_cleanup.user_id AND a.provider=calendar_creation_cleanup.provider AND a.connection_scope_id=calendar_creation_cleanup.connection_scope_id AND a.item_id=calendar_creation_cleanup.item_id AND a.external_id=calendar_creation_cleanup.external_id AND a.status IN ('active','uncertain'))
       AND EXISTS (SELECT 1 FROM calendar_connections WHERE user_id=? AND provider='apple' AND connection_scope_id=? AND credential_generation_id=?)`)
       .run(connection.user_id,connection.connection_scope_id,row.item_id,row.external_id,connection.user_id,connection.connection_scope_id,connection.credential_generation_id);
-    verifiedItems.add(row.item_id);
+    verifiedItems.add(`${connection.provider}\0${row.item_id}\0${row.external_id}`);
     scheduleUncertainCreationCleanup(connection,row.item_id,row.external_id);
   }
   return verifiedItems;
@@ -1910,7 +1916,7 @@ async function verifyLegacyApple(connection: Connection, events: EventItem[]) {
   assertActiveScope(connection);
 }
 
-async function syncGoogle(connection: Connection, events: EventItem[], limits: Map<string,{itemId:string;title:string;provider:Provider;message:string}>, verifiedAppleItems: Set<string>, generation: number) {
+async function syncGoogle(connection: Connection, events: EventItem[], limits: Map<string,{itemId:string;title:string;provider:Provider;message:string}>, verifiedAppleItems: Set<string>, verifiedCleanup: ReadonlySet<string>, generation: number) {
   assertActiveScope(connection);
   assertActiveScope(connection);
   const access = await googleAccess(connection); const calendarId = encodeURIComponent(connection.calendar_url ?? "primary");
@@ -1920,6 +1926,15 @@ async function syncGoogle(connection: Connection, events: EventItem[], limits: M
   const liveIds = new Set(events.filter((item) => (!item.seriesId || item.id === item.seriesId) && (item.scheduledDate || item.calendarSync.length)).map((item) => item.id));
   for (const item of events.filter((entry) => !entry.scheduledDate && entry.calendarSync.length)) reportSyncLimitation(limits,item,"google","This imported Event no longer has a schedule. Its Calendar copy is preserved and sync is paused.");
   for (const [itemId, copy] of maps) if (!liveIds.has(itemId) && copy.scope === connection.connection_scope_id) {
+    if (verifiedCleanup.has(`google\0${itemId}\0${copy.id}`)) {
+      // Keep any still-needed tombstone for a possible late create, but settle
+      // the exact mapped copy after provider verification.
+      database().prepare(`DELETE FROM calendar_copies WHERE user_id=? AND provider='google' AND item_id=? AND external_id=? AND connection_scope_id=?
+        AND NOT EXISTS (SELECT 1 FROM items WHERE user_id=? AND id=? AND kind='event')
+        AND EXISTS (SELECT 1 FROM calendar_connections WHERE user_id=? AND provider='google' AND connection_scope_id=? AND credential_generation_id=?)`)
+        .run(connection.user_id,itemId,copy.id,connection.connection_scope_id,connection.user_id,itemId,connection.user_id,connection.connection_scope_id,connection.credential_generation_id);
+      continue;
+    }
     if (database().prepare("SELECT 1 FROM calendar_creation_cleanup WHERE user_id=? AND provider='google' AND connection_scope_id=? AND item_id=?").get(connection.user_id,connection.connection_scope_id,itemId)) {
       limits.set(`${itemId}:google`,{itemId,title:"Deleted Event",provider:"google",message:"The deleted Event's Google Calendar identity could not be verified safely. Its copy is retained for retry."});
       continue;
@@ -2138,7 +2153,7 @@ async function syncGoogle(connection: Connection, events: EventItem[], limits: M
   }
 }
 
-async function syncApple(connection: Connection, events: EventItem[], missingHrefs: Set<string>, limits: Map<string,{itemId:string;title:string;provider:Provider;message:string}>, verifiedAppleItems: Set<string>, generation: number) {
+async function syncApple(connection: Connection, events: EventItem[], missingHrefs: Set<string>, limits: Map<string,{itemId:string;title:string;provider:Provider;message:string}>, verifiedAppleItems: Set<string>, verifiedCleanup: ReadonlySet<string>, generation: number) {
   assertActiveScope(connection);
   ensureAppleRepresentationBaselines();
   if (!connection.access_token || !connection.calendar_url) throw new HttpError(503, "Reconnect Apple Calendar to continue syncing.");
@@ -2155,6 +2170,18 @@ async function syncApple(connection: Connection, events: EventItem[], missingHre
     return url.toString();
   };
   for (const [itemId, copy] of maps) if (!liveIds.has(itemId) && copy.scope === connection.connection_scope_id) {
+    if (verifiedCleanup.has(`apple\0${itemId}\0${copy.uid}`)) {
+      // Keep any still-needed tombstone for a possible late create, but settle
+      // only the mapped provider identity that reconciliation verified.
+      database().prepare(`DELETE FROM calendar_copies WHERE user_id=? AND provider='apple' AND item_id=? AND resource_uid=? AND connection_scope_id=?
+        AND NOT EXISTS (SELECT 1 FROM items WHERE user_id=? AND id=? AND kind='event')
+        AND EXISTS (SELECT 1 FROM calendar_connections WHERE user_id=? AND provider='apple' AND connection_scope_id=? AND credential_generation_id=?)`)
+        .run(connection.user_id,itemId,copy.uid,connection.connection_scope_id,connection.user_id,itemId,connection.user_id,connection.connection_scope_id,connection.credential_generation_id);
+      database().prepare(`DELETE FROM apple_copy_representation_baselines WHERE user_id=? AND item_id=? AND connection_scope_id=? AND external_id=?
+        AND EXISTS (SELECT 1 FROM calendar_connections WHERE user_id=? AND provider='apple' AND connection_scope_id=? AND credential_generation_id=?)`)
+        .run(connection.user_id,itemId,connection.connection_scope_id,copy.href,connection.user_id,connection.connection_scope_id,connection.credential_generation_id);
+      continue;
+    }
     if (database().prepare("SELECT 1 FROM calendar_creation_cleanup WHERE user_id=? AND provider='apple' AND connection_scope_id=? AND item_id=?").get(connection.user_id,connection.connection_scope_id,itemId)) {
       limits.set(`${itemId}:apple`,{itemId,title:"Deleted Event",provider:"apple",message:"The deleted Event's Apple Calendar identity could not be verified safely. Its copy is retained for retry."});
       continue;
@@ -2311,10 +2338,10 @@ async function performCalendarSync(userId: string, exportProviders: ReadonlySet<
       connection.connection_scope_id = scope;
     }
     const verified=await withCalendarExportLock(connection,async () => reconcileDeletedCreationReservations(connection));
-    for (const itemId of verified) verifiedCleanup.add(`${connection.provider}:${itemId}`);
-    const unresolvedCreations = database().prepare(`SELECT item_id FROM calendar_creation_cleanup WHERE user_id=? AND provider=? AND connection_scope_id=?`)
-      .all(userId,connection.provider,connection.connection_scope_id) as {item_id:string}[];
-    for (const row of unresolvedCreations) if (!verifiedCleanup.has(`${connection.provider}:${row.item_id}`)) limitations.set(`${row.item_id}:${connection.provider}`,{
+    for (const identity of verified) verifiedCleanup.add(identity);
+    const unresolvedCreations = database().prepare(`SELECT item_id,external_id FROM calendar_creation_cleanup WHERE user_id=? AND provider=? AND connection_scope_id=?`)
+      .all(userId,connection.provider,connection.connection_scope_id) as {item_id:string;external_id:string}[];
+    for (const row of unresolvedCreations) if (!verified.has(`${connection.provider}\0${row.item_id}\0${row.external_id}`)) limitations.set(`${row.item_id}:${connection.provider}`,{
       itemId:row.item_id,title:"Deleted Event",provider:connection.provider,
       message:`The deleted Event's ${connection.provider === "google" ? "Google" : "Apple"} Calendar identity could not be verified safely. Its copy is retained for retry.`,
     });
@@ -2339,8 +2366,8 @@ async function performCalendarSync(userId: string, exportProviders: ReadonlySet<
       const events = listItemsForCalendarSync(userId).filter((item) => item.kind === "event");
       const generation = generations.get(connection.provider);
       if (generation === undefined) throw new HttpError(409,"Calendar sync generation changed. Please sync again.");
-      if (connection.provider === "google") await syncGoogle(connection,events,limitations,verifiedAppleItems,generation);
-      else await syncApple(connection,events,missingAppleHrefs,limitations,verifiedAppleItems,generation);
+      if (connection.provider === "google") await syncGoogle(connection,events,limitations,verifiedAppleItems,verifiedCleanup,generation);
+      else await syncApple(connection,events,missingAppleHrefs,limitations,verifiedAppleItems,verifiedCleanup,generation);
     });
     assertActiveScope(connection);
     if (![...limitations.values(), ...calendarSyncLimitations(userId)].some((entry) => entry.provider === connection.provider && entry.title === "Deleted Event")) synced.push(connection.provider);
