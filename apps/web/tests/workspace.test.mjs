@@ -1720,6 +1720,188 @@ test("Google DELETE failure preserves mapping and retries on sync", async () => 
   }
 });
 
+test("clearing a local Event date retries Google and Apple copy removal after restart", async () => {
+  const owner = await account();
+  const other = await account();
+  const previousGoogleEvents = googleEvents;
+  const previousAppleEvents = appleEvents;
+  const initialClock = new Date(testClock);
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  googleEvents = new Map();
+  appleEvents = new Map();
+  try {
+    const authorization = await beginGoogleAuthorization(owner);
+    assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
+      cookie: authorization.cookie, redirect: "manual",
+    })).status, 303);
+    assert.equal((await request("/api/calendars", { token: owner.token, method: "POST", body: {
+      username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
+    } })).status, 201);
+
+    const dated = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "event", title: "Keep the dated Event", scheduledDate: "2027-02-10",
+    } })).json()).item;
+    const toUnschedule = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "event", title: "Remember locally", details: "Keep its File", scheduledDate: "2027-02-11",
+    } })).json()).item;
+    const file = (await (await request("/api/files", { token: owner.token, method: "POST", body: {
+      name: "Event notes", url: "https://example.com/event-notes.pdf",
+    } })).json()).file;
+    assert.equal((await request(`/api/files/${file.id}/attachments`, { token: owner.token, method: "POST", body: { itemId: toUnschedule.id } })).status, 201);
+    const newlyUndated = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "event", title: "Local only", scheduledDate: null,
+    } })).json()).item;
+
+    const googleId = (itemId) => [...googleEvents.entries()].find(([, event]) => event.extendedProperties?.private?.filetasksItemId === itemId)?.[0];
+    const appleEntry = (itemId) => [...appleEvents.entries()].find(([, calendarData]) => calendarData.includes(`URL:${base}/?event=${itemId}`));
+    const googleCopyId = googleId(toUnschedule.id);
+    const appleCopy = appleEntry(toUnschedule.id);
+    assert.ok(googleCopyId && appleCopy, "the dated Event should have copies in both connected calendars");
+    assert.ok(googleId(dated.id) && appleEntry(dated.id), "the other dated Event should synchronize alongside it");
+    assert.equal(googleId(newlyUndated.id), undefined, "a newly undated Event must not create an invalid Google export");
+    assert.equal(appleEntry(newlyUndated.id), undefined, "a newly undated Event must not create an invalid Apple export");
+
+    const googlePath = `/google/calendar/v3/calendars/primary/events/${googleCopyId}`;
+    const applePath = appleCopy[0];
+    failNextGoogleRequest = { method: "DELETE", path: googlePath, status: 503 };
+    failNextAppleRequest = { method: "DELETE", path: applePath, status: 503 };
+    const cleared = await request(`/api/items/${toUnschedule.id}`, { token: owner.token, method: "PATCH", body: {
+      scheduledDate: null, scheduledTime: null,
+    } });
+    assert.equal(cleared.status, 200);
+    assert.equal(failNextGoogleRequest, null, "the Google removal failure should be exercised");
+    assert.equal(failNextAppleRequest, null, "the Apple removal failure should be exercised");
+    const retained = (await (await request(`/api/items/${toUnschedule.id}`, { token: owner.token })).json()).item;
+    assert.equal(retained.scheduledDate, null);
+    assert.deepEqual(retained.files, [{ id: file.id, name: file.name, sourceType: "link" }]);
+    assert.deepEqual(retained.calendarSync.filter((status) => status.limitationCode === "undated-copy-removal-failed")
+      .map((status) => status.provider).sort(), ["apple", "google"], "the failed removals should be visible on the undated Event");
+    assert.equal((await (await request("/api/files", { token: owner.token })).json()).files
+      .find((entry) => entry.id === file.id).attachments.some((attachment) => attachment.itemId === toUnschedule.id), true);
+    assert.equal(googleEvents.has(googleCopyId), true);
+    assert.equal(appleEvents.has(applePath), true);
+    assert.equal(db.prepare("SELECT external_id FROM calendar_copies WHERE user_id=? AND item_id=? AND provider='google'")
+      .get(owner.user.id, toUnschedule.id)?.external_id, googleCopyId, "failed Google removal must retain its identity");
+    assert.equal(db.prepare("SELECT external_id FROM calendar_copies WHERE user_id=? AND item_id=? AND provider='apple'")
+      .get(owner.user.id, toUnschedule.id)?.external_id, new URL(`http://localhost${applePath}`).toString().replace("http://localhost", deliveryBase),
+    "failed Apple removal must retain its identity");
+    const delivery = (await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery;
+    assert.deepEqual(delivery.map((entry) => entry.provider).sort(), ["apple", "google"]);
+    assert.deepEqual((await (await request("/api/calendars", { token: other.token })).json()).syncDelivery, [],
+      "another account must not see this retry state");
+    assert.equal(googleId(dated.id) !== undefined, true, "the dated Event must continue to synchronize");
+    assert.equal(appleEntry(dated.id) !== undefined, true, "the dated Event must continue to synchronize");
+
+    await stopServer();
+    await startServer();
+    await advanceTestClock(60_000);
+    assert.equal((await runReminderWorker()).status, 200, "the worker should retry both removals after restart");
+    assert.equal(googleEvents.has(googleCopyId), false);
+    assert.equal(appleEvents.has(applePath), false);
+    assert.equal(db.prepare("SELECT external_id FROM calendar_copies WHERE user_id=? AND item_id=? AND provider='google'")
+      .get(owner.user.id, toUnschedule.id), undefined);
+    assert.equal(db.prepare("SELECT external_id FROM calendar_copies WHERE user_id=? AND item_id=? AND provider='apple'")
+      .get(owner.user.id, toUnschedule.id), undefined);
+    assert.deepEqual((await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery, []);
+    const afterRetry = (await (await request(`/api/items/${toUnschedule.id}`, { token: owner.token })).json()).item;
+    assert.equal(afterRetry.scheduledDate, null);
+    assert.deepEqual(afterRetry.files, [{ id: file.id, name: file.name, sourceType: "link" }]);
+    assert.equal(afterRetry.calendarSync.some((status) => status.limitationCode === "undated-copy-removal-failed"), false,
+      "successful retries should clear the Event's cleanup limitation");
+  } finally {
+    failNextGoogleRequest = null;
+    failNextAppleRequest = null;
+    googleEvents = previousGoogleEvents;
+    appleEvents = previousAppleEvents;
+    await setTestClock(initialClock);
+    db.close();
+  }
+});
+
+test("clearing an imported Event date preserves its source copy and removes its exported copy", async () => {
+  const owner = await account();
+  const originalGoogleEvents = googleEvents;
+  const originalAppleEvents = appleEvents;
+  googleEvents = new Map();
+  appleEvents = new Map();
+  try {
+    const source = { id: "imported-source-to-unschedule", summary: "Imported Event", start: { date: "2027-02-12" }, end: { date: "2027-02-13" } };
+    googleEvents.set(source.id, structuredClone(source));
+    const authorization = await beginGoogleAuthorization(owner);
+    assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
+      cookie: authorization.cookie, redirect: "manual",
+    })).status, 303);
+    assert.equal((await request("/api/calendars", { token: owner.token, method: "POST", body: {
+      username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`,
+    } })).status, 201);
+    assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+    const imported = (await (await request("/api/items", { token: owner.token })).json()).items
+      .find((item) => item.title === "Imported Event");
+    assert.ok(imported);
+    const appleCopy = [...appleEvents.entries()].find(([, calendarData]) => calendarData.includes(`URL:${base}/?event=${imported.id}`));
+    assert.ok(appleCopy, "the imported Event should have an exported Apple copy before its date is cleared");
+
+    const cleared = await request(`/api/items/${imported.id}`, { token: owner.token, method: "PATCH", body: {
+      scheduledDate: null, scheduledTime: null,
+    } });
+    assert.equal(cleared.status, 200);
+    assert.deepEqual(googleEvents.get(source.id), source, "the verified imported Google source copy must be preserved");
+    assert.equal(appleEvents.has(appleCopy[0]), false, "the FileTasks-owned Apple copy must be removed");
+    const retained = (await (await request(`/api/items/${imported.id}`, { token: owner.token })).json()).item;
+    assert.equal(retained.scheduledDate, null);
+    assert.ok(retained.calendarSync.some((status) => status.provider === "google" && status.state === "limited"),
+      "the preserved source representation should remain visibly limited while the Event is undated");
+  } finally {
+    googleEvents = originalGoogleEvents;
+    appleEvents = originalAppleEvents;
+  }
+});
+
+test("an authorization failure while removing an undated Event copy stays visible and retains identity", async () => {
+  const owner = await account();
+  const authorization = await beginGoogleAuthorization(owner);
+  assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
+    cookie: authorization.cookie, redirect: "manual",
+  })).status, 303);
+  const event = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "Requires calendar reauthorization", scheduledDate: "2027-02-14",
+  } })).json()).item;
+  const copy = [...googleEvents.entries()].find(([, value]) => value.extendedProperties?.private?.filetasksItemId === event.id);
+  assert.ok(copy);
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  try {
+    const mapping = () => db.prepare("SELECT external_id FROM calendar_copies WHERE user_id=? AND item_id=? AND provider='google'")
+      .get(owner.user.id, event.id)?.external_id;
+    assert.equal(mapping(), copy[0]);
+    failNextGoogleRequest = { method: "DELETE", path: `/google/calendar/v3/calendars/primary/events/${copy[0]}`, status: 401 };
+    assert.equal((await request(`/api/items/${event.id}`, { token: owner.token, method: "PATCH", body: {
+      scheduledDate: null, scheduledTime: null,
+    } })).status, 200);
+    assert.equal(failNextGoogleRequest, null);
+    assert.equal(googleEvents.has(copy[0]), true);
+    assert.equal(mapping(), copy[0], "authorization failure must not clear the copy identity");
+    const retained = (await (await request(`/api/items/${event.id}`, { token: owner.token })).json()).item;
+    assert.ok(retained.calendarSync.some((status) => status.provider === "google"
+      && status.limitationCode === "undated-copy-removal-failed"), "the Event should surface an authorization-related cleanup limitation");
+
+    failNextGoogleRequest = { method: "DELETE", path: `/google/calendar/v3/calendars/primary/events/${copy[0]}`, status: 403 };
+    const response = await request("/api/calendars/sync", { token: owner.token, method: "POST" });
+    const result = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(failNextGoogleRequest, null);
+    assert.ok(result.syncLimitations.some((limitation) => limitation.title === "Deleted Event" && limitation.itemId === event.id
+      && limitation.provider === "google" && /retained for retry/i.test(limitation.message)),
+    "a permanent or authorization DELETE failure must remain a visible cleanup limitation");
+    assert.equal(googleEvents.has(copy[0]), true);
+    assert.equal(mapping(), copy[0]);
+    assert.equal((await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery
+      .some((status) => status.provider === "google" && status.state === "failed"), true);
+  } finally {
+    failNextGoogleRequest = null;
+    db.close();
+  }
+});
+
 test("Event mutations survive Calendar delivery failures and retry durably through the worker", async () => {
   const owner = await account();
   const other = await account();
@@ -2777,6 +2959,32 @@ test("browser Event saves and deletions remain local when Google delivery fails"
     const saved = (await (await request("/api/items", { token: owner.token })).json()).items
       .find((item) => item.title === "Browser committed Event");
     assert.ok(saved, "another client should observe the Event saved through the browser");
+
+    await page.getByRole("button", { name: "New Event", exact: true }).click();
+    await page.getByLabel("Title", { exact: true }).fill("Browser unscheduled Event");
+    await page.getByLabel(/^Date\b/).fill("2027-02-13");
+    await page.getByRole("button", { name: "Save Event", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Browser unscheduled Event", exact: true })).toBeVisible();
+    const unscheduled = (await (await request("/api/items", { token: owner.token })).json()).items
+      .find((item) => item.title === "Browser unscheduled Event");
+    assert.ok(unscheduled);
+    const unscheduledCopy = [...googleEvents.entries()].find(([, event]) => event.extendedProperties?.private?.filetasksItemId === unscheduled.id);
+    assert.ok(unscheduledCopy, "the dated Event should have a Google copy before its date is cleared");
+    failNextGoogleRequest = {
+      method: "DELETE", path: `/google/calendar/v3/calendars/primary/events/${unscheduledCopy[0]}`, status: 503,
+    };
+    await page.getByRole("button", { name: "Edit Browser unscheduled Event", exact: true }).click();
+    await page.getByLabel(/^Date\b/).fill("");
+    await page.getByRole("button", { name: "Save Event", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Browser unscheduled Event", exact: true })).toBeVisible();
+    await expect(page.getByRole("status").filter({ hasText: "Calendar sync pending." }))
+      .toContainText(/Calendar sync pending\. Your Event is saved in FileTasks and will be retried\. The last attempt failed; another retry is scheduled\./i);
+    assert.equal(failNextGoogleRequest, null, "clearing the date should exercise the injected provider failure");
+    assert.equal(googleEvents.has(unscheduledCopy[0]), true, "the failed cleanup must retain the provider copy for retry");
+    const locallyUndated = (await (await request(`/api/items/${unscheduled.id}`, { token: owner.token })).json()).item;
+    assert.equal(locallyUndated.scheduledDate, null);
+    assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
+    assert.equal(googleEvents.has(unscheduledCopy[0]), false, "a later sync should remove the obsolete dated copy");
 
     assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
     const copy = [...googleEvents.entries()].find(([, event]) => event.extendedProperties?.private?.filetasksItemId === saved.id);
