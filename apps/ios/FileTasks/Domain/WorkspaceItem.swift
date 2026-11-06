@@ -109,6 +109,18 @@ struct ReminderSettings: Codable, Equatable {
     static let empty = ReminderSettings(taskReminders: [], eventReminders: [], pushEnabled: false, emailEnabled: false, pushAvailable: false, emailAvailable: false)
 }
 
+struct CalendarSyncDeliveryStatus: Codable, Equatable, Identifiable {
+    let provider: String
+    let state: String
+    let attempts: Int
+    let nextAttemptAt: String?
+    let lastAttemptAt: String?
+    let lastError: String?
+    let connected: Bool?
+
+    var id: String { provider }
+}
+
 struct WorkspaceItem: Codable, Identifiable, Equatable {
     let id: String
     let kind: WorkspaceItemKind

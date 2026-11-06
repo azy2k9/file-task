@@ -20,6 +20,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         createEventBySwitchingFromTask(title: "UI Runner Event Default")
         assertReminder(amount: 3, unit: "weeks")
         saveCurrentItem()
+        assertCalendarDeliveryNotice()
 
         openItem("UI Runner Event Default")
         assertReminder(amount: 3, unit: "weeks")
@@ -173,7 +174,10 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         field.typeText(String(password.prefix(1)))
         dismissStrongPasswordSuggestionIfShown()
         let firstCharacterWasEntered = (field.value as? String)?.count == 1
-        field.typeText(firstCharacterWasEntered ? String(password.dropFirst()) : password)
+        let remainingPassword = firstCharacterWasEntered ? String(password.dropFirst()) : password
+        for character in remainingPassword {
+            field.typeText(String(character))
+        }
         XCTAssertEqual((field.value as? String)?.count, password.count,
                        "The full password should be entered before submitting the form. Accessibility hierarchy: \(app.debugDescription)")
     }
@@ -294,6 +298,15 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         app.buttons["Save"].tap()
     }
 
+    private func assertCalendarDeliveryNotice() {
+        let notice = element(identifier: "calendar.sync.delivery.status")
+        XCTAssertTrue(notice.waitForExistence(timeout: 15),
+                      "A failed Calendar delivery must be reported separately from the saved Event. Accessibility hierarchy: \(app.debugDescription)")
+        XCTAssertTrue(notice.label.localizedCaseInsensitiveContains("Calendar sync"), notice.label)
+        XCTAssertTrue(notice.label.localizedCaseInsensitiveContains("saved"), notice.label)
+        XCTAssertTrue(notice.label.localizedCaseInsensitiveContains("FileTasks"), notice.label)
+    }
+
     private func openItem(_ title: String) {
         let row = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", title)).firstMatch
         scrollToHittable(row, toward: .down, maxSwipes: 10, message: "The saved item should appear in the signed-in workspace.")
@@ -318,9 +331,8 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         } else {
             field.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5)).tap()
         }
-        let focused = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hasKeyboardFocus == true"), object: field)
-        XCTAssertEqual(XCTWaiter.wait(for: [focused], timeout: 10), .completed,
-                       "The text field should receive keyboard focus. Accessibility hierarchy: \(app.debugDescription)")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5),
+                      "The text field should open the keyboard before text entry. Accessibility hierarchy: \(app.debugDescription)")
         if !currentValue.isEmpty {
             field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: currentValue.count))
         }

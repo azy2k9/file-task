@@ -52,6 +52,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -86,6 +89,7 @@ import com.google.firebase.messaging.FirebaseMessaging
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.tasks.await
@@ -156,9 +160,73 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
         var showLinkDialog by remember { mutableStateOf(false) }
         var linkName by rememberSaveable { mutableStateOf("") }
         var linkUrl by rememberSaveable { mutableStateOf("") }
+        var calendarSyncNotice by remember { mutableStateOf<String?>(null) }
+        var calendarNoticeVersion by remember { mutableStateOf(0) }
+
+        suspend fun refreshCalendarDeliveryStatus(currentToken: String, outcome: String? = null) {
+            try {
+                val statuses = ApiClient(apiBaseUrl).calendarSyncDelivery(currentToken)
+                if (token != currentToken) return
+                if (statuses.isEmpty()) {
+                    if (outcome == null) {
+                        calendarSyncNotice = null
+                        calendarNoticeVersion += 1
+                    } else {
+                        val version = calendarNoticeVersion + 1
+                        calendarNoticeVersion = version
+                        calendarSyncNotice = if (outcome == "deleted") "Deleted from FileTasks." else "Saved to FileTasks."
+                        scope.launch {
+                            delay(5_000)
+                            if (calendarNoticeVersion == version) calendarSyncNotice = null
+                        }
+                    }
+                    return
+                }
+                val retryNote = if (statuses.any { it.state == "failed" }) {
+                    if (statuses.any { !it.connected }) {
+                        " Reconnect the disconnected calendar to retry."
+                    } else {
+                        " The last attempt failed; another retry is scheduled."
+                    }
+                } else {
+                    if (statuses.any { !it.connected }) {
+                        " Reconnect the disconnected calendar to resume retries."
+                    } else ""
+                }
+                val disconnected = statuses.any { !it.connected }
+                val failed = statuses.any { it.state == "failed" }
+                val deliveryState = if (disconnected && failed) "failed" else "pending"
+                val savedOrDeleted = if (disconnected) "." else " and will be retried."
+                calendarSyncNotice = when (outcome) {
+                    "saved" -> "Calendar sync $deliveryState. Your Event is saved in FileTasks$savedOrDeleted" + retryNote
+                    "deleted" -> "Calendar removal $deliveryState. Your Event was deleted from FileTasks$savedOrDeleted" + retryNote
+                    else -> if (disconnected && failed) {
+                        "Calendar sync failed. Your Events are saved in FileTasks." + retryNote
+                    } else {
+                        "Calendar changes are pending. Your Events are saved in FileTasks$savedOrDeleted" + retryNote
+                    }
+                }
+                calendarNoticeVersion += 1
+            } catch (failure: Exception) {
+                if (token == currentToken && outcome != null) {
+                    calendarSyncNotice = if (outcome == "deleted") {
+                        "Deleted from FileTasks. Calendar removal status is not available yet."
+                    } else {
+                        "Saved to FileTasks. Calendar sync status is not available yet."
+                    }
+                }
+            }
+        }
 
         LaunchedEffect(user?.id) {
             pushDeviceId = user?.id?.let { preferences.getString(PushMessagingService.pushDeviceKey(it), null) }
+        }
+        LaunchedEffect(user?.id, token) {
+            val currentToken = token ?: return@LaunchedEffect
+            while (true) {
+                delay(30_000)
+                if (token == currentToken) refreshCalendarDeliveryStatus(currentToken)
+            }
         }
         var handledOpenItemRequest by remember { mutableStateOf<Long?>(null) }
         LaunchedEffect(openItemRequest, workspaceItems) {
@@ -180,6 +248,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                     workspaceItems = api.listItems(savedToken)
                     workspaceFiles = api.listFiles(savedToken)
                     reminderSettings = api.reminderSettings(savedToken)
+                    refreshCalendarDeliveryStatus(savedToken)
                 } catch (failure: Exception) {
                     if (failure is ApiException && failure.statusCode == 401) {
                         withContext(Dispatchers.IO) { tokenStore.clear() }
@@ -188,6 +257,8 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                         workspaceItems = emptyList()
                         workspaceFiles = emptyList()
                         reminderSettings = ReminderSettings.Empty
+                        calendarSyncNotice = null
+                        calendarNoticeVersion += 1
                     } else {
                         recoveryAvailable = true
                         errorMessage = readableError(failure)
@@ -213,6 +284,8 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                         workspaceFiles = emptyList()
                         reminderSettings = ReminderSettings.Empty
                         recoveryAvailable = false
+                        calendarSyncNotice = null
+                        calendarNoticeVersion += 1
                         editorTarget = null
                         confirmDelete = null
                     }
@@ -251,6 +324,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                 workspaceItems = api.listItems(currentToken)
                 workspaceFiles = api.listFiles(currentToken)
                 reminderSettings = api.reminderSettings(currentToken)
+                refreshCalendarDeliveryStatus(currentToken)
             }
         }
 
@@ -274,6 +348,8 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                 workspaceItems = emptyList()
                 workspaceFiles = emptyList()
                 reminderSettings = ReminderSettings.Empty
+                calendarSyncNotice = null
+                calendarNoticeVersion += 1
                 pushDeviceId = null
                 recoveryAvailable = false
             }
@@ -302,6 +378,8 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                     withContext(Dispatchers.IO) { tokenStore.write(newToken) }
                     token = newToken
                     user = account
+                    calendarSyncNotice = null
+                    calendarNoticeVersion += 1
                     recoveryAvailable = false
                     authError = null
                     errorMessage = null
@@ -310,6 +388,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                         workspaceItems = api.listItems(newToken)
                         workspaceFiles = api.listFiles(newToken)
                         reminderSettings = api.reminderSettings(newToken)
+                        refreshCalendarDeliveryStatus(newToken)
                     } catch (failure: Exception) {
                         if (failure is ApiException && failure.statusCode == 401) {
                             withContext(Dispatchers.IO) { tokenStore.clear() }
@@ -318,6 +397,8 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                             workspaceItems = emptyList()
                             workspaceFiles = emptyList()
                             reminderSettings = ReminderSettings.Empty
+                            calendarSyncNotice = null
+                            calendarNoticeVersion += 1
                             authError = readableError(failure)
                         } else {
                             errorMessage = readableError(failure)
@@ -341,6 +422,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                     workspaceItems = api.listItems(currentToken)
                     workspaceFiles = api.listFiles(currentToken)
                     reminderSettings = api.reminderSettings(currentToken)
+                    refreshCalendarDeliveryStatus(currentToken)
                     recoveryAvailable = false
                 } catch (failure: ApiException) {
                     if (failure.statusCode == 401) {
@@ -350,6 +432,8 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                         workspaceItems = emptyList()
                         workspaceFiles = emptyList()
                         reminderSettings = ReminderSettings.Empty
+                        calendarSyncNotice = null
+                        calendarNoticeVersion += 1
                         recoveryAvailable = false
                     }
                     throw failure
@@ -462,6 +546,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                 section = workspaceSection,
                 isBusy = working,
                 error = errorMessage,
+                calendarDeliveryNotice = calendarSyncNotice,
                 onFilterChange = { itemFilter = it.name },
                 onSectionChange = { workspaceSection = it.name },
                 onRefresh = ::refreshItems,
@@ -538,6 +623,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                             }
                             AgendaRefreshResult.Stale -> Unit
                         }
+                        if (fields.kind == ItemKind.Event) refreshCalendarDeliveryStatus(currentToken, "saved")
                     } catch (failure: Exception) {
                         if (failure is ApiException && failure.statusCode == 401) {
                             withContext(Dispatchers.IO) { tokenStore.clear() }
@@ -547,6 +633,8 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                             recoveryAvailable = false
                             editorTarget = null
                             confirmDelete = null
+                            calendarSyncNotice = null
+                            calendarNoticeVersion += 1
                         }
                         throw failure
                     } finally {
@@ -586,6 +674,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                                     workspaceItems = api.listItems(currentToken)
                                     workspaceFiles = api.listFiles(currentToken)
                                     reminderSettings = api.reminderSettings(currentToken)
+                                    if (item.kind == ItemKind.Event) refreshCalendarDeliveryStatus(currentToken, "deleted")
                                     confirmDelete = null
                                 }
                             }
@@ -880,6 +969,7 @@ private fun WorkspaceScreen(
     section: String,
     isBusy: Boolean,
     error: String?,
+    calendarDeliveryNotice: String?,
     onFilterChange: (ItemFilter) -> Unit,
     onSectionChange: (WorkspaceSection) -> Unit,
     onRefresh: () -> Unit,
@@ -971,6 +1061,20 @@ private fun WorkspaceScreen(
                 error?.let {
                     Spacer(Modifier.height(8.dp))
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                }
+                calendarDeliveryNotice?.let {
+                    Spacer(Modifier.height(8.dp))
+                    Card(
+                        modifier = Modifier.fillMaxWidth().testTag("calendar.sync.delivery.status")
+                            .semantics { liveRegion = LiveRegionMode.Polite },
+                    ) {
+                        Text(
+                            it,
+                            modifier = Modifier.fillMaxWidth().padding(12.dp),
+                            color = MaterialTheme.colorScheme.tertiary,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
                 }
             }
 

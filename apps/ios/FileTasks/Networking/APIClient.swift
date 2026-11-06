@@ -68,6 +68,14 @@ struct APIClient {
         return response.settings
     }
 
+    func calendarSyncDelivery(token: String) async throws -> [CalendarSyncDeliveryStatus] {
+        let response: CalendarSyncDeliveryResponse = try decode(
+            CalendarSyncDeliveryResponse.self,
+            from: try await perform(path: ["api", "calendars"], method: "GET", token: token)
+        )
+        return response.syncDelivery
+    }
+
     func updateReminderSettings(_ settings: ReminderSettings, token: String, applyToExisting: Bool) async throws -> ReminderSettings {
         let payload = ReminderSettingsPayload(
             taskReminders: settings.taskReminders,
@@ -300,6 +308,7 @@ private struct CompletionPayload: Encodable {
 
 private struct FilesResponse: Decodable { let files: [WorkspaceFile] }
 private struct ReminderSettingsResponse: Decodable { let settings: ReminderSettings }
+private struct CalendarSyncDeliveryResponse: Decodable { let syncDelivery: [CalendarSyncDeliveryStatus] }
 private struct ReminderSettingsPayload: Encodable {
     let taskReminders: [ReminderRule]
     let eventReminders: [ReminderRule]

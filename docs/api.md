@@ -53,7 +53,7 @@ PATCH preserves omitted fields. Send explicit nulls to remove date/time; send bo
 
 Events have `completed: null`; Tasks have a boolean. Lists contain only the authenticated account's items, ordered by date and time, with undated items last. Requests for another person's item return 404. Clients refresh through GET to observe changes saved by other clients.
 
-Imported Events include `calendarSync` entries with the source provider, whether synchronization is `supported` or `limited`, whether the FileTasks schedule or Recurrence rule differs from its import baseline, and a limitation message when sync is paused. Provider payloads and raw iCalendar data remain private. The Event `scheduledDate` and `scheduledTime` contract remains local wall-clock input; provider duration and timezone are retained separately.
+Imported Events include `calendarSync` entries with the source provider, whether synchronization is `supported` or `limited`, whether the FileTasks schedule or Recurrence rule differs from its import baseline, and a limitation message when sync is paused. Provider payloads and raw iCalendar data remain private. The Event `scheduledDate` and `scheduledTime` contract remains local wall-clock input; provider duration and timezone are retained separately. Event mutations commit locally with durable account/provider calendar retry state before delivery begins. A provider failure after that commit does not turn a successful Event save or deletion into an HTTP error; clients can read the delivery state from `GET /api/calendars`.
 
 ## Files and Attachments
 
@@ -86,8 +86,8 @@ Uploaded bytes move directly between the client and Cloudflare R2. The client fi
 | PATCH | `/api/notifications/{id}` | — | 200 `{success:true}` marks a Notification read |
 | POST | `/api/devices/push` | `{platform:"web"|"ios"|"android",token}` | 201 `{device:{id,platform,createdAt}}` |
 | DELETE | `/api/devices/push/{id}` | — | 204; revokes this device registration |
-| POST | `/api/internal/reminders/deliver` | — | 200 `{attempted,sent,failed}`; worker-only |
-| GET | `/api/calendars` | — | 200 `{calendars,syncLimitations}` |
+| POST | `/api/internal/reminders/deliver` | — | 200 `{attempted,sent,failed,calendarSync:{attempted,completed,failed}}`; worker-only |
+| GET | `/api/calendars` | — | 200 `{calendars,syncLimitations,syncDelivery}` |
 | GET | `/api/calendars/google/connect` | Browser session cookie | Sets a short-lived transaction cookie and redirects to Google OAuth |
 | GET | `/api/calendars/google/callback` | Google OAuth `state` and `code` query | Redirects back to the app after a verified transaction; rejects replayed, expired, or mismatched transactions |
 | POST | `/api/calendars` | `{username,password,calendarUrl?}` | 201 Apple CalDAV connection |
@@ -95,6 +95,8 @@ Uploaded bytes move directly between the client and Cloudflare R2. The client fi
 | DELETE | `/api/calendars/{google|apple}` | — | 204 |
 
 Calendar credentials are encrypted at rest. Set `FILETASKS_CALENDAR_ENCRYPTION_KEY` to a private 32-byte base64 or hex key. Google requires OAuth client ID, secret, and callback URL settings. Apple Calendar uses an Apple ID app-specific password; CalDAV discovery runs from iCloud unless a calendar collection URL is supplied. Imported Events keep an account- and provider-specific source payload or raw iCalendar resource, normalized provider timing, and a FileTasks schedule baseline in an additive metadata table. When the schedule is unchanged, sync preserves the imported provider start and end exactly; a simple local schedule edit keeps the original duration and timezone when they can be resolved safely. External edits to supported details are replaced by FileTasks values, and missing supported copies are recreated. Unsupported timing or Recurrence representations stay in the source metadata and are not exported to either connected provider; the API and browser show a sync limitation instead of simplifying them. Legacy imported Events without retained source metadata are marked limited during the next sync. Configure `FILETASKS_PUBLIC_URL` or `FILETASKS_ORIGIN` for backlinks, and `FILETASKS_TIME_ZONE` for new Google timed Event copies.
+
+`syncDelivery` contains account-scoped connected-calendar delivery rows that are `pending` or `failed`. Each row includes `provider`, `attempts`, `nextAttemptAt`, `lastAttemptAt`, and a safe user-facing `lastError`; `connected` is false when a pending row is waiting for a provider to be reconnected. Event saves and deletions mark these rows in the same local database transaction as the Event mutation. The scheduled worker retries connected rows with exponential backoff. A successful sync removes the row from `syncDelivery`; unsupported representations remain visible through `syncLimitations` and do not retry endlessly.
 
 Google Calendar connection starts with a top-level browser navigation to `/api/calendars/google/connect` while the intended FileTasks account is signed in. The server sets a 10-minute, HttpOnly, SameSite=Lax transaction cookie (Secure on HTTPS), and stores only hashes of the OAuth state, cookie nonce, and initiating session. The callback must present that cookie and the same active FileTasks session and account; it consumes a valid transaction once. Expired, replayed, cancelled, or mismatched transactions cannot connect a calendar. Copying the Google authorization URL into another browser does not transfer the transaction cookie, so OAuth state alone never selects the FileTasks account. The callback response is not cacheable and suppresses referrers because Google sends its authorization code and state in the callback URL.
 
