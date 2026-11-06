@@ -1,5 +1,6 @@
 package com.filetasks.android
 
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsOn
@@ -167,7 +168,14 @@ class RecurringAgendaUiTest {
 
     private fun deleteItem(item: WorkspaceItem) {
         compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.delete.${item.id}"))
-        compose.onNodeWithTag("agenda.delete.${item.id}").performClick()
+        val deleteButton = compose.onNodeWithTag("agenda.delete.${item.id}")
+        waitFor("the delete action to finish enabling") {
+            runCatching {
+                deleteButton.assertIsDisplayed()
+                deleteButton.assertIsEnabled()
+            }.isSuccess
+        }
+        deleteButton.performClick()
         waitFor("the delete confirmation to appear") {
             compose.onAllNodes(hasTestTag("item.delete.confirm"), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
         }
