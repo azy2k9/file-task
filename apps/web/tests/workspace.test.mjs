@@ -108,6 +108,18 @@ function validCompactDateTime(value, requireZulu = false) {
     && hour < 24 && minute < 60 && second < 60;
 }
 
+function appleCopiesForItem(title) {
+  return [...appleEvents.entries()].filter(([, calendarData]) => calendarData.includes(`SUMMARY:${title}\r\n`));
+}
+
+function googleCopiesForItem(title) {
+  return [...googleEvents.entries()].filter(([, event]) => event.summary === title);
+}
+
+function withoutAppleSyncMetadata(calendarData) {
+  return calendarData.replace(/^URL:.*\r?\n/gm, "").replace(/^X-FILETASKS-SYNC-GENERATION:.*\r?\n/gm, "");
+}
+
 function validIcsDateValue(value, parameters = {}) {
   return parameters.VALUE?.toUpperCase() === "DATE" ? validCompactDate(value) : validCompactDateTime(value);
 }
@@ -1777,6 +1789,56 @@ test("long-lead Reminders extend rolling Occurrence materialization beyond the f
   assert.equal((await runReminderWorker()).status, 200);
   const notifications = (await (await request("/api/notifications", { token: owner.token })).json()).notifications;
   assert.equal(longLeadOccurrences.some(({ id }) => notifications.some(({ itemId }) => itemId === id)), true);
+});
+
+test("a 20,000-hour Reminder has its future Occurrence materialized before the provider due time", async () => {
+  const owner = await account();
+  const previousClock = new Date(testClock);
+  try {
+    await setTestClock("2026-11-07T12:00:00.000Z");
+    const today = testClock.toISOString().slice(0, 10);
+    assert.equal((await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: { emailEnabled: true } })).status, 200);
+    const root = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "event", title: "Twenty thousand hour Reminder", scheduledDate: today, scheduledTime: "10:00",
+      recurrence: { interval: 1, unit: "months", end: { type: "never" } },
+      reminders: [{ delivery: "email", amount: 20_000, unit: "hours", time: "10:00" }],
+    } })).json()).item;
+    const occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ seriesId, scheduledDate }) => seriesId === root.id && scheduledDate > today);
+    const target = occurrences.find(({ scheduledDate }) => Date.parse(`${scheduledDate}T10:00:00.000Z`) - testClock.getTime() >= 20_000 * 3_600_000);
+    assert.ok(target, "an Occurrence beyond the former 370-day horizon should already be visible");
+
+    const dueAt = Date.parse(`${target.scheduledDate}T10:00:00.000Z`) - 20_000 * 3_600_000;
+    await setTestClock(dueAt - 1);
+    await runReminderWorker();
+    assert.equal(deliveryRequests.some(({ body }) => body.operation === "deliver" && body.reminder?.itemId === target.id), false);
+    await setTestClock(dueAt);
+    await runReminderWorker();
+    const delivery = deliveryRequests.find(({ body }) => body.operation === "deliver" && body.reminder?.itemId === target.id);
+    assert.ok(delivery, "the provider should receive the delivery when the Reminder becomes due");
+    assert.equal(delivery.body.reminder.scheduledAt, new Date(dueAt).toISOString());
+  } finally { await setTestClock(previousClock); }
+});
+
+test("old never-ending daily series materialize current and upcoming Occurrences without losing root history", async () => {
+  const owner = await account();
+  const previousClock = new Date(testClock);
+  try {
+    await setTestClock("2026-11-07T12:00:00.000Z");
+    const root = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "task", title: "Old daily series", scheduledDate: "1990-01-01",
+      recurrence: { interval: 1, unit: "days", end: { type: "never" } },
+    } })).json()).item;
+    await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: { completed: true } });
+    const occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ seriesId }) => seriesId === root.id);
+    const dates = new Set(occurrences.map(({ scheduledDate }) => scheduledDate));
+    assert.equal(dates.has("2026-11-07"), true);
+    assert.equal(dates.has("2026-11-08"), true);
+    assert.equal(occurrences.some(({ id, completed }) => id === root.id && completed), true,
+      "materialization must preserve the root Occurrence completion history");
+    assert.ok(occurrences.length < 500, "generation should stay bounded to the rolling window");
+  } finally { await setTestClock(previousClock); }
 });
 
 test("recurring item deletion requires a scope and preserves the requested range", async () => {
@@ -4184,7 +4246,7 @@ test("a person can manage Tasks and Events through the browser and see another c
     await expect(page.getByText("Synced apple Calendar.", { exact: false })).toBeVisible();
     await expect(page.getByLabel("Calendar sync limitations")).toContainText("earlier or unknown connection");
     assert.equal(appleEvents.get(oldCollectionCopy[0]), oldCollectionCopy[1], "reconnect must preserve the previous collection's copy");
-    assert.equal(appleEvents.get("/apple/calendar-b/unrelated-b.ics"), unrelatedCollectionCopy, "sync must preserve an unrelated Event in the selected collection");
+    assert.equal(withoutAppleSyncMetadata(appleEvents.get("/apple/calendar-b/unrelated-b.ics")), unrelatedCollectionCopy, "sync must preserve an unrelated Event in the selected collection");
     assert.ok([...appleEvents.entries()].some(([path, calendarData]) => path.startsWith("/apple/calendar-b/")
       && calendarData.includes("SUMMARY:New collection B event")), "new work should export to the selected collection");
     assert.ok(providerRequests.slice(appleRequestsBeforeSwitch).filter(({ path }) => path.startsWith("/apple/"))
@@ -6100,7 +6162,7 @@ test("Apple schedule edits that end in the repeated DST hour pause export", asyn
     const sync = await request("/api/calendars/sync",{token:owner.token,method:"POST"});
     assert.ok((await sync.json()).syncLimitations.some((entry) => entry.itemId === item.id));
     assert.equal(appleEvents.size,1);
-    assert.equal(appleEvents.get(path),original);
+    assert.equal(withoutAppleSyncMetadata(appleEvents.get(path)),original);
   } finally { appleEvents=priorAppleEvents; }
 });
 
@@ -6574,7 +6636,7 @@ test("imported provider titles preserve whitespace until deliberately edited", a
       if (provider === "apple") appleEvents.set(path, original);
       else googleEvents.set("whitespace", {id: "whitespace", summary: title, start: {date: "2027-01-14"}, end: {date: "2027-01-15"}});
       assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
-      if (provider === "apple") assert.equal(appleEvents.get(path), original);
+      if (provider === "apple") assert.equal(withoutAppleSyncMetadata(appleEvents.get(path)), original);
       else assert.equal(googleEvents.get("whitespace").summary, title);
       const item = (await (await request("/api/items", {token: owner.token})).json()).items.find(entry => entry.title.trim() === "Whitespace title");
       assert.ok(item);
