@@ -168,6 +168,9 @@ class CalendarSettingsUiTest {
         Intents.init()
         try {
             Intents.intending(hasData(fileUri)).respondWith(Instrumentation.ActivityResult(Activity.RESULT_OK, null))
+            waitFor("the attached File action to become enabled") {
+                compose.onAllNodes(hasText("Open") and isEnabled()).fetchSemanticsNodes().isNotEmpty()
+            }
             compose.onNodeWithText("Open").performClick()
             waitFor("the external File open intent") {
                 runCatching { Intents.intended(hasData(fileUri)) }.isSuccess
