@@ -3641,8 +3641,9 @@ test("a whole-series edit after a local first-Occurrence recurrence override kee
   assert.equal(rows.length, 4);
   assert.ok(rows.every(({ title }) => title === "Renamed series"));
   assert.deepEqual(rows.map(({ occurrenceDate }) => occurrenceDate), ["2026-11-01", "2026-11-02", "2026-11-03", "2026-11-04"]);
-  assert.equal(rows[0].recurrence.end.type, "count");
-  assert.equal(rows[0].recurrence.end.count, 4);
+  assert.equal(rows[0].recurrence, null, "the local first-Occurrence override stays local");
+  assert.ok(rows.slice(1).every(({ recurrence }) => recurrence?.end?.type === "count" && recurrence.end.count === 4),
+    "the saved series recurrence remains available for generated Occurrences");
 });
 
 test("a root Occurrence edit with recurrence enabled does not replace the series generation template", async () => {
