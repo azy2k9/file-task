@@ -13,7 +13,6 @@ import androidx.compose.ui.test.isRoot
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
-import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
@@ -259,7 +258,9 @@ class RecurringAgendaUiTest {
             compose.onNodeWithText(scope).performScrollTo().performClick()
         } catch (failure: AssertionError) {
             val serverItem = items(api, token).singleOrNull { it.id == item.id }
-            throw AssertionError("Could not select edit scope '$scope' for item ${item.id}; passed seriesId=${item.seriesId}; server=$serverItem; UI=${compose.onRoot(useUnmergedTree = true).printToString()}", failure)
+            val roots = compose.onAllNodes(isRoot(), useUnmergedTree = true)
+            val ui = (0 until roots.fetchSemanticsNodes().size).joinToString("\n") { roots.get(it).printToString() }
+            throw AssertionError("Could not select edit scope '$scope' for item ${item.id}; passed seriesId=${item.seriesId}; server=$serverItem; cause=${failure.message}; UI=$ui", failure)
         }
         compose.onNodeWithText("Save").performClick()
         waitFor("the edit editor to close") { compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty() }
