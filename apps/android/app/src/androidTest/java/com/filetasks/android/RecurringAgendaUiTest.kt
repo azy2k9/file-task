@@ -13,6 +13,7 @@ import androidx.compose.ui.test.isRoot
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
@@ -170,13 +171,13 @@ class RecurringAgendaUiTest {
             items(api, token).none { it.id == personalTask.id || it.id == personalEvent.id }
         }
 
-        edit(event[1], "Android UI Following", "This and following Occurrences")
+        edit(event[1], "Android UI Following", "This and following Occurrences", api, token)
         val afterFollowing = items(api, token)
         assertEquals(2, afterFollowing.count { it.title == "Android UI Following" })
         assertEquals(1, afterFollowing.count { it.title == "Android UI Event" })
         afterFollowing.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
 
-        edit(task[0], "Android UI Whole Task", "Whole series")
+        edit(task[0], "Android UI Whole Task", "Whole series", api, token)
         val afterSeries = items(api, token)
         assertEquals(3, afterSeries.count { it.title == "Android UI Whole Task" })
         assertTrue(afterSeries.any { it.title == "Android UI Event" })
@@ -249,7 +250,7 @@ class RecurringAgendaUiTest {
         waitFor("the create editor to close") { compose.onAllNodes(hasText("Add to your workspace")).fetchSemanticsNodes().isEmpty() }
     }
 
-    private fun edit(item: WorkspaceItem, title: String, scope: String) {
+    private fun edit(item: WorkspaceItem, title: String, scope: String, api: ApiClient, token: String) {
         compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
         compose.onNodeWithTag("agenda.edit.${item.id}").performClick()
         compose.onNodeWithText("Title").performTextClearance()
