@@ -3430,6 +3430,43 @@ test("recurring items create independent Occurrences and honor occurrence and se
   assert.equal(afterSeriesEdit.find(({ id }) => id === occurrenceId)?.completed, true);
 });
 
+test("whole-series edits keep the original start after locally moving the first Occurrence", async () => {
+  const owner = await account();
+  const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "task", title: "Original finite series", scheduledDate: "2026-10-14",
+    recurrence: { interval: 1, unit: "days", end: { type: "date", date: "2026-10-16" } },
+  } });
+  assert.equal(created.status, 201, await created.clone().text());
+  const root = (await created.json()).item;
+  let occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+    .filter(({ seriesId }) => seriesId === root.id)
+    .sort((left, right) => left.occurrenceDate.localeCompare(right.occurrenceDate));
+  assert.deepEqual(occurrences.map(({ occurrenceDate }) => occurrenceDate), ["2026-10-14", "2026-10-15", "2026-10-16"]);
+
+  const moved = await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: {
+    title: "Moved first Occurrence", scheduledDate: "2026-10-24", recurrence: null, scope: "occurrence",
+  } });
+  assert.equal(moved.status, 200, await moved.clone().text());
+  const movedRoot = (await moved.json()).item;
+  assert.equal(movedRoot.occurrenceDate, "2026-10-14");
+  assert.equal(movedRoot.scheduledDate, "2026-10-24");
+
+  const laterOccurrence = occurrences.find(({ id }) => id !== root.id);
+  assert.ok(laterOccurrence);
+  const seriesEdit = await request(`/api/items/${laterOccurrence.id}`, { token: owner.token, method: "PATCH", body: {
+    title: "Updated finite series", scope: "series",
+  } });
+  assert.equal(seriesEdit.status, 200, await seriesEdit.clone().text());
+
+  occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+    .filter(({ seriesId }) => seriesId === root.id)
+    .sort((left, right) => left.occurrenceDate.localeCompare(right.occurrenceDate));
+  assert.deepEqual(occurrences.map(({ occurrenceDate }) => occurrenceDate), ["2026-10-14", "2026-10-15", "2026-10-16"]);
+  assert.equal(occurrences.filter(({ title }) => title === "Updated finite series").length, 3);
+  assert.equal(occurrences.some(({ scheduledDate }) => scheduledDate === "2026-10-24"), false,
+    "the locally moved first Occurrence must not become a new recurrence start");
+});
+
 test("editing the first Occurrence locally preserves its recurrence definition and series identity", async () => {
   const owner = await account();
   const previousClock = new Date(testClock);
