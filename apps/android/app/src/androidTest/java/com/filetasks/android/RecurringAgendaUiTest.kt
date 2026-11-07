@@ -114,7 +114,7 @@ class RecurringAgendaUiTest {
         try {
             waitFor("the first Occurrence edit to be saved without changing the series") {
                 observedRows = items(api, token).filter { it.id in initialTaskRows.map(WorkspaceItem::id) || it.title == "Android UI First Task Only" }
-                val savedFirst = observedRows.singleOrNull { it.title == "Android UI First Task Only" }
+                val savedFirst = observedRows.singleOrNull { it.id == firstTaskOccurrence.id }
                 val savedRows = observedRows
                 val savedLater = laterTaskOccurrences.mapNotNull { original -> savedRows.singleOrNull { it.id == original.id } }
                 savedFirst?.title == "Android UI First Task Only"
@@ -130,13 +130,13 @@ class RecurringAgendaUiTest {
                             && saved.recurrence == original.recurrence
                             && saved.reminders == original.reminders
                     }
-                }
+            }
         } catch (failure: AssertionError) {
             val values = observedRows.joinToString { "${it.id}:series=${it.seriesId},occurrence=${it.occurrenceDate},title=${it.title},date=${it.scheduledDate},time=${it.scheduledTime},rule=${it.recurrence},reminders=${it.reminders}" }
             val expectedLater = laterTaskOccurrences.joinToString { "${it.id}:occurrence=${it.occurrenceDate},title=${it.title},date=${it.scheduledDate},time=${it.scheduledTime},rule=${it.recurrence},reminders=${it.reminders}" }
             throw AssertionError("First Occurrence API rows after edit; expected id ${firstTaskOccurrence.id}; expected later=$expectedLater; actual=$values", failure)
         }
-        val savedFirstTaskOccurrence = items(api, token).single { it.title == "Android UI First Task Only" }
+        val savedFirstTaskOccurrence = items(api, token).single { it.id == firstTaskOccurrence.id }
         assertEquals(firstTaskOccurrence.occurrenceDate, savedFirstTaskOccurrence.occurrenceDate)
         assertAgendaItem(savedFirstTaskOccurrence.id, "Android UI First Task Only")
         laterTaskOccurrences.forEach { assertAgendaItem(it.id, it.title) }
@@ -148,19 +148,6 @@ class RecurringAgendaUiTest {
         val event = items(api, token).filter { it.title == "Android UI Event" }.sortedBy { it.scheduledDate }
         assertEquals("The UI-created Event must have three Occurrences", 3, event.size)
         event.forEach { assertAgendaItem(it.id, it.title) }
-
-        edit(event[1], "Android UI Following", "This and following Occurrences", api, token)
-        val afterFollowing = items(api, token)
-        assertEquals(2, afterFollowing.count { it.title == "Android UI Following" })
-        assertEquals(1, afterFollowing.count { it.title == "Android UI Event" })
-        afterFollowing.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
-
-        edit(task[0], "Android UI Whole Task", "Whole series", api, token)
-        val afterSeries = items(api, token)
-        assertEquals(3, afterSeries.count { it.title == "Android UI Whole Task" })
-        assertTrue(afterSeries.any { it.title == "Android UI Event" })
-        assertEquals(2, afterSeries.count { it.title == "Android UI Following" })
-        afterSeries.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
 
         createSimpleItem("Android UI personal Event", isEvent = true, details = "An undated Event", api = api, token = token)
         var personalEvent = items(api, token).single { it.title == "Android UI personal Event" }
@@ -186,21 +173,19 @@ class RecurringAgendaUiTest {
             items(api, token).none { it.id == personalTask.id || it.id == personalEvent.id }
         }
 
-        edit(event[1], "Android UI Following", "This and following Occurrences")
+        edit(event[1], "Android UI Following", "This and following Occurrences", api, token)
         val afterFollowing = items(api, token)
         assertEquals(2, afterFollowing.count { it.title == "Android UI Following" })
         assertEquals(1, afterFollowing.count { it.title == "Android UI Event" })
         afterFollowing.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
 
-        edit(laterTaskOccurrences.first(), "Android UI Whole Task", "Whole series")
+        edit(laterTaskOccurrences.first(), "Android UI Whole Task", "Whole series", api, token)
         val afterSeries = items(api, token)
         val afterTaskSeriesEdit = afterSeries.filter { it.id in initialTaskRows.map(WorkspaceItem::id) }
         assertEquals(3, afterTaskSeriesEdit.count { it.title == "Android UI Whole Task" })
         assertEquals(2, afterSeries.count { it.title == "Android UI Following" })
         afterSeries.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
 
-        clearEventDate(undatedEvent, api, token)
-        deleteEvent(eventToDelete, api, token)
     }
 
     private fun items(api: ApiClient, token: String): List<WorkspaceItem> = runBlocking { api.listItems(token) }
