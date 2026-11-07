@@ -545,7 +545,7 @@ function propertyLineForTiming(name: "DTSTART"|"DTEND", original: string, timing
   return `${original.slice(0,separator+1)}${outputValue}`;
 }
 
-function patchImportedAppleIcs(metadata: ImportMetadataRow, item: EventItem) {
+function patchImportedAppleIcs(metadata: ImportMetadataRow, item: EventItem, restoreMissingCopy = false) {
   if (!metadata.source_ics) return { limitation:"The original Apple Calendar data is unavailable. Sync is paused to protect the imported Event." };
   const original = metadata.source_ics;
   const timingResult = importedTimingForEdit(metadata,item);
@@ -564,10 +564,13 @@ function patchImportedAppleIcs(metadata: ImportMetadataRow, item: EventItem) {
     return -1;
   };
   const baseline = JSON.parse(metadata.baseline_json) as {scheduledDate:string|null;scheduledTime:string|null;title?:string;details?:string};
-  if (typeof baseline.title === "string" && baseline.title !== item.title) changes.set("SUMMARY",`SUMMARY:${escapeIcs(item.title)}`);
-  if (typeof baseline.details === "string" && baseline.details !== item.details) changes.set("DESCRIPTION",item.details ? `DESCRIPTION:${escapeIcs(item.details)}` : null);
+  const titleChanged = typeof baseline.title === "string" && baseline.title !== item.title;
+  const detailsChanged = typeof baseline.details === "string" && baseline.details !== item.details;
+  const scheduleChanged = baseline.scheduledDate !== item.scheduledDate || baseline.scheduledTime !== item.scheduledTime;
+  if (titleChanged) changes.set("SUMMARY",`SUMMARY:${escapeIcs(item.title)}`);
+  if (detailsChanged) changes.set("DESCRIPTION",item.details ? `DESCRIPTION:${escapeIcs(item.details)}` : null);
   const backlink = filetasksEventUrl(item.id);
-  if (backlink) changes.set("URL",`URL:${backlink}`);
+  if (backlink && (restoreMissingCopy || titleChanged || detailsChanged || scheduleChanged)) changes.set("URL",`URL:${backlink}`);
   const implicitAllDayEnd = timingResult.kind === "allDay" && directIndex("DTEND") < 0 && directIndex("DURATION") < 0;
   if (implicitAllDayEnd) changes.set("DTEND",`DTEND;VALUE=DATE:${compactDate(timingResult.endDate)}`);
   if (baseline.scheduledDate !== item.scheduledDate || baseline.scheduledTime !== item.scheduledTime) {
@@ -2422,7 +2425,7 @@ async function syncApple(connection: Connection, events: EventItem[], missingHre
         || occurrence.title !== item.title || occurrence.details !== item.details));
     let calendarData: string;
     if (metadata?.provider === "apple") {
-      const source = patchImportedAppleIcs(metadata,item);
+      const source = patchImportedAppleIcs(metadata,item,Boolean(mapped && missingHrefs.has(mapped.href)));
       if ("limitation" in source) { reportSyncLimitation(limits,item,"apple",source.limitation); continue; }
       calendarData = source.ics;
     } else if (metadata) {
