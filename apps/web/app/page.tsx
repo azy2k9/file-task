@@ -7,7 +7,7 @@ import FilesView from "./files-view";
 type Account = { id: string; email: string };
 type ReminderSettings = { taskReminders: ReminderRule[]; eventReminders: ReminderRule[]; pushEnabled: boolean; emailEnabled: boolean; pushAvailable: boolean; emailAvailable: boolean };
 type InAppNotification = { id: string; itemId: string; title: string; scheduledAt: string; readAt: string | null };
-type CalendarSyncDelivery = { provider: "google" | "apple"; state: "pending" | "failed"; attempts: number; nextAttemptAt: string | null; lastAttemptAt: string | null; lastError: string | null; connected?: boolean };
+type CalendarSyncDelivery = { provider: "google" | "apple"; state: "pending" | "failed"; attempts: number; nextAttemptAt: string | null; lastAttemptAt: string | null; lastError: string | null; connected?: boolean; reauthorizationRequired?: boolean };
 type View = "agenda" | "task" | "event" | "files";
 type AuthMode = "login" | "register";
 type Draft = {
@@ -611,6 +611,7 @@ function ReminderSettingsDialog({ initial, accountId, onClose, onSave }: {
   const [calendarBusy, setCalendarBusy] = useState(false);
   const [calendars, setCalendars] = useState<{ provider: "google" | "apple"; account_label: string }[]>([]);
   const [calendarSyncLimitations, setCalendarSyncLimitations] = useState<{itemId:string;title:string;provider:"google"|"apple";message:string}[]>([]);
+  const [calendarSyncDelivery, setCalendarSyncDelivery] = useState<CalendarSyncDelivery[]>([]);
   const [appleUsername, setAppleUsername] = useState("");
   const [applePassword, setApplePassword] = useState("");
   const [appleCalendarUrl, setAppleCalendarUrl] = useState("");
@@ -620,9 +621,10 @@ function ReminderSettingsDialog({ initial, accountId, onClose, onSave }: {
     if (dialog && !dialog.open) dialog.showModal();
     void fetch("/api/calendars", { credentials: "same-origin", cache: "no-store" }).then(async (response) => {
       if (response.ok) {
-        const result = await response.json() as {calendars:{provider:"google"|"apple";account_label:string}[];syncLimitations?:{itemId:string;title:string;provider:"google"|"apple";message:string}[]};
+        const result = await response.json() as {calendars:{provider:"google"|"apple";account_label:string}[];syncLimitations?:{itemId:string;title:string;provider:"google"|"apple";message:string}[];syncDelivery?:CalendarSyncDelivery[]};
         setCalendars(result.calendars);
         setCalendarSyncLimitations(result.syncLimitations ?? []);
+        setCalendarSyncDelivery(result.syncDelivery ?? []);
       }
     }).catch(() => undefined);
     return () => { if (dialog?.open) dialog.close(); };
@@ -649,22 +651,23 @@ function ReminderSettingsDialog({ initial, accountId, onClose, onSave }: {
       const response = await fetch(path, { credentials: "same-origin", ...init });
       if (!response.ok) throw new Error(await errorFromResponse(response, "Calendar action failed."));
       if (response.status !== 204) {
-        const result = await response.json() as { calendars?: { provider: "google" | "apple"; account_label: string }[]; synced?: string[]; message?: string; syncLimitations?:{itemId:string;title:string;provider:"google"|"apple";message:string}[] };
+        const result = await response.json() as { calendars?: { provider: "google" | "apple"; account_label: string }[]; synced?: string[]; message?: string; syncLimitations?:{itemId:string;title:string;provider:"google"|"apple";message:string}[]; syncDelivery?:CalendarSyncDelivery[] };
         if (result.calendars) setCalendars(result.calendars);
         if (result.syncLimitations) setCalendarSyncLimitations(result.syncLimitations);
+        if (result.syncDelivery) setCalendarSyncDelivery(result.syncDelivery);
         if (result.synced) setCalendarError(`Synced ${result.synced.join(" and ")} Calendar${result.synced.length === 1 ? "" : "s"}.${result.syncLimitations?.length ? ` ${result.syncLimitations.length} Event sync limitation${result.syncLimitations.length === 1 ? "" : "s"}.` : ""}`);
         else {
           const refreshed = await fetch("/api/calendars", { credentials: "same-origin", cache: "no-store" });
           if (refreshed.ok) {
-            const status = await refreshed.json() as {calendars:{provider:"google"|"apple";account_label:string}[];syncLimitations?:{itemId:string;title:string;provider:"google"|"apple";message:string}[]};
-            setCalendars(status.calendars); setCalendarSyncLimitations(status.syncLimitations ?? []);
+            const status = await refreshed.json() as {calendars:{provider:"google"|"apple";account_label:string}[];syncLimitations?:{itemId:string;title:string;provider:"google"|"apple";message:string}[];syncDelivery?:CalendarSyncDelivery[]};
+            setCalendars(status.calendars); setCalendarSyncLimitations(status.syncLimitations ?? []); setCalendarSyncDelivery(status.syncDelivery ?? []);
           }
         }
       } else {
         const refreshed = await fetch("/api/calendars", { credentials: "same-origin", cache: "no-store" });
         if (refreshed.ok) {
-          const status = await refreshed.json() as {calendars:{provider:"google"|"apple";account_label:string}[];syncLimitations?:{itemId:string;title:string;provider:"google"|"apple";message:string}[]};
-          setCalendars(status.calendars); setCalendarSyncLimitations(status.syncLimitations ?? []);
+          const status = await refreshed.json() as {calendars:{provider:"google"|"apple";account_label:string}[];syncLimitations?:{itemId:string;title:string;provider:"google"|"apple";message:string}[];syncDelivery?:CalendarSyncDelivery[]};
+          setCalendars(status.calendars); setCalendarSyncLimitations(status.syncLimitations ?? []); setCalendarSyncDelivery(status.syncDelivery ?? []);
         }
       }
     } catch (failure) { setCalendarError(failure instanceof Error ? failure.message : "Calendar action failed."); }
@@ -687,12 +690,14 @@ function ReminderSettingsDialog({ initial, accountId, onClose, onSave }: {
         {calendarSyncLimitations.length > 0 && <div className="calendar-event-notice" aria-label="Calendar sync limitations">
           {calendarSyncLimitations.map((limitation) => <p key={`${limitation.itemId}:${limitation.provider}`}><strong>{limitation.title} · {limitation.provider === "google" ? "Google" : "Apple"} Calendar:</strong> {limitation.message}</p>)}
         </div>}
-        {!calendars.some((calendar) => calendar.provider === "google") && <button className="button button-secondary" type="button" disabled={calendarBusy} onClick={() => window.location.assign("/api/calendars/google/connect")}>Connect Google Calendar</button>}
-        {!calendars.some((calendar) => calendar.provider === "apple") && <div className="apple-calendar-connect">
+        {calendarSyncDelivery.filter((status) => status.reauthorizationRequired).map((status) => <p className="form-error" role="status" key={status.provider}>{status.lastError}</p>)}
+        {(!calendars.some((calendar) => calendar.provider === "google") || calendarSyncDelivery.some((status) => status.provider === "google" && status.reauthorizationRequired)) && <button className="button button-secondary" type="button" disabled={calendarBusy} onClick={() => window.location.assign("/api/calendars/google/connect")}>{calendars.some((calendar) => calendar.provider === "google") ? "Reauthorize Google Calendar" : "Connect Google Calendar"}</button>}
+        {(!calendars.some((calendar) => calendar.provider === "apple") || calendarSyncDelivery.some((status) => status.provider === "apple" && status.reauthorizationRequired)) && <div className="apple-calendar-connect">
+          {calendars.some((calendar) => calendar.provider === "apple") && <p>Update Apple Calendar credentials to reauthorize cleanup and resume retries.</p>}
           <label className="field-label" htmlFor="apple-calendar-user">Apple ID</label><input id="apple-calendar-user" type="email" autoComplete="username" value={appleUsername} disabled={calendarBusy} onChange={(event) => setAppleUsername(event.target.value)} />
           <label className="field-label" htmlFor="apple-calendar-password">App-specific password</label><input id="apple-calendar-password" type="password" autoComplete="new-password" value={applePassword} disabled={calendarBusy} onChange={(event) => setApplePassword(event.target.value)} />
           <label className="field-label" htmlFor="apple-calendar-url">CalDAV calendar URL <span aria-hidden="true">Optional</span></label><input id="apple-calendar-url" type="url" placeholder="Discover from iCloud when blank" value={appleCalendarUrl} disabled={calendarBusy} onChange={(event) => setAppleCalendarUrl(event.target.value)} />
-          <button className="button button-secondary" type="button" disabled={calendarBusy} onClick={() => void updateCalendar("/api/calendars", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: appleUsername, password: applePassword, ...(appleCalendarUrl ? { calendarUrl: appleCalendarUrl } : {}) }) })}>Connect Apple Calendar</button>
+          <button className="button button-secondary" type="button" disabled={calendarBusy} onClick={() => void updateCalendar("/api/calendars", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: appleUsername, password: applePassword, ...(appleCalendarUrl ? { calendarUrl: appleCalendarUrl } : {}) }) })}>{calendars.some((calendar) => calendar.provider === "apple") ? "Reauthorize Apple Calendar" : "Connect Apple Calendar"}</button>
         </div>}
         {calendarError && <p className="form-error" role="status">{calendarError}</p>}
       </section>
@@ -969,13 +974,17 @@ export default function Page() {
       const statuses = result.syncDelivery ?? [];
       const failed = statuses.some((status) => status.state === "failed");
       const disconnected = statuses.some((status) => status.connected !== true);
-      const retryText = disconnected
+      const reauthorizationProviders = statuses.filter((status) => status.reauthorizationRequired).map((status) => status.provider);
+      const reauthorizationText = reauthorizationProviders.length
+        ? ` Reauthorize ${reauthorizationProviders.map((provider) => provider === "google" ? "Google" : "Apple").join(" and ")} Calendar in Sync Calendar settings; automatic retries continue.`
+        : "";
+      const retryText = reauthorizationText || (disconnected
         ? failed
           ? " Reconnect the disconnected calendar to retry."
           : " Reconnect the disconnected calendar to resume retries."
         : failed
           ? " The last attempt failed; another retry is scheduled."
-          : "";
+          : "");
       if (statuses.length > 0) {
         const statusText = disconnected && failed ? "failed" : "pending";
         const message = outcome === "deleted"

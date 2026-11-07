@@ -85,6 +85,16 @@ export function database() {
         next_attempt_at INTEGER,
         last_attempt_at INTEGER,
         last_error TEXT,
+        last_error_code TEXT,
+        PRIMARY KEY(user_id,provider)
+      );
+      CREATE TABLE IF NOT EXISTS calendar_sync_authorization (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL CHECK(provider IN ('google','apple')),
+        connection_scope_id TEXT NOT NULL,
+        credential_generation_id TEXT NOT NULL,
+        last_error TEXT NOT NULL,
+        recorded_at INTEGER NOT NULL,
         PRIMARY KEY(user_id,provider)
       );
       CREATE TABLE IF NOT EXISTS calendar_copies (
@@ -237,6 +247,8 @@ export function database() {
       );
     `);
     const itemColumns = new Set(db.prepare("PRAGMA table_info(items)").all().map((column) => String(column.name)));
+    const syncStateColumns = new Set(db.prepare("PRAGMA table_info(calendar_sync_state)").all().map((column) => String(column.name)));
+    if (!syncStateColumns.has("last_error_code")) db.exec("ALTER TABLE calendar_sync_state ADD COLUMN last_error_code TEXT");
     if (!itemColumns.has("recurrence_json")) db.exec("ALTER TABLE items ADD COLUMN recurrence_json TEXT");
     if (!itemColumns.has("reminders_json")) db.exec("ALTER TABLE items ADD COLUMN reminders_json TEXT NOT NULL DEFAULT '[]'");
     if (!itemColumns.has("series_root_id")) db.exec("ALTER TABLE items ADD COLUMN series_root_id TEXT REFERENCES items(id) ON DELETE CASCADE");
