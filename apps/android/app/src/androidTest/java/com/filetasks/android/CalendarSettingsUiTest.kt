@@ -169,7 +169,9 @@ class CalendarSettingsUiTest {
         try {
             Intents.intending(hasData(fileUri)).respondWith(Instrumentation.ActivityResult(Activity.RESULT_OK, null))
             compose.onNodeWithText("Open").performClick()
-            Intents.intended(hasData(fileUri))
+            waitFor("the external File open intent") {
+                runCatching { Intents.intended(hasData(fileUri)) }.isSuccess
+            }
         } finally {
             Intents.release()
         }
