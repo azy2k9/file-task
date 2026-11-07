@@ -264,11 +264,14 @@ class RecurringAgendaUiTest {
     }
 
     private fun clickDeleteConfirmation() {
-        val confirmDelete = compose.onNodeWithTag("item.delete.confirm")
+        val mergedConfirm = compose.onNodeWithTag("item.delete.confirm")
+        val unmergedConfirm = compose.onNodeWithTag("item.delete.confirm", useUnmergedTree = true)
+        var mergedReady = false
         waitFor("the delete confirmation button to become enabled") {
-            runCatching { confirmDelete.assertIsEnabled() }.isSuccess
+            mergedReady = runCatching { mergedConfirm.assertIsEnabled() }.isSuccess
+            mergedReady || runCatching { unmergedConfirm.assertIsEnabled() }.isSuccess
         }
-        confirmDelete.performClick()
+        if (mergedReady) mergedConfirm.performClick() else unmergedConfirm.performClick()
     }
 
     private fun waitFor(description: String, condition: () -> Boolean) {
@@ -279,8 +282,17 @@ class RecurringAgendaUiTest {
             val snapshot = runCatching {
                 compose.onAllNodes(isRoot(), useUnmergedTree = true).printToString()
             }.getOrElse { it.toString() }
+            val dialogSnapshot = runCatching {
+                compose.onAllNodes(isDialog(), useUnmergedTree = true).printToString()
+            }.getOrElse { it.toString() }
+            val confirmSnapshot = runCatching {
+                compose.onAllNodes(hasTestTag("item.delete.confirm"), useUnmergedTree = true).printToString()
+            }.getOrElse { it.toString() }
             val ui = if (password.isNullOrEmpty()) snapshot else snapshot.replace(password, "<redacted>")
-            throw AssertionError("Failed while waiting for $description. UI: $ui", failure)
+            throw AssertionError(
+                "Failed while waiting for $description. UI: $ui\nDialogs: $dialogSnapshot\nDelete confirmation: $confirmSnapshot",
+                failure,
+            )
         }
     }
 }
