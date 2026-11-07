@@ -154,7 +154,7 @@ class CalendarSettingsUiTest {
 
         compose.onNodeWithText("Done").performClick()
         check(compose.onAllNodes(hasText("Android UI imported Apple Event")).fetchSemanticsNodes().isNotEmpty())
-        compose.onNodeWithText("Files").performClick()
+        compose.onNode(hasText("Files ·", substring = true)).performClick()
         compose.onNodeWithText("Add an external link").performClick()
         compose.onNodeWithText("Name").performTextInput("Imported Event notes")
         compose.onNodeWithText("Web link").performTextInput("https://example.com/imported-event-notes")
