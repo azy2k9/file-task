@@ -179,7 +179,7 @@ class RecurringAgendaUiTest {
         assertEquals(1, afterFollowing.count { it.title == "Android UI Event" })
         afterFollowing.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
 
-        edit(laterTaskOccurrences.first(), "Android UI Whole Task", "Whole series")
+        edit(laterTaskOccurrences.first(), "Android UI Whole Task", "Whole series", api, token)
         val afterSeries = items(api, token)
         val afterTaskSeriesEdit = afterSeries.filter { it.id in initialTaskRows.map(WorkspaceItem::id) }
         assertEquals(3, afterTaskSeriesEdit.count { it.title == "Android UI Whole Task" })
