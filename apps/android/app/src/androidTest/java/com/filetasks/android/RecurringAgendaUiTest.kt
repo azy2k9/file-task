@@ -107,23 +107,31 @@ class RecurringAgendaUiTest {
         val firstTaskOccurrence = initialTaskRows.first()
         val laterTaskOccurrences = initialTaskRows.drop(1)
         editFirstOccurrence(firstTaskOccurrence)
-        waitFor("the first Occurrence edit to be saved without changing the series") {
-            val savedRows = items(api, token).filter { it.occurrenceDate in initialTaskRows.map { row -> row.occurrenceDate } }
-            val savedFirst = savedRows.singleOrNull { it.id == firstTaskOccurrence.id }
-            val savedLater = laterTaskOccurrences.mapNotNull { original -> savedRows.singleOrNull { it.id == original.id } }
-            savedFirst?.title == "Android UI First Task Only"
-                && savedFirst.scheduledDate == LocalDate.parse(requireNotNull(firstTaskOccurrence.scheduledDate)).plusDays(10).toString()
-                && savedFirst.scheduledTime == "14:30"
-                && savedFirst.recurrence == null
-                && savedFirst.reminders.firstOrNull()?.let { it.amount == 2 && it.unit == "hours" && it.time == "11:00" } == true
-                && savedLater.size == laterTaskOccurrences.size
-                && savedLater.zip(laterTaskOccurrences).all { (saved, original) ->
-                    saved.title == original.title
-                        && saved.scheduledDate == original.scheduledDate
-                        && saved.scheduledTime == original.scheduledTime
-                        && saved.recurrence == original.recurrence
-                        && saved.reminders == original.reminders
+        var observedRows = emptyList<WorkspaceItem>()
+        try {
+            waitFor("the first Occurrence edit to be saved without changing the series") {
+                observedRows = items(api, token).filter { it.id in initialTaskRows.map(WorkspaceItem::id) || it.title == "Android UI First Task Only" }
+                val savedRows = observedRows.filter { it.occurrenceDate in initialTaskRows.map { row -> row.occurrenceDate } }
+                val savedFirst = savedRows.singleOrNull { it.id == firstTaskOccurrence.id }
+                val savedLater = laterTaskOccurrences.mapNotNull { original -> savedRows.singleOrNull { it.id == original.id } }
+                savedFirst?.title == "Android UI First Task Only"
+                    && savedFirst.scheduledDate == LocalDate.parse(requireNotNull(firstTaskOccurrence.scheduledDate)).plusDays(10).toString()
+                    && savedFirst.scheduledTime == "14:30"
+                    && savedFirst.recurrence == null
+                    && savedFirst.reminders.firstOrNull()?.let { it.amount == 2 && it.unit == "hours" && it.time == "11:00" } == true
+                    && savedLater.size == laterTaskOccurrences.size
+                    && savedLater.zip(laterTaskOccurrences).all { (saved, original) ->
+                        saved.title == original.title
+                            && saved.scheduledDate == original.scheduledDate
+                            && saved.scheduledTime == original.scheduledTime
+                            && saved.recurrence == original.recurrence
+                            && saved.reminders == original.reminders
+                    }
                 }
+        } catch (failure: AssertionError) {
+            val values = observedRows.joinToString { "${it.id}:series=${it.seriesId},occurrence=${it.occurrenceDate},title=${it.title},date=${it.scheduledDate},time=${it.scheduledTime},rule=${it.recurrence},reminders=${it.reminders}" }
+            val expectedLater = laterTaskOccurrences.joinToString { "${it.id}:occurrence=${it.occurrenceDate},title=${it.title},date=${it.scheduledDate},time=${it.scheduledTime},rule=${it.recurrence},reminders=${it.reminders}" }
+            throw AssertionError("First Occurrence API rows after edit; expected id ${firstTaskOccurrence.id}; expected later=$expectedLater; actual=$values", failure)
         }
         val afterFirstOccurrenceEdit = items(api, token).filter { it.occurrenceDate in initialTaskRows.map { row -> row.occurrenceDate } }
         assertEquals(firstTaskOccurrence.occurrenceDate, afterFirstOccurrenceEdit.single { it.id == firstTaskOccurrence.id }.occurrenceDate)
@@ -162,13 +170,13 @@ class RecurringAgendaUiTest {
             items(api, token).none { it.id == personalTask.id || it.id == personalEvent.id }
         }
 
-        edit(event[1], "Android UI Following", "This and following Occurrences")
+        edit(event[1], "Android UI Following", "This and following Occurrences", api, token)
         val afterFollowing = items(api, token)
         assertEquals(2, afterFollowing.count { it.title == "Android UI Following" })
         assertEquals(1, afterFollowing.count { it.title == "Android UI Event" })
         afterFollowing.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
 
-        edit(task[0], "Android UI Whole Task", "Whole series")
+        edit(task[0], "Android UI Whole Task", "Whole series", api, token)
         val afterSeries = items(api, token)
         assertEquals(3, afterSeries.count { it.title == "Android UI Whole Task" })
         assertTrue(afterSeries.any { it.title == "Android UI Event" })
@@ -241,12 +249,21 @@ class RecurringAgendaUiTest {
         waitFor("the create editor to close") { compose.onAllNodes(hasText("Add to your workspace")).fetchSemanticsNodes().isEmpty() }
     }
 
-    private fun edit(item: WorkspaceItem, title: String, scope: String) {
+    private fun edit(item: WorkspaceItem, title: String, scope: String, api: ApiClient, token: String) {
+        waitFor("any previous editor to close") { compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty() }
         compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
         compose.onNodeWithTag("agenda.edit.${item.id}").performClick()
+        waitFor("the requested item editor to open") { compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("Title").performTextClearance()
         compose.onNodeWithText("Title").performTextInput(title)
-        compose.onNodeWithText(scope).performScrollTo().performClick()
+        try {
+            compose.onNodeWithText(scope).performScrollTo().performClick()
+        } catch (failure: AssertionError) {
+            val serverItem = items(api, token).singleOrNull { it.id == item.id }
+            val roots = compose.onAllNodes(isRoot(), useUnmergedTree = true)
+            val ui = (0 until roots.fetchSemanticsNodes().size).joinToString("\n") { roots.get(it).printToString() }
+            throw AssertionError("Could not select edit scope '$scope' for item ${item.id}; passed seriesId=${item.seriesId}; server=$serverItem; cause=${failure.message}; UI=$ui", failure)
+        }
         compose.onNodeWithText("Save").performClick()
         waitFor("the edit editor to close") { compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty() }
     }
@@ -273,7 +290,7 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("Offset").performTextInput("2")
         compose.onNodeWithText("Clock time").performTextClearance()
         compose.onNodeWithText("Clock time").performTextInput("11:00")
-        compose.onNodeWithText("hours").performScrollTo().performClick()
+        compose.onNodeWithText("ho").performScrollTo().performClick()
 
         compose.onNodeWithText("This Occurrence").performScrollTo().performClick()
         compose.onNodeWithText("Save").performClick()
