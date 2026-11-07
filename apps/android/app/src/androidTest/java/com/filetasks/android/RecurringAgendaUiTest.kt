@@ -65,6 +65,9 @@ class RecurringAgendaUiTest {
         assertAgendaItem(undatedEvent.id, undatedEvent.title)
         assertAgendaItem(eventToDelete.id, eventToDelete.title)
 
+        clearEventDate(undatedEvent, api, token)
+        deleteEvent(eventToDelete, api, token)
+
         createSimpleItem("Android UI personal Task", isEvent = false, details = "Initial Task details", api = api, token = token)
         var personalTask = items(api, token).single { it.title == "Android UI personal Task" }
         assertEquals(ItemKind.Task, personalTask.kind)
@@ -182,8 +185,6 @@ class RecurringAgendaUiTest {
             items(api, token).none { it.id == personalTask.id || it.id == personalEvent.id }
         }
 
-        clearEventDate(undatedEvent, api, token)
-        deleteEvent(eventToDelete, api, token)
     }
 
     private fun items(api: ApiClient, token: String): List<WorkspaceItem> = runBlocking { api.listItems(token) }
