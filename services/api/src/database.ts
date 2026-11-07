@@ -32,6 +32,18 @@ export function database() {
         CHECK((kind = 'task' AND completed IS NOT NULL) OR (kind = 'event' AND completed IS NULL))
       );
       CREATE UNIQUE INDEX IF NOT EXISTS items_user_id_id ON items(user_id,id);
+      CREATE TABLE IF NOT EXISTS item_series_definitions (
+        user_id TEXT NOT NULL,
+        series_root_id TEXT NOT NULL,
+        scheduled_date TEXT NOT NULL,
+        scheduled_time TEXT,
+        title TEXT NOT NULL,
+        details TEXT NOT NULL,
+        recurrence_json TEXT NOT NULL,
+        reminders_json TEXT NOT NULL DEFAULT '[]',
+        PRIMARY KEY(user_id,series_root_id),
+        FOREIGN KEY(user_id,series_root_id) REFERENCES items(user_id,id) ON DELETE CASCADE
+      );
       CREATE TABLE IF NOT EXISTS calendar_destination_limitations (
         user_id TEXT NOT NULL,
         item_id TEXT NOT NULL,
@@ -230,7 +242,13 @@ export function database() {
     if (!itemColumns.has("series_root_id")) db.exec("ALTER TABLE items ADD COLUMN series_root_id TEXT REFERENCES items(id) ON DELETE CASCADE");
     if (!itemColumns.has("occurrence_date")) db.exec("ALTER TABLE items ADD COLUMN occurrence_date TEXT");
     if (!itemColumns.has("uses_reminder_default")) db.exec("ALTER TABLE items ADD COLUMN uses_reminder_default INTEGER NOT NULL DEFAULT 1");
+    if (!itemColumns.has("occurrence_recurrence_json")) db.exec("ALTER TABLE items ADD COLUMN occurrence_recurrence_json TEXT");
     db.exec("CREATE INDEX IF NOT EXISTS items_series ON items(series_root_id, occurrence_date)");
+    // The root row is also the first Occurrence. Capture its original generation
+    // template before occurrence-local edits can change the root row.
+    db.exec(`INSERT OR IGNORE INTO item_series_definitions(user_id,series_root_id,scheduled_date,scheduled_time,title,details,recurrence_json,reminders_json)
+      SELECT user_id,id,scheduled_date,scheduled_time,title,details,recurrence_json,reminders_json FROM items
+      WHERE series_root_id=id AND recurrence_json IS NOT NULL AND scheduled_date IS NOT NULL`);
     const connectionColumns = new Set(db.prepare("PRAGMA table_info(calendar_connections)").all().map((column) => String(column.name)));
     if (!connectionColumns.has("expires_at")) db.exec("ALTER TABLE calendar_connections ADD COLUMN expires_at INTEGER");
     if (!connectionColumns.has("legacy_identity_eligible")) db.exec("ALTER TABLE calendar_connections ADD COLUMN legacy_identity_eligible INTEGER NOT NULL DEFAULT 0 CHECK(legacy_identity_eligible IN (0,1))");

@@ -16,6 +16,7 @@
     "test": "npm run test --workspace=@filetasks/web",
     "test:acceptance": "FILETASKS_RUN_NATIVE_ACCEPTANCE=1 npm test",
     "test:ios-ui": "node scripts/test-ios-ui.mjs",
+    "test:shared-acceptance": "node scripts/test-ios-ui.mjs --shared",
     "test:android-ui": "node scripts/test-android-ui.mjs"
   }
 }
