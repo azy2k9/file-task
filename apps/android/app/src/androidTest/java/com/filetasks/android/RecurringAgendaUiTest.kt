@@ -276,8 +276,7 @@ class RecurringAgendaUiTest {
             compose.onNodeWithText("Remove Reminder").performScrollTo().performClick()
         }
         compose.onNodeWithText("Add Reminder").performScrollTo().performClick()
-        compose.onNodeWithText("Offset").performScrollTo().performTextClearance()
-        compose.onNodeWithText("Offset").performTextInput("2")
+        compose.onNodeWithText("Offset").performScrollTo().performTextReplacement("2")
         compose.onNodeWithText("Clock time").performTextClearance()
         compose.onNodeWithText("Clock time").performTextInput("11:00")
         compose.onNodeWithText("ho").performScrollTo().performClick()
