@@ -4103,7 +4103,10 @@ test("Android UI acceptance: recurring agenda and connected calendar workflows w
   const response = await request("/api/items", { token: owner.token });
   assert.equal(response.status, 200);
   const { items } = await response.json();
-  assert.equal(items.filter(({ title }) => title === "Android UI Whole Task").length, 3);
+  const wholeTaskRows = items.filter(({ title }) => title === "Android UI Whole Task");
+  assert.equal(wholeTaskRows.length, 3, JSON.stringify(wholeTaskRows.map(({ id, seriesId, occurrenceDate, scheduledDate }) => ({
+    id, seriesId, occurrenceDate, scheduledDate,
+  }))));
   assert.equal(items.filter(({ title }) => title === "Android UI Following").length, 2);
   assert.equal(items.filter(({ title }) => title === "Android UI Event").length, 1);
   const clearedEvent = (await (await request(`/api/items/${undatedEvent.id}`, { token: owner.token })).json()).item;
