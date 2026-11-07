@@ -173,6 +173,7 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("Save").performClick()
         waitFor("the simple item editor to close after editing") {
             compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty()
+                && compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
         }
     }
 
