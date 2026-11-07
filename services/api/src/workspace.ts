@@ -695,7 +695,8 @@ function saveItemInTransaction(userId: string, body: Record<string, unknown>, id
     if (scope === "series" || (scope === "following" && id === series)) {
       if (!preservesOccurrenceIdentity) for (const target of targets) db.prepare("UPDATE items SET occurrence_recurrence_json=NULL WHERE user_id=? AND id=?").run(userId,target.id);
       saveSeriesDefinition(userId,series,preservesOccurrenceIdentity
-        ? {...item,scheduledDate:String(definition?.scheduled_date ?? root?.scheduled_date ?? item.scheduledDate),scheduledTime:definition?.scheduled_time == null ? (root?.scheduled_time == null ? null : String(root.scheduled_time)) : String(definition.scheduled_time)}
+        ? {...item,scheduledDate:String(definition?.scheduled_date ?? root?.scheduled_date ?? item.scheduledDate),
+          scheduledTime:definition ? definition.scheduled_time == null ? null : String(definition.scheduled_time) : root?.scheduled_time == null ? null : String(root.scheduled_time)}
         : item);
     }
     if (item.recurrence) ensureOccurrences(userId);

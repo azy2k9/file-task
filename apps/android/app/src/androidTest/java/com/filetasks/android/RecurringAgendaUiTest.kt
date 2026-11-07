@@ -18,6 +18,7 @@ import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.test.printToString
 import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -185,6 +186,21 @@ class RecurringAgendaUiTest {
             items(api, token).none { it.id == personalTask.id || it.id == personalEvent.id }
         }
 
+        edit(event[1], "Android UI Following", "This and following Occurrences")
+        val afterFollowing = items(api, token)
+        assertEquals(2, afterFollowing.count { it.title == "Android UI Following" })
+        assertEquals(1, afterFollowing.count { it.title == "Android UI Event" })
+        afterFollowing.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
+
+        edit(laterTaskOccurrences.first(), "Android UI Whole Task", "Whole series")
+        val afterSeries = items(api, token)
+        val afterTaskSeriesEdit = afterSeries.filter { it.id in initialTaskRows.map(WorkspaceItem::id) }
+        assertEquals(3, afterTaskSeriesEdit.count { it.title == "Android UI Whole Task" })
+        assertEquals(2, afterSeries.count { it.title == "Android UI Following" })
+        afterSeries.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
+
+        clearEventDate(undatedEvent, api, token)
+        deleteEvent(eventToDelete, api, token)
     }
 
     private fun items(api: ApiClient, token: String): List<WorkspaceItem> = runBlocking { api.listItems(token) }
@@ -298,8 +314,7 @@ class RecurringAgendaUiTest {
             compose.onNodeWithText("Remove Reminder").performScrollTo().performClick()
         }
         compose.onNodeWithText("Add Reminder").performScrollTo().performClick()
-        compose.onNodeWithText("Offset").performScrollTo().performTextClearance()
-        compose.onNodeWithText("Offset").performTextInput("2")
+        compose.onNodeWithText("Offset").performScrollTo().performTextReplacement("2")
         compose.onNodeWithText("Clock time").performTextClearance()
         compose.onNodeWithText("Clock time").performTextInput("11:00")
         compose.onNodeWithText("ho").performScrollTo().performClick()
