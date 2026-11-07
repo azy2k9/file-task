@@ -177,8 +177,9 @@ class RecurringAgendaUiTest {
     }
 
     private fun deleteItem(item: WorkspaceItem) {
-        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.delete.${item.id}"))
-        val deleteButton = compose.onNodeWithTag("agenda.delete.${item.id}")
+        val itemTag = "agenda.item.${item.id}"
+        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag(itemTag))
+        val deleteButton = compose.onNode(hasText("Delete") and hasAnyAncestor(hasTestTag(itemTag)))
         waitFor("the delete action to finish enabling") {
             runCatching {
                 deleteButton.assertIsDisplayed()
@@ -187,14 +188,14 @@ class RecurringAgendaUiTest {
         }
         deleteButton.performClick()
         waitFor("the delete confirmation dialog to appear") {
-            compose.onAllNodes(hasTestTag("item.delete.title")).fetchSemanticsNodes().isNotEmpty()
+            compose.onAllNodes(isDialog()).fetchSemanticsNodes().isNotEmpty()
         }
-        val confirmDelete = compose.onNodeWithTag("item.delete.confirm")
+        val confirmDelete = compose.onNode(hasText("Delete") and hasAnyAncestor(isDialog()))
         confirmDelete.assertIsDisplayed()
         confirmDelete.performClick()
         waitFor("the deleted item and confirmation dialog to leave the agenda") {
-            compose.onAllNodes(hasTestTag("agenda.item.${item.id}")).fetchSemanticsNodes().isEmpty()
-                && compose.onAllNodes(hasTestTag("item.delete.title")).fetchSemanticsNodes().isEmpty()
+            compose.onAllNodes(hasTestTag(itemTag)).fetchSemanticsNodes().isEmpty()
+                && compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
         }
     }
 
