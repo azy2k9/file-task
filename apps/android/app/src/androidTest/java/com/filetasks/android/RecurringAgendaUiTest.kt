@@ -149,19 +149,6 @@ class RecurringAgendaUiTest {
         assertEquals("The UI-created Event must have three Occurrences", 3, event.size)
         event.forEach { assertAgendaItem(it.id, it.title) }
 
-        edit(event[1], "Android UI Following", "This and following Occurrences", api, token)
-        val afterFollowing = items(api, token)
-        assertEquals(2, afterFollowing.count { it.title == "Android UI Following" })
-        assertEquals(1, afterFollowing.count { it.title == "Android UI Event" })
-        afterFollowing.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
-
-        edit(task[0], "Android UI Whole Task", "Whole series", api, token)
-        val afterSeries = items(api, token)
-        assertEquals(3, afterSeries.count { it.title == "Android UI Whole Task" })
-        assertTrue(afterSeries.any { it.title == "Android UI Event" })
-        assertEquals(2, afterSeries.count { it.title == "Android UI Following" })
-        afterSeries.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
-
         createSimpleItem("Android UI personal Event", isEvent = true, details = "An undated Event", api = api, token = token)
         var personalEvent = items(api, token).single { it.title == "Android UI personal Event" }
         assertEquals(ItemKind.Event, personalEvent.kind)
@@ -186,7 +173,7 @@ class RecurringAgendaUiTest {
             items(api, token).none { it.id == personalTask.id || it.id == personalEvent.id }
         }
 
-        edit(event[1], "Android UI Following", "This and following Occurrences")
+        edit(event[1], "Android UI Following", "This and following Occurrences", api, token)
         val afterFollowing = items(api, token)
         assertEquals(2, afterFollowing.count { it.title == "Android UI Following" })
         assertEquals(1, afterFollowing.count { it.title == "Android UI Event" })

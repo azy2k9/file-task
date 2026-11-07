@@ -6667,6 +6667,8 @@ test("Apple embedded VTIMEZONE conflicting with IANA rules blocks Calendar copie
 
 for (const order of ["apple-first", "google-first"]) {
   test(`Apple-origin copies recover together in one sync (${order})`, async () => {
+    const appleCopiesForItem = (title) => [...appleEvents.values()].filter((ics) => ics.includes(`SUMMARY:${title}`));
+    const googleCopiesForItem = (title) => [...googleEvents.values()].filter((event) => event.summary === title);
     const owner = await account();
     const connectApple = () => request("/api/calendars", {token: owner.token, method: "POST", body: {username: "person@example.com", password: "app-specific-password", calendarUrl: `${deliveryBase}/apple/calendar/`}});
     const connectGoogle = async () => {
