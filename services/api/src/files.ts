@@ -105,6 +105,15 @@ export function listFiles(userId: string): WorkspaceFile[] {
     const id=String(row.file_id);
     byFile.set(id,[...(byFile.get(id)??[]),{ itemId:String(row.item_id),itemKind:row.kind as "task"|"event",itemTitle:String(row.title),scope:"following" }]);
   }
+  const localOccurrences = database().prepare(`SELECT a.file_id,i.id AS item_id,i.kind,i.title FROM occurrence_attachments a
+    JOIN files f ON f.id=a.file_id JOIN items i ON i.id=a.item_id
+    WHERE f.user_id=? AND i.user_id=? AND f.status='ready'`).all(userId,userId);
+  for (const row of localOccurrences) {
+    const id=String(row.file_id), itemId=String(row.item_id);
+    const existing=byFile.get(id)??[];
+    if (existing.some((attachment)=>attachment.itemId===itemId)) continue;
+    byFile.set(id,[...existing,{itemId,itemKind:row.kind as "task"|"event",itemTitle:String(row.title),scope:"occurrence"}]);
+  }
   return files.map((file) => publicFile({ ...file, attachments: byFile.get(file.id) ?? [] }));
 }
 
@@ -194,15 +203,16 @@ export function attachFile(userId: string, fileId: string, itemId: unknown, scop
   }
   inTransaction(() => {
     const db = database();
-    // The first Occurrence shares its id with the series root. Keep the series
-    // Attachment row when adding the same File locally there; clearing its
-    // local exclusion is enough to make the inherited File effective again.
-    db.prepare(`INSERT INTO attachments(file_id,item_id,created_at,scope) VALUES(?,?,?,?)
-      ON CONFLICT(file_id,item_id) DO UPDATE SET
-        scope=CASE WHEN attachments.scope='series' AND excluded.scope='occurrence' THEN 'series' ELSE excluded.scope END`)
-      .run(fileId, targetId, new Date().toISOString(), scope);
     if (scope === "occurrence") {
+      // Keep local Occurrence associations separate from series rows. The
+      // first Occurrence shares its item id with the series root, so the
+      // composite key on attachments cannot represent both scopes there.
+      db.prepare("INSERT OR IGNORE INTO occurrence_attachments(file_id,item_id,created_at) VALUES(?,?,?)")
+        .run(fileId,itemId,new Date().toISOString());
       db.prepare("DELETE FROM attachment_exclusions WHERE file_id=? AND item_id=? AND scope='occurrence'").run(fileId,itemId);
+    } else {
+      db.prepare("INSERT INTO attachments(file_id,item_id,created_at,scope) VALUES(?,?,?,?) ON CONFLICT(file_id,item_id) DO UPDATE SET scope='series'")
+        .run(fileId, targetId, new Date().toISOString(), scope);
     }
   });
 }
@@ -217,38 +227,56 @@ export function removeAttachment(userId: string, fileId: string, itemId: string,
     const inherited=database().prepare("SELECT 1 FROM attachments WHERE file_id=? AND item_id=? AND scope='series'").get(fileId,rootId);
     const inheritedFollowing=database().prepare(`SELECT 1 FROM following_attachments a JOIN items anchor ON anchor.id=a.item_id
       WHERE a.file_id=? AND anchor.series_root_id=? AND anchor.occurrence_date<=? LIMIT 1`).get(fileId,rootId,selected.occurrence_date);
-    const removed=database().prepare("DELETE FROM following_attachments WHERE file_id=? AND item_id=?").run(fileId,itemId);
+    const db=database();
+    const removed=db.prepare("DELETE FROM following_attachments WHERE file_id=? AND item_id=?").run(fileId,itemId);
     if (!removed.changes && !inherited && !inheritedFollowing) throw new HttpError(404,"This Attachment could not be found.");
-    if (inherited || inheritedFollowing) database().prepare("INSERT OR IGNORE INTO attachment_exclusions(file_id,item_id,scope) VALUES(?,?,'following')").run(fileId,itemId);
+    inTransaction(() => {
+      // Removing a following range also removes local Occurrence restorations
+      // within it; otherwise those explicit rows would bypass this exclusion.
+      db.prepare(`DELETE FROM occurrence_attachments WHERE file_id=? AND item_id IN (
+        SELECT id FROM items WHERE user_id=? AND series_root_id=? AND occurrence_date>=?)`)
+        .run(fileId,userId,rootId,selected.occurrence_date);
+      if (inherited || inheritedFollowing) db.prepare("INSERT OR IGNORE INTO attachment_exclusions(file_id,item_id,scope) VALUES(?,?,'following')").run(fileId,itemId);
+    });
     return;
   }
   if (scope === "series") {
     const rootId=String(selected.series_root_id ?? itemId);
     const db=database();
     const exists=db.prepare(`SELECT 1 FROM attachments WHERE file_id=? AND item_id=? AND scope='series'
-      UNION SELECT 1 FROM following_attachments a JOIN items i ON i.id=a.item_id WHERE a.file_id=? AND i.series_root_id=? LIMIT 1`).get(fileId,rootId,fileId,rootId);
+      UNION SELECT 1 FROM following_attachments a JOIN items i ON i.id=a.item_id WHERE a.file_id=? AND i.series_root_id=?
+      UNION SELECT 1 FROM occurrence_attachments a JOIN items i ON i.id=a.item_id WHERE a.file_id=? AND (i.id=? OR i.series_root_id=?) LIMIT 1`)
+      .get(fileId,rootId,fileId,rootId,fileId,rootId,rootId);
     if (!exists) throw new HttpError(404,"This Attachment could not be found.");
     inTransaction(() => {
       db.prepare("DELETE FROM attachments WHERE file_id=? AND item_id IN (SELECT id FROM items WHERE id=? OR series_root_id=?)").run(fileId,rootId,rootId);
       db.prepare("DELETE FROM following_attachments WHERE file_id=? AND item_id IN (SELECT id FROM items WHERE id=? OR series_root_id=?)").run(fileId,rootId,rootId);
+      db.prepare("DELETE FROM occurrence_attachments WHERE file_id=? AND item_id IN (SELECT id FROM items WHERE id=? OR series_root_id=?)").run(fileId,rootId,rootId);
       db.prepare("DELETE FROM attachment_exclusions WHERE file_id=? AND item_id IN (SELECT id FROM items WHERE id=? OR series_root_id=?)").run(fileId,rootId,rootId);
     });
     return;
   }
-  const targetId = itemId;
-  const result = database().prepare(`DELETE FROM attachments WHERE file_id=? AND item_id=? AND scope=?
-    AND EXISTS (SELECT 1 FROM files WHERE id=? AND user_id=?)
-    AND EXISTS (SELECT 1 FROM items WHERE id=? AND user_id=?)`)
-    .run(fileId, targetId, scope, fileId, userId, targetId, userId);
-  if (!result.changes && scope === "occurrence") {
+  if (scope === "occurrence") {
+    const db=database();
+    const local=db.prepare("DELETE FROM occurrence_attachments WHERE file_id=? AND item_id=? AND EXISTS (SELECT 1 FROM files WHERE id=? AND user_id=?) AND EXISTS (SELECT 1 FROM items WHERE id=? AND user_id=?)")
+      .run(fileId,itemId,fileId,userId,itemId,userId);
+    // Clean up legacy occurrence rows created before local overrides had a
+    // separate table. Never delete a series row that happens to share the id.
+    const legacy=db.prepare("DELETE FROM attachments WHERE file_id=? AND item_id=? AND scope='occurrence' AND EXISTS (SELECT 1 FROM files WHERE id=? AND user_id=?)")
+      .run(fileId,itemId,fileId,userId);
     const inherited = database().prepare(`SELECT 1 FROM attachments WHERE file_id=? AND item_id=? AND scope='series'
       UNION SELECT 1 FROM following_attachments a JOIN items anchor ON anchor.id=a.item_id
       WHERE a.file_id=? AND anchor.series_root_id=? AND anchor.occurrence_date<=? LIMIT 1`)
       .get(fileId,String(selected.series_root_id ?? itemId),fileId,String(selected.series_root_id ?? itemId),selected.occurrence_date);
-    if (!inherited) throw new HttpError(404,"This Attachment could not be found.");
-    database().prepare("INSERT OR IGNORE INTO attachment_exclusions(file_id,item_id,scope) VALUES(?,?,'occurrence')").run(fileId,itemId);
+    if (!local.changes && !legacy.changes && !inherited) throw new HttpError(404,"This Attachment could not be found.");
+    if (inherited && (local.changes || legacy.changes || inherited))
+      db.prepare("INSERT OR IGNORE INTO attachment_exclusions(file_id,item_id,scope) VALUES(?,?,'occurrence')").run(fileId,itemId);
     return;
   }
+  const targetId = String(selected.series_root_id ?? itemId);
+  const result = database().prepare(`DELETE FROM attachments WHERE file_id=? AND item_id=? AND scope='series'
+    AND EXISTS (SELECT 1 FROM files WHERE id=? AND user_id=?) AND EXISTS (SELECT 1 FROM items WHERE id=? AND user_id=?)`)
+    .run(fileId, targetId, fileId, userId, targetId, userId);
   if (!result.changes) throw new HttpError(404, "This Attachment could not be found.");
 }
 

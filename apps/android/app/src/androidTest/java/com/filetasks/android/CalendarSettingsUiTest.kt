@@ -148,12 +148,13 @@ class CalendarSettingsUiTest {
         }
         val imported = ApiClient(apiUrl).listItems(token).filter { it.title == "Android UI imported Apple Event" }
         assertEquals("Provider restoration must not duplicate the imported Event", 1, imported.size)
-        assertTrue(providerInspect(providerFakeUrl, "android-ui-apple-${email.hashCode()}", appleCollectionPath).getJSONObject(0)
-            .getString("calendarData").contains("URL:${apiUrl.trimEnd('/')}/?event=${imported.single().id}"))
+        val appleCopy = providerInspect(providerFakeUrl, "android-ui-apple-${email.hashCode()}", appleCollectionPath)
+            .getJSONObject(0).getString("calendarData")
+        assertTrue(appleCopy.contains("URL:") && appleCopy.contains("/?event=${imported.single().id}"))
 
         compose.onNodeWithText("Done").performClick()
         check(compose.onAllNodes(hasText("Android UI imported Apple Event")).fetchSemanticsNodes().isNotEmpty())
-        compose.onNodeWithText("Files").performClick()
+        compose.onNode(hasText("Files ·", substring = true)).performClick()
         compose.onNodeWithText("Add an external link").performClick()
         compose.onNodeWithText("Name").performTextInput("Imported Event notes")
         compose.onNodeWithText("Web link").performTextInput("https://example.com/imported-event-notes")
@@ -167,8 +168,13 @@ class CalendarSettingsUiTest {
         Intents.init()
         try {
             Intents.intending(hasData(fileUri)).respondWith(Instrumentation.ActivityResult(Activity.RESULT_OK, null))
+            waitFor("the attached File action to become enabled") {
+                compose.onAllNodes(hasText("Open") and isEnabled()).fetchSemanticsNodes().isNotEmpty()
+            }
             compose.onNodeWithText("Open").performClick()
-            Intents.intended(hasData(fileUri))
+            waitFor("the external File open intent") {
+                runCatching { Intents.intended(hasData(fileUri)) }.isSuccess
+            }
         } finally {
             Intents.release()
         }

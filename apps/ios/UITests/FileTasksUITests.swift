@@ -99,7 +99,7 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
             newTitle: "UI Runner Following Task",
             scope: "This and following Occurrences"
         )
-        assertOccurrenceRows(title: "UI Runner Recurring Task", atLeast: 1)
+        assertOccurrenceRows(title: "UI Runner Recurring Task", exactly: 1)
         assertOccurrenceRows(title: "UI Runner Following Task", atLeast: 2)
         editOccurrence(
             title: "UI Runner Following Task",
@@ -107,7 +107,8 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
             newTitle: "UI Runner Whole Series Task",
             scope: "Whole series"
         )
-        assertOccurrenceRows(title: "UI Runner Recurring Task", atLeast: 1)
+        assertOccurrenceRows(title: "UI Runner Recurring Task", exactly: 1)
+        assertOccurrenceRows(title: "UI Runner Following Task", exactly: 0)
         assertOccurrenceRows(title: "UI Runner Whole Series Task", atLeast: 2)
 
         let localRootTitle = "UI Runner Local Root Task"
@@ -396,9 +397,9 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
                        "A first-Occurrence edit should retain all existing public Occurrences.")
         let updatedRoot = try XCTUnwrap(updatedRows.first { $0["id"] as? String == originalRootID })
         XCTAssertEqual(updatedRoot["title"] as? String, newTitle)
-        XCTAssertNil(updatedRoot["scheduledDate"], "The UI's local schedule edit should clear only the first Occurrence date.")
-        XCTAssertNil(updatedRoot["scheduledTime"], "Clearing the first Occurrence date should clear its local time.")
-        XCTAssertNil(updatedRoot["recurrence"], "The first Occurrence's local recurrence choice should be off.")
+        XCTAssertTrue(updatedRoot["scheduledDate"] is NSNull, "The UI's local schedule edit should clear only the first Occurrence date.")
+        XCTAssertTrue(updatedRoot["scheduledTime"] is NSNull, "Clearing the first Occurrence date should clear its local time.")
+        XCTAssertTrue(updatedRoot["recurrence"] is NSNull, "The first Occurrence's local recurrence choice should be off.")
         XCTAssertEqual(updatedRoot["occurrenceDate"] as? String, originalRoot["occurrenceDate"] as? String,
                        "The first Occurrence should retain its immutable original identity.")
 
@@ -863,6 +864,12 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         }
         XCTAssertGreaterThanOrEqual(rows.count, count,
                                     "The real iOS agenda should show at least \(count) server-generated Occurrences titled \(title). Accessibility hierarchy: \(app.debugDescription)")
+    }
+
+    private func assertOccurrenceRows(title: String, exactly count: Int) {
+        let rows = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", title))
+        XCTAssertEqual(rows.count, count,
+                       "The refreshed agenda should show exactly \(count) rows titled \(title), with no stale rows. Accessibility hierarchy: \(app.debugDescription)")
     }
 
     private func assertCalendarDeliveryNotice() {
