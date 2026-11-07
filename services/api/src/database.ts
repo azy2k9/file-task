@@ -286,6 +286,12 @@ export function database() {
         created_at TEXT NOT NULL,
         PRIMARY KEY(file_id,item_id)
       );
+      CREATE TABLE IF NOT EXISTS occurrence_attachments (
+        file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(file_id,item_id)
+      );
       CREATE TABLE IF NOT EXISTS attachment_exclusions (
         file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
         item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
