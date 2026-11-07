@@ -75,6 +75,32 @@ final class FileTasksAcceptanceTests: XCTestCase {
         XCTAssertEqual((downloadResponse as? HTTPURLResponse)?.statusCode, 200)
         XCTAssertEqual(downloadedBytes, bytes)
 
+        let rememberedEvent = try await client.createItem(ItemPayload(
+            kind: .event, title: "Undated native Event \(namespace)", details: "Keep its File",
+            scheduledDate: "2026-11-04", scheduledTime: nil, recurrence: nil,
+            reminders: [], scope: nil
+        ), token: token)
+        try await client.attachFile(id: file.id, to: rememberedEvent.id, scope: .occurrence, token: token)
+        let undatedEvent = try await client.updateItem(
+            id: rememberedEvent.id,
+            payload: ItemPayload(
+                kind: .event, title: rememberedEvent.title, details: rememberedEvent.details,
+                scheduledDate: nil, scheduledTime: nil, recurrence: nil,
+                reminders: rememberedEvent.reminders, scope: nil
+            ),
+            token: token
+        )
+        XCTAssertNil(undatedEvent.scheduledDate)
+        XCTAssertNil(undatedEvent.scheduledTime)
+        XCTAssertTrue(undatedEvent.files.contains(where: { $0.id == file.id }))
+        let sharedUndatedEvent = try await APIClient(baseURL: baseURL).items(token: token)
+            .first(where: { $0.id == rememberedEvent.id })
+        XCTAssertNil(sharedUndatedEvent?.scheduledDate)
+        XCTAssertTrue(sharedUndatedEvent?.files.contains(where: { $0.id == file.id }) ?? false)
+        try await client.deleteItem(id: rememberedEvent.id, token: token)
+        let afterDelete = try await client.items(token: token)
+        XCTAssertFalse(afterDelete.contains(where: { $0.id == rememberedEvent.id }))
+
         let dueTask = try await client.createItem(ItemPayload(
             kind: .task, title: "Native due push \(namespace)", details: "Delivery boundary check",
             scheduledDate: "2026-10-12", scheduledTime: nil, recurrence: nil,
