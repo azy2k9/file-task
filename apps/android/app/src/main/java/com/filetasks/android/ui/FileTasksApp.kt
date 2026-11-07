@@ -85,7 +85,6 @@ import com.filetasks.android.data.WorkspaceFileSummary
 import com.filetasks.android.data.WorkspaceItem
 import com.filetasks.android.data.refreshSavedAgenda
 import com.filetasks.android.PushMessagingService
-import com.google.firebase.installations.FirebaseInstallations
 import com.google.firebase.messaging.FirebaseMessaging
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -403,7 +402,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
             if (currentUserId != null) {
                 preferences.edit()
                     .remove(PushMessagingService.pushDeviceKey(currentUserId))
-                    .remove(PushMessagingService.pushFidKey(currentUserId))
+                    .remove(PushMessagingService.pushTokenKey(currentUserId))
                     .putBoolean("push_enabled", false)
                     .putBoolean("push_device_revoked", true)
                     .apply()
@@ -798,7 +797,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
         }
 
         fileToAttach?.let { file ->
-            val availableItems = workspaceItems.filter { item -> file.attachments.none { it.itemId == item.id } }
+            val availableItems = workspaceItems.filter { item -> item.files.none { it.id == file.id } }
             AlertDialog(
                 onDismissRequest = { if (!working) fileToAttach = null },
                 title = { Text("Attach ${file.name}") },
@@ -824,30 +823,26 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
         }
 
         confirmRemoveAttachment?.let { (file, attachment) ->
+            val attachmentItem = items.firstOrNull { it.id == attachment.itemId }
+            val isRecurringAttachment = attachmentItem?.seriesId != null || attachmentItem?.recurrence != null
             AlertDialog(
                 onDismissRequest = { if (!working) confirmRemoveAttachment = null },
                 title = { Text("Remove this Attachment?") },
                 text = {
                     Column {
                         Text("Remove ${file.name} from ${attachment.itemKind.displayName} “${attachment.itemTitle}” only, or delete the File from your Files section.")
-                        if (attachment.scope == "series" || attachment.scope == "following") {
-                            listOf("occurrence" to "This Occurrence", "following" to "This and following Occurrences").forEach { (scope, label) ->
+                        if (isRecurringAttachment || attachment.scope == "series" || attachment.scope == "following") {
+                            listOf("occurrence" to "This Occurrence", "following" to "This and following Occurrences", "series" to "Whole series").forEach { (scope, label) ->
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     RadioButton(selected = attachmentRemovalScope == scope, onClick = { attachmentRemovalScope = scope }, enabled = !working)
                                     Text(label, modifier = Modifier.clickable(enabled = !working) { attachmentRemovalScope = scope })
-                                }
-                            }
-                            if (attachment.scope == "series") {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    RadioButton(selected = attachmentRemovalScope == "series", onClick = { attachmentRemovalScope = "series" }, enabled = !working)
-                                    Text("Whole series", modifier = Modifier.clickable(enabled = !working) { attachmentRemovalScope = "series" })
                                 }
                             }
                         }
                         if (file.attachments.size > 1) Text("Deleting this File removes it from ${file.attachments.size} Tasks or Events.", color = MaterialTheme.colorScheme.error)
                     }
                 },
-                confirmButton = { TextButton(enabled = !working, onClick = { removeAttachment(file, attachment, if (attachment.scope == "series" || attachment.scope == "following") attachmentRemovalScope else "occurrence") }) { Text("Remove Attachment") } },
+                confirmButton = { TextButton(enabled = !working, onClick = { removeAttachment(file, attachment, if (isRecurringAttachment || attachment.scope == "series" || attachment.scope == "following") attachmentRemovalScope else "occurrence") }) { Text("Remove Attachment") } },
                 dismissButton = {
                     Row {
                         TextButton(enabled = !working, onClick = { removeFile(file) }) { Text("Delete File", color = MaterialTheme.colorScheme.error) }
@@ -923,7 +918,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                         pushDeviceId?.let { deviceId ->
                             ApiClient(apiBaseUrl).revokePushDevice(currentToken, PushDevice(deviceId, "android", ""))
                             preferences.edit().remove(PushMessagingService.pushDeviceKey(currentUser.id))
-                                .remove(PushMessagingService.pushFidKey(currentUser.id)).putBoolean("push_device_revoked", true).apply()
+                                .remove(PushMessagingService.pushTokenKey(currentUser.id)).putBoolean("push_device_revoked", true).apply()
                             pushDeviceId = null
                             FirebaseMessaging.getInstance().unregister().await()
                         }
@@ -946,19 +941,26 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                             val deviceWasExplicitlyRevoked = preferences.getBoolean(PushMessagingService.PUSH_REVOKED_KEY, false) && wasPushEnabled
                             preferences.edit().putBoolean("push_enabled", true)
                                 .putBoolean(PushMessagingService.PUSH_REVOKED_KEY, deviceWasExplicitlyRevoked).apply()
-                            if (pushDeviceId == null && !deviceWasExplicitlyRevoked) {
-                                FirebaseMessaging.getInstance().register().await()
-                                val installationId = FirebaseInstallations.getInstance().id.await()
-                                val device = api.registerPushDevice(currentToken, "android", installationId)
-                                preferences.edit().putString(deviceKey, device.id)
-                                    .putString(PushMessagingService.pushFidKey(currentUser.id), installationId).apply()
-                                pushDeviceId = device.id
+                            if (!deviceWasExplicitlyRevoked) {
+                                val fcmToken = FirebaseMessaging.getInstance().token.await()
+                                val tokenKey = PushMessagingService.pushTokenKey(currentUser.id)
+                                val previousToken = preferences.getString(tokenKey, null)
+                                if (pushDeviceId == null || previousToken != fcmToken) {
+                                    val previousDeviceId = pushDeviceId
+                                    val device = api.registerPushDevice(currentToken, "android", fcmToken)
+                                    if (previousDeviceId != null && previousDeviceId != device.id) {
+                                        api.revokePushDevice(currentToken, PushDevice(previousDeviceId, "android", ""))
+                                    }
+                                    preferences.edit().putString(deviceKey, device.id)
+                                        .putString(tokenKey, fcmToken).apply()
+                                    pushDeviceId = device.id
+                                }
                             }
                         } else {
                             preferences.edit().putBoolean("push_enabled", false).putBoolean("push_device_revoked", true).apply()
                             pushDeviceId?.let { deviceId ->
                                 api.revokePushDevice(currentToken, PushDevice(deviceId, "android", ""))
-                                preferences.edit().remove(deviceKey).remove(PushMessagingService.pushFidKey(currentUser.id)).apply()
+                                preferences.edit().remove(deviceKey).remove(PushMessagingService.pushTokenKey(currentUser.id)).apply()
                                 pushDeviceId = null
                                 FirebaseMessaging.getInstance().unregister().await()
                             }
@@ -1458,7 +1460,7 @@ private fun WorkspaceFileCard(
                 TextButton(enabled = enabled, onClick = onOpen) { Text("Open") }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                TextButton(enabled = enabled && items.size > file.attachments.size, onClick = onAttach) { Text("Attach") }
+                TextButton(enabled = enabled && items.any { item -> item.files.none { it.id == file.id } }, onClick = onAttach) { Text("Attach") }
                 TextButton(enabled = enabled, onClick = onDelete) { Text("Delete File", color = MaterialTheme.colorScheme.error) }
             }
             Text("Attached to", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)

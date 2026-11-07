@@ -295,7 +295,7 @@ export default function FilesView({
                 </>}
               </>;
             })()}
-            {dialog.file.attachments.length > 1 && <p className="file-delete-warning">Deleting this File removes all of its Attachments.</p>}
+            {dialog.file.attachments.length > 0 && <p className="file-delete-warning">Deleting this File removes its {dialog.file.attachments.length} {dialog.file.attachments.length === 1 ? "Attachment" : "Attachments"} from all associated Tasks and Events.</p>}
             <div className="files-dialog-actions"><button className="button button-secondary" type="button" disabled={busy} onClick={() => setDialog(null)}>Cancel</button><button className="button button-secondary" type="button" disabled={busy} onClick={() => void removeAttachment(dialog.file, dialog.attachment)}>Remove Attachment</button><button className="button button-danger" type="button" disabled={busy} onClick={() => void deleteFile(dialog.file)}>{busy ? "Deleting…" : "Delete File"}</button></div>
           </> : <>
             <p className="eyebrow">FILES SECTION</p><h2 id="files-dialog-title">Delete this File?</h2>
