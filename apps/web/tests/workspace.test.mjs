@@ -3467,6 +3467,40 @@ test("whole-series edits keep the original start after locally moving the first 
     "the locally moved first Occurrence must not become a new recurrence start");
 });
 
+test("whole-series edits carry the effective time into future Occurrences", async () => {
+  const owner = await account();
+  const previousClock = new Date(testClock);
+  try {
+    const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "task", title: "Timed series", scheduledDate: "2026-10-14", scheduledTime: "08:00",
+      recurrence: { interval: 1, unit: "days", end: { type: "never" } },
+    } });
+    assert.equal(created.status, 201, await created.clone().text());
+    const root = (await created.json()).item;
+
+    const moved = await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: {
+      scheduledDate: "2026-10-24", scheduledTime: "12:30", scope: "occurrence",
+    } });
+    assert.equal(moved.status, 200, await moved.clone().text());
+
+    const seriesEdit = await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: {
+      title: "Updated timed series", scope: "series",
+    } });
+    assert.equal(seriesEdit.status, 200, await seriesEdit.clone().text());
+    let occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ seriesId }) => seriesId === root.id);
+    assert.ok(occurrences.every(({ scheduledTime }) => scheduledTime === "12:30"));
+
+    await setTestClock(previousClock.getTime() + 372 * 86_400_000);
+    occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ seriesId }) => seriesId === root.id);
+    const generated = occurrences.find(({ occurrenceDate }) => occurrenceDate === "2027-10-21");
+    assert.ok(generated, "advancing the clock should materialize a new future Occurrence");
+    assert.equal(generated.title, "Updated timed series");
+    assert.equal(generated.scheduledTime, "12:30");
+  } finally { await setTestClock(previousClock); }
+});
+
 test("editing the first Occurrence locally preserves its recurrence definition and series identity", async () => {
   const owner = await account();
   const previousClock = new Date(testClock);
