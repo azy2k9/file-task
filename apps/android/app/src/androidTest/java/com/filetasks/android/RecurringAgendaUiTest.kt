@@ -307,10 +307,19 @@ class RecurringAgendaUiTest {
     }
 
     private fun clearEventDate(item: WorkspaceItem, api: ApiClient, token: String) {
+        waitFor("any previous editor to close before clearing the Event date") {
+            compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
+        }
+        compose.onNodeWithText("Refresh").performScrollTo().performClick()
         compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
-        compose.onNodeWithTag("agenda.edit.${item.id}").performClick()
+        val editButton = compose.onNodeWithTag("agenda.edit.${item.id}")
+        waitFor("the Event edit action to be enabled") { runCatching { editButton.assertIsEnabled() }.isSuccess }
+        editButton.performClick()
+        waitFor("the Event edit dialog to open") { compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("Date (YYYY-MM-DD, optional)").performScrollTo().performTextClearance()
-        compose.onNodeWithText("Save").performClick()
+        val saveButton = compose.onNodeWithText("Save")
+        waitFor("the Event Save button to be enabled") { runCatching { saveButton.assertIsEnabled() }.isSuccess }
+        saveButton.performClick()
         waitFor("the date-clearing editor to close") {
             compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty()
         }
