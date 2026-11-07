@@ -1547,7 +1547,6 @@ private fun ItemEditorDialog(
                             if (item == null && !reminderRowsTouched) reminders = reminderSettings.eventReminders
                         },
                         enabled = item == null && !saving && !isBusy,
-                        modifier = Modifier.testTag("item.editor.kind.event"),
                         label = { Text("Event") },
                     )
                 }

@@ -4,22 +4,23 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsOn
-import androidx.compose.ui.test.isRoot
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isDialog
+import androidx.compose.ui.test.isRoot
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
-import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
+import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.printToString
+import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.filetasks.android.data.ApiClient
@@ -27,6 +28,7 @@ import com.filetasks.android.data.ItemKind
 import com.filetasks.android.data.WorkspaceItem
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -173,12 +175,15 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("Save").performClick()
         waitFor("the simple item editor to close after editing") {
             compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty()
+                && compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
         }
     }
 
     private fun deleteItem(item: WorkspaceItem) {
-        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.delete.${item.id}"))
-        val deleteButton = compose.onNodeWithTag("agenda.delete.${item.id}")
+        val itemTag = "agenda.item.${item.id}"
+        val deleteTag = "agenda.delete.${item.id}"
+        scrollDeleteActionClearOfFab(deleteTag)
+        val deleteButton = compose.onNodeWithTag(deleteTag)
         waitFor("the delete action to finish enabling") {
             runCatching {
                 deleteButton.assertIsDisplayed()
@@ -189,12 +194,10 @@ class RecurringAgendaUiTest {
         waitFor("the delete confirmation dialog to appear") {
             compose.onAllNodes(hasTestTag("item.delete.title")).fetchSemanticsNodes().isNotEmpty()
         }
-        val confirmDelete = compose.onNodeWithTag("item.delete.confirm")
-        confirmDelete.assertIsDisplayed()
-        confirmDelete.performClick()
+        clickDeleteConfirmation()
         waitFor("the deleted item and confirmation dialog to leave the agenda") {
-            compose.onAllNodes(hasTestTag("agenda.item.${item.id}")).fetchSemanticsNodes().isEmpty()
-                && compose.onAllNodes(hasTestTag("item.delete.title")).fetchSemanticsNodes().isEmpty()
+            compose.onAllNodes(hasTestTag(itemTag)).fetchSemanticsNodes().isEmpty()
+                && compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
         }
     }
 
@@ -239,8 +242,9 @@ class RecurringAgendaUiTest {
 
     private fun deleteEvent(item: WorkspaceItem, api: ApiClient, token: String) {
         val itemTag = "agenda.item.${item.id}"
-        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag(itemTag))
-        val deleteButton = compose.onNode(hasText("Delete") and hasAnyAncestor(hasTestTag(itemTag)))
+        val deleteTag = "agenda.delete.${item.id}"
+        scrollDeleteActionClearOfFab(deleteTag)
+        val deleteButton = compose.onNodeWithTag(deleteTag)
         waitFor("the Event delete action to become available") {
             runCatching {
                 deleteButton.assertIsDisplayed()
@@ -249,10 +253,9 @@ class RecurringAgendaUiTest {
         }
         deleteButton.performClick()
         waitFor("the Event delete confirmation") {
-            compose.onAllNodes(isDialog()).fetchSemanticsNodes().isNotEmpty()
+            compose.onAllNodes(hasTestTag("item.delete.title")).fetchSemanticsNodes().isNotEmpty()
         }
-        val confirmDelete = compose.onNode(hasText("Delete") and hasAnyAncestor(isDialog()))
-        confirmDelete.performClick()
+        clickDeleteConfirmation()
         waitFor("the deleted Event and confirmation to leave the workspace") {
             items(api, token).none { it.id == item.id }
                 && compose.onAllNodes(hasTestTag(itemTag)).fetchSemanticsNodes().isEmpty()
@@ -265,13 +268,42 @@ class RecurringAgendaUiTest {
         compose.onNode(hasTestTag("agenda.item.$id") and hasAnyDescendant(hasText(title))).assertExists()
     }
 
+    private fun clickDeleteConfirmation() {
+        val confirmDelete = compose.onNodeWithTag("item.delete.confirm")
+        waitFor("the delete confirmation button to become enabled") {
+            runCatching { confirmDelete.assertIsEnabled() }.isSuccess
+        }
+        confirmDelete.performClick()
+    }
+
+    private fun scrollDeleteActionClearOfFab(deleteTag: String) {
+        val agenda = compose.onNodeWithTag("agenda.list")
+        val deleteButton = compose.onNodeWithTag(deleteTag)
+        agenda.performScrollToNode(hasTestTag(deleteTag))
+        var overlapsFab: Boolean
+        var scrollCount = 0
+        while (true) {
+            val deleteBounds = deleteButton.fetchSemanticsNode().boundsInRoot
+            val fabBounds = compose.onNodeWithTag("agenda.add").fetchSemanticsNode().boundsInRoot
+            overlapsFab = deleteBounds.left < fabBounds.right && fabBounds.left < deleteBounds.right
+                && deleteBounds.top < fabBounds.bottom && fabBounds.top < deleteBounds.bottom
+            if (!overlapsFab || scrollCount == 4) break
+            agenda.performTouchInput {
+                swipeUp(startY = bottom * 0.85f, endY = bottom * 0.70f)
+            }
+            scrollCount += 1
+        }
+        assertFalse("Delete action $deleteTag overlaps the Add item button after scrolling", overlapsFab)
+    }
+
     private fun waitFor(description: String, condition: () -> Boolean) {
         try {
             compose.waitUntil(30_000, condition)
         } catch (failure: Throwable) {
             val password = InstrumentationRegistry.getArguments().getString("password")
             val snapshot = runCatching {
-                compose.onAllNodes(isRoot(), useUnmergedTree = true).printToString()
+                val roots = compose.onAllNodes(isRoot(), useUnmergedTree = true)
+                (0 until roots.fetchSemanticsNodes().size).joinToString("\n") { index -> roots.get(index).printToString() }
             }.getOrElse { it.toString() }
             val ui = if (password.isNullOrEmpty()) snapshot else snapshot.replace(password, "<redacted>")
             throw AssertionError("Failed while waiting for $description. UI: $ui", failure)
