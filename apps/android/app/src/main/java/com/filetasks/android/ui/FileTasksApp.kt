@@ -1722,6 +1722,7 @@ private fun ReminderRuleEditor(
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         reminders.forEachIndexed { index, reminder ->
+            var amountText by remember(index) { mutableStateOf(reminder.amount.toString()) }
             Text("Reminder ${index + 1}", style = MaterialTheme.typography.labelMedium)
             Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 FilterChip(selected = reminder.delivery == "notification", onClick = {
@@ -1733,9 +1734,13 @@ private fun ReminderRuleEditor(
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
-                    value = reminder.amount.toString(), onValueChange = { value ->
-                        val amount = value.toIntOrNull()?.coerceIn(0, 100_000) ?: 0
-                        onChange(reminders.mapIndexed { row, current -> if (row == index) current.copy(amount = amount) else current })
+                    value = amountText, onValueChange = { value ->
+                        amountText = value
+                        val parsed = value.toLongOrNull()
+                        if (value.isEmpty() || parsed != null) {
+                            val amount = parsed?.coerceIn(0, 100_000)?.toInt() ?: 0
+                            onChange(reminders.mapIndexed { row, current -> if (row == index) current.copy(amount = amount) else current })
+                        }
                     }, modifier = Modifier.weight(1f), label = { Text("Offset") }, singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), enabled = enabled,
                 )
