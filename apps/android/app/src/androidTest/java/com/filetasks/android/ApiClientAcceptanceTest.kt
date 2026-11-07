@@ -104,6 +104,31 @@ class ApiClientAcceptanceTest {
         val androidDownload = URL(api.openFile(token, androidFile).url).openStream().use { it.readBytes() }
         assertTrue(androidBytes.contentEquals(androidDownload))
 
+        val rememberedEvent = api.createItem(token, ItemFields(
+            kind = ItemKind.Event,
+            title = "Undated Android Event $namespace",
+            details = "Keep its File",
+            scheduledDate = "2026-11-04",
+            scheduledTime = null,
+        ))
+        api.attachFile(token, file, rememberedEvent)
+        val undatedEvent = api.updateItem(token, rememberedEvent, ItemFields(
+            kind = ItemKind.Event,
+            title = rememberedEvent.title,
+            details = rememberedEvent.details,
+            scheduledDate = null,
+            scheduledTime = null,
+            recurrence = null,
+            reminders = rememberedEvent.reminders,
+        ))
+        assertEquals(null, undatedEvent.scheduledDate)
+        assertTrue(undatedEvent.files.any { it.id == file.id })
+        val sharedUndatedEvent = ApiClient(apiUrl).listItems(token).first { it.id == rememberedEvent.id }
+        assertEquals(null, sharedUndatedEvent.scheduledDate)
+        assertTrue(sharedUndatedEvent.files.any { it.id == file.id })
+        api.deleteItem(token, undatedEvent)
+        assertFalse(api.listItems(token).any { it.id == rememberedEvent.id })
+
         api.createItem(token, ItemFields(
             kind = ItemKind.Task,
             title = "Native due push $namespace",
