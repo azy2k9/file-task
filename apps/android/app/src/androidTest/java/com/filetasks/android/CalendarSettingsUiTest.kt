@@ -127,6 +127,9 @@ class CalendarSettingsUiTest {
         }
 
         providerAction(providerFakeUrl, "edit", "android-ui-apple-${email.hashCode()}", "Android UI imported Apple Event", "External edit", appleCollectionPath)
+        waitFor("Sync Calendar after the external edit to become available") {
+            compose.onAllNodes(hasTestTag("calendar.sync") and isEnabled()).fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithTag("calendar.sync").performScrollTo().performClick()
         waitFor("native sync restoring the authoritative title") {
             providerInspect(providerFakeUrl, "android-ui-apple-${email.hashCode()}", appleCollectionPath).let { copies ->
@@ -135,6 +138,9 @@ class CalendarSettingsUiTest {
         }
 
         providerAction(providerFakeUrl, "delete", "android-ui-apple-${email.hashCode()}", "Android UI imported Apple Event", collectionPath = appleCollectionPath)
+        waitFor("Sync Calendar after the external deletion to become available") {
+            compose.onAllNodes(hasTestTag("calendar.sync") and isEnabled()).fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithTag("calendar.sync").performScrollTo().performClick()
         waitFor("native sync restoring a deleted copy without duplication") {
             val copies = providerInspect(providerFakeUrl, "android-ui-apple-${email.hashCode()}", appleCollectionPath)
