@@ -190,9 +190,7 @@ class RecurringAgendaUiTest {
         waitFor("the delete confirmation dialog to appear") {
             compose.onAllNodes(isDialog()).fetchSemanticsNodes().isNotEmpty()
         }
-        val confirmDelete = compose.onNode(hasText("Delete") and hasAnyAncestor(isDialog()))
-        confirmDelete.assertIsDisplayed()
-        confirmDelete.performClick()
+        clickDeleteConfirmation()
         waitFor("the deleted item and confirmation dialog to leave the agenda") {
             compose.onAllNodes(hasTestTag(itemTag)).fetchSemanticsNodes().isEmpty()
                 && compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
@@ -252,13 +250,23 @@ class RecurringAgendaUiTest {
         waitFor("the Event delete confirmation") {
             compose.onAllNodes(isDialog()).fetchSemanticsNodes().isNotEmpty()
         }
-        val confirmDelete = compose.onNode(hasText("Delete") and hasAnyAncestor(isDialog()))
-        confirmDelete.performClick()
+        clickDeleteConfirmation()
         waitFor("the deleted Event and confirmation to leave the workspace") {
             items(api, token).none { it.id == item.id }
                 && compose.onAllNodes(hasTestTag(itemTag)).fetchSemanticsNodes().isEmpty()
                 && compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
         }
+    }
+
+    private fun clickDeleteConfirmation() {
+        val confirmDelete = compose.onNode(hasText("Delete") and hasAnyAncestor(isDialog()))
+        waitFor("the delete confirmation button to become visible") {
+            runCatching {
+                confirmDelete.assertIsDisplayed()
+                confirmDelete.assertIsEnabled()
+            }.isSuccess
+        }
+        confirmDelete.performClick()
     }
 
     private fun assertAgendaItem(id: String, title: String) {
