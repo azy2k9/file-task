@@ -2,6 +2,9 @@ package com.filetasks.android
 
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsOff
+import androidx.compose.ui.test.assertIsOn
+import androidx.compose.ui.test.isRoot
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasTestTag
@@ -61,6 +64,38 @@ class RecurringAgendaUiTest {
         assertAgendaItem(undatedEvent.id, undatedEvent.title)
         assertAgendaItem(eventToDelete.id, eventToDelete.title)
 
+        createSimpleItem("Android UI personal Task", isEvent = false, details = "Initial Task details")
+        var personalTask = items(api, token).single { it.title == "Android UI personal Task" }
+        assertEquals(ItemKind.Task, personalTask.kind)
+        assertEquals(false, personalTask.completed)
+        assertAgendaItem(personalTask.id, personalTask.title)
+
+        compose.onNodeWithTag("agenda.complete.${personalTask.id}").performClick()
+        waitFor("the Task to be marked complete") {
+            val saved = items(api, token).single { it.id == personalTask.id }.completed == true
+            val checkboxReady = runCatching {
+                compose.onNodeWithTag("agenda.complete.${personalTask.id}")
+                    .assertIsOn()
+                    .assertIsEnabled()
+            }.isSuccess
+            saved && checkboxReady
+        }
+        compose.onNodeWithTag("agenda.complete.${personalTask.id}").performClick()
+        waitFor("the Task to be reopened") {
+            val saved = items(api, token).single { it.id == personalTask.id }.completed == false
+            val checkboxReady = runCatching {
+                compose.onNodeWithTag("agenda.complete.${personalTask.id}")
+                    .assertIsOff()
+                    .assertIsEnabled()
+            }.isSuccess
+            saved && checkboxReady
+        }
+
+        editSimpleItem(personalTask, "Android UI edited Task", "Updated Task details")
+        personalTask = items(api, token).single { it.id == personalTask.id }
+        assertEquals("Updated Task details", personalTask.details)
+        assertAgendaItem(personalTask.id, personalTask.title)
+
         createRecurring("Android UI Task", isEvent = false, date = "2026-10-14")
         val task = items(api, token).filter { it.title == "Android UI Task" }.sortedBy { it.scheduledDate }
         assertEquals("The UI-created Task must have three Occurrences", 3, task.size)
@@ -73,6 +108,30 @@ class RecurringAgendaUiTest {
         val event = items(api, token).filter { it.title == "Android UI Event" }.sortedBy { it.scheduledDate }
         assertEquals("The UI-created Event must have three Occurrences", 3, event.size)
         event.forEach { assertAgendaItem(it.id, it.title) }
+
+        createSimpleItem("Android UI personal Event", isEvent = true, details = "An undated Event")
+        var personalEvent = items(api, token).single { it.title == "Android UI personal Event" }
+        assertEquals(ItemKind.Event, personalEvent.kind)
+        assertEquals(null, personalEvent.scheduledDate)
+        assertEquals(null, personalEvent.completed)
+
+        compose.onNode(hasText("Events ·", substring = true)).performClick()
+        assertAgendaItem(personalEvent.id, "Android UI personal Event")
+        compose.onNode(hasText("Tasks ·", substring = true)).performClick()
+        assertAgendaItem(personalTask.id, "Android UI edited Task")
+        compose.onNode(hasText("Events ·", substring = true)).performClick()
+        personalEvent = items(api, token).single { it.id == personalEvent.id }
+        editSimpleItem(personalEvent, "Android UI edited Event", "Edited without a schedule")
+        personalEvent = items(api, token).single { it.id == personalEvent.id }
+        assertEquals("Edited without a schedule", personalEvent.details)
+        assertEquals(null, personalEvent.scheduledDate)
+
+        compose.onNode(hasText("All ·", substring = true)).performClick()
+        deleteItem(personalTask)
+        deleteItem(personalEvent)
+        waitFor("the simple Task and Event to be deleted") {
+            items(api, token).none { it.id == personalTask.id || it.id == personalEvent.id }
+        }
 
         edit(event[1], "Android UI Following", "This and following Occurrences")
         val afterFollowing = items(api, token)
@@ -92,6 +151,52 @@ class RecurringAgendaUiTest {
     }
 
     private fun items(api: ApiClient, token: String): List<WorkspaceItem> = runBlocking { api.listItems(token) }
+
+    private fun createSimpleItem(title: String, isEvent: Boolean, details: String) {
+        compose.onNodeWithTag("agenda.add").performClick()
+        if (isEvent) compose.onNodeWithTag("item.editor.kind.event").performClick()
+        compose.onNodeWithText("Title").performTextInput(title)
+        compose.onNodeWithText("Details").performTextInput(details)
+        compose.onNodeWithText("Create").performClick()
+        waitFor("the simple item editor to close") {
+            compose.onAllNodes(hasText("Add to your workspace")).fetchSemanticsNodes().isEmpty()
+        }
+    }
+
+    private fun editSimpleItem(item: WorkspaceItem, title: String, details: String) {
+        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
+        compose.onNodeWithTag("agenda.edit.${item.id}").performClick()
+        compose.onNodeWithText("Title").performTextClearance()
+        compose.onNodeWithText("Title").performTextInput(title)
+        compose.onNodeWithText("Details").performTextClearance()
+        compose.onNodeWithText("Details").performTextInput(details)
+        compose.onNodeWithText("Save").performClick()
+        waitFor("the simple item editor to close after editing") {
+            compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty()
+        }
+    }
+
+    private fun deleteItem(item: WorkspaceItem) {
+        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.delete.${item.id}"))
+        val deleteButton = compose.onNodeWithTag("agenda.delete.${item.id}")
+        waitFor("the delete action to finish enabling") {
+            runCatching {
+                deleteButton.assertIsDisplayed()
+                deleteButton.assertIsEnabled()
+            }.isSuccess
+        }
+        deleteButton.performClick()
+        waitFor("the delete confirmation dialog to appear") {
+            compose.onAllNodes(hasTestTag("item.delete.title")).fetchSemanticsNodes().isNotEmpty()
+        }
+        val confirmDelete = compose.onNodeWithTag("item.delete.confirm")
+        confirmDelete.assertIsDisplayed()
+        confirmDelete.performClick()
+        waitFor("the deleted item and confirmation dialog to leave the agenda") {
+            compose.onAllNodes(hasTestTag("agenda.item.${item.id}")).fetchSemanticsNodes().isEmpty()
+                && compose.onAllNodes(hasTestTag("item.delete.title")).fetchSemanticsNodes().isEmpty()
+        }
+    }
 
     private fun createRecurring(title: String, isEvent: Boolean, date: String) {
         compose.onNodeWithTag("agenda.add").performClick()
@@ -165,7 +270,9 @@ class RecurringAgendaUiTest {
             compose.waitUntil(30_000, condition)
         } catch (failure: Throwable) {
             val password = InstrumentationRegistry.getArguments().getString("password")
-            val snapshot = runCatching { compose.onRoot(useUnmergedTree = true).printToString() }.getOrElse { it.toString() }
+            val snapshot = runCatching {
+                compose.onAllNodes(isRoot(), useUnmergedTree = true).printToString()
+            }.getOrElse { it.toString() }
             val ui = if (password.isNullOrEmpty()) snapshot else snapshot.replace(password, "<redacted>")
             throw AssertionError("Failed while waiting for $description. UI: $ui", failure)
         }

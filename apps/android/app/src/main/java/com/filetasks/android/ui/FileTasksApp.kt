@@ -734,7 +734,12 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
         confirmDelete?.let { item ->
             AlertDialog(
                 onDismissRequest = { if (!working) confirmDelete = null },
-                title = { Text("Delete ${item.kind.displayName.lowercase()}?") },
+                title = {
+                    Text(
+                        "Delete ${item.kind.displayName.lowercase()}?",
+                        modifier = Modifier.testTag("item.delete.title"),
+                    )
+                },
                 text = {
                     Column {
                         Text("“${item.title}” will be removed from your workspace.")
@@ -751,6 +756,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                 confirmButton = {
                     Button(
                         enabled = !working,
+                        modifier = Modifier.testTag("item.delete.confirm"),
                         onClick = {
                             val currentToken = token
                             if (currentToken != null) {
@@ -1367,7 +1373,7 @@ private fun WorkspaceItemCard(
                     checked = item.completed == true,
                     onCheckedChange = { onToggleTask() },
                     enabled = enabled,
-                    modifier = Modifier.padding(top = 0.dp),
+                    modifier = Modifier.padding(top = 0.dp).testTag("agenda.complete.${item.id}"),
                 )
                 Spacer(Modifier.width(4.dp))
             }
@@ -1416,7 +1422,11 @@ private fun WorkspaceItemCard(
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.align(Alignment.End)) {
                     TextButton(onClick = onEdit, enabled = enabled, modifier = Modifier.testTag("agenda.edit.${item.id}")) { Text("Edit") }
-                    TextButton(onClick = onDelete, enabled = enabled) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+                    TextButton(
+                        onClick = onDelete,
+                        enabled = enabled,
+                        modifier = Modifier.testTag("agenda.delete.${item.id}"),
+                    ) { Text("Delete", color = MaterialTheme.colorScheme.error) }
                 }
             }
         }
@@ -1537,6 +1547,7 @@ private fun ItemEditorDialog(
                             if (item == null && !reminderRowsTouched) reminders = reminderSettings.eventReminders
                         },
                         enabled = item == null && !saving && !isBusy,
+                        modifier = Modifier.testTag("item.editor.kind.event"),
                         label = { Text("Event") },
                     )
                 }
