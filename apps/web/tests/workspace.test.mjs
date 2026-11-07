@@ -6351,6 +6351,7 @@ test("Apple sync safely recreates a deleted imported Event and propagates later 
     const recreated = appleEvents.get(path);
     assert.ok(recreated, "deleted resource should be recreated");
     assert.match(recreated, /^UID:deleted-import\r?$/m);
+    assert.match(recreated, new RegExp(`^URL:${base}/\\?event=${item.id}$`, "m"));
     assert.match(recreated, /^DTSTART;VALUE=DATE:20270114\r?$/m);
     assert.match(recreated, /^DTEND;VALUE=DATE:20270115\r?$/m);
     assert.equal(providerRequests.find(entry => entry.method === "PUT" && entry.path === path)?.headers["if-none-match"], "*");
