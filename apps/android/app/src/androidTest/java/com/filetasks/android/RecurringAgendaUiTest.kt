@@ -99,9 +99,36 @@ class RecurringAgendaUiTest {
         assertAgendaItem(personalTask.id, personalTask.title)
 
         createRecurring("Android UI Task", isEvent = false, date = "2026-10-14")
-        val task = items(api, token).filter { it.title == "Android UI Task" }.sortedBy { it.scheduledDate }
+        val initialTaskRows = items(api, token).filter { it.title == "Android UI Task" }.sortedBy { it.occurrenceDate }
+        val task = initialTaskRows.sortedBy { it.scheduledDate }
         assertEquals("The UI-created Task must have three Occurrences", 3, task.size)
         task.forEach { assertAgendaItem(it.id, it.title) }
+
+        val firstTaskOccurrence = initialTaskRows.first()
+        val laterTaskOccurrences = initialTaskRows.drop(1)
+        editFirstOccurrence(firstTaskOccurrence)
+        waitFor("the first Occurrence edit to be saved without changing the series") {
+            val savedRows = items(api, token).filter { it.occurrenceDate in initialTaskRows.map { row -> row.occurrenceDate } }
+            val savedFirst = savedRows.singleOrNull { it.id == firstTaskOccurrence.id }
+            val savedLater = laterTaskOccurrences.mapNotNull { original -> savedRows.singleOrNull { it.id == original.id } }
+            savedFirst?.title == "Android UI First Task Only"
+                && savedFirst.scheduledDate == LocalDate.parse(requireNotNull(firstTaskOccurrence.scheduledDate)).plusDays(10).toString()
+                && savedFirst.scheduledTime == "14:30"
+                && savedFirst.recurrence == null
+                && savedFirst.reminders.firstOrNull()?.let { it.amount == 2 && it.unit == "hours" && it.time == "11:00" } == true
+                && savedLater.size == laterTaskOccurrences.size
+                && savedLater.zip(laterTaskOccurrences).all { (saved, original) ->
+                    saved.title == original.title
+                        && saved.scheduledDate == original.scheduledDate
+                        && saved.scheduledTime == original.scheduledTime
+                        && saved.recurrence == original.recurrence
+                        && saved.reminders == original.reminders
+                }
+        }
+        val afterFirstOccurrenceEdit = items(api, token).filter { it.occurrenceDate in initialTaskRows.map { row -> row.occurrenceDate } }
+        assertEquals(firstTaskOccurrence.occurrenceDate, afterFirstOccurrenceEdit.single { it.id == firstTaskOccurrence.id }.occurrenceDate)
+        assertAgendaItem(firstTaskOccurrence.id, "Android UI First Task Only")
+        laterTaskOccurrences.forEach { assertAgendaItem(it.id, it.title) }
 
         createRecurring("Android UI Event", isEvent = true, date = "2026-10-18")
         waitFor("the saved Event's Calendar failure status") {
@@ -222,6 +249,37 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText(scope).performScrollTo().performClick()
         compose.onNodeWithText("Save").performClick()
         waitFor("the edit editor to close") { compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty() }
+    }
+
+    private fun editFirstOccurrence(item: WorkspaceItem) {
+        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
+        compose.onNodeWithTag("agenda.edit.${item.id}").performClick()
+        compose.onNodeWithText("Title").performTextClearance()
+        compose.onNodeWithText("Title").performTextInput("Android UI First Task Only")
+        compose.onNodeWithText("Date (YYYY-MM-DD, optional)").performTextClearance()
+        compose.onNodeWithText("Date (YYYY-MM-DD, optional)")
+            .performTextInput(LocalDate.parse(requireNotNull(item.scheduledDate)).plusDays(10).toString())
+        compose.onNodeWithText("Time (HH:mm, optional)").performTextInput("14:30")
+
+        compose.onNodeWithTag("item.editor.repeat").performScrollTo().performClick()
+
+        // Replace any inherited default reminder with a specific local Reminder,
+        // exercising the actual editor even when the test account has no defaults.
+        while (compose.onAllNodes(hasText("Remove Reminder")).fetchSemanticsNodes().isNotEmpty()) {
+            compose.onNodeWithText("Remove Reminder").performScrollTo().performClick()
+        }
+        compose.onNodeWithText("Add Reminder").performScrollTo().performClick()
+        compose.onNodeWithText("Offset").performScrollTo().performTextClearance()
+        compose.onNodeWithText("Offset").performTextInput("2")
+        compose.onNodeWithText("Clock time").performTextClearance()
+        compose.onNodeWithText("Clock time").performTextInput("11:00")
+        compose.onNodeWithText("hours").performScrollTo().performClick()
+
+        compose.onNodeWithText("This Occurrence").performScrollTo().performClick()
+        compose.onNodeWithText("Save").performClick()
+        waitFor("the first Occurrence editor to close") {
+            compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty()
+        }
     }
 
     private fun clearEventDate(item: WorkspaceItem, api: ApiClient, token: String) {

@@ -47,6 +47,7 @@ export default function FilesView({
   const [linkUrl, setLinkUrl] = useState("");
   const [selectedItemId, setSelectedItemId] = useState("");
   const [selectedScope, setSelectedScope] = useState<"occurrence" | "following" | "series">("occurrence");
+  const [removeScope, setRemoveScope] = useState<"occurrence" | "following" | "series">("occurrence");
   const fileInput = useRef<HTMLInputElement>(null);
 
   async function loadFiles() {
@@ -134,7 +135,7 @@ export default function FilesView({
 
   async function removeAttachment(file: WorkspaceFile, attachment: FileAttachment) {
     await mutateFile(
-      () => fetch(`/api/files/${encodeURIComponent(file.id)}/attachments/${encodeURIComponent(attachment.itemId)}?scope=${attachment.scope}`, {
+      () => fetch(`/api/files/${encodeURIComponent(file.id)}/attachments/${encodeURIComponent(attachment.itemId)}?scope=${removeScope}`, {
         method: "DELETE", credentials: "same-origin",
       }),
       "Could not remove this Attachment.",
@@ -231,7 +232,7 @@ export default function FilesView({
                 {file.attachments.length === 0 ? <span className="file-unattached">No Tasks or Events yet</span> : file.attachments.map((attachment) => (
                   <span className="file-attachment" key={attachment.itemId}>
                     <button className="text-link" type="button" onClick={() => onOpenItem(attachment.itemId)}>{attachment.itemKind === "task" ? "Task" : "Event"}: {attachment.itemTitle}</button>
-                    <button className="attachment-remove" type="button" aria-label={`Remove Attachment from ${attachment.itemTitle}`} disabled={busy} onClick={() => setDialog({ type: "remove", file, attachment })}>×</button>
+                    <button className="attachment-remove" type="button" aria-label={`Remove Attachment from ${attachment.itemTitle}`} disabled={busy} onClick={() => { setRemoveScope(attachment.scope); setDialog({ type: "remove", file, attachment }); }}>×</button>
                   </span>
                 ))}
               </div>
@@ -267,8 +268,34 @@ export default function FilesView({
             <div className="files-dialog-actions"><button className="button button-secondary" type="button" disabled={busy} onClick={() => setDialog(null)}>Close</button><button className="button button-primary" type="button" disabled={busy || !selectedItemId} onClick={() => void attach(dialog.file, selectedItemId)}>{busy ? "Attaching…" : "Add Attachment"}</button></div>
           </> : dialog.type === "remove" ? <>
             <p className="eyebrow">ATTACHMENT</p><h2 id="files-dialog-title">Remove this Attachment?</h2>
-            <p>Choose whether to remove <strong>{dialog.file.name}</strong> from {dialog.attachment.scope === "series" ? `the whole ${dialog.attachment.itemKind} series “${dialog.attachment.itemTitle}”` : dialog.attachment.scope === "following" ? `${dialog.attachment.itemKind} Occurrences from “${dialog.attachment.itemTitle}” onward` : `${dialog.attachment.itemKind} “${dialog.attachment.itemTitle}”`}, or delete the File from your Files section.</p>
-            {dialog.file.attachments.length > 1 && <p className="file-delete-warning">Deleting this File removes it from {dialog.file.attachments.length} Tasks or Events.</p>}
+            {(() => {
+              const selected = items.find((item) => item.id === dialog.attachment.itemId);
+              const seriesId = selected?.seriesId ?? selected?.id;
+              const seriesItems = selected?.seriesId || selected?.recurrence
+                ? items.filter((item) => item.id === seriesId || item.seriesId === seriesId)
+                : [selected].filter((item): item is WorkspaceItem => Boolean(item));
+              const effective = seriesItems.filter((item) => item.files.some((attached) => attached.id === dialog.file.id));
+              const anchorDate = selected?.occurrenceDate ?? selected?.scheduledDate ?? "";
+              const impacted = removeScope === "series" ? effective
+                : removeScope === "following" ? effective.filter((item) => (item.occurrenceDate ?? item.scheduledDate ?? "") >= anchorDate)
+                  : effective.filter((item) => item.id === dialog.attachment.itemId);
+              const scopeDescription = removeScope === "series"
+                ? `the whole ${dialog.attachment.itemKind} series`
+                : removeScope === "following"
+                  ? `${dialog.attachment.itemKind} Occurrences from “${dialog.attachment.itemTitle}” onward`
+                  : `${dialog.attachment.itemKind} “${dialog.attachment.itemTitle}”`;
+              return <>
+                <p>Remove <strong>{dialog.file.name}</strong> from {scopeDescription}?</p>
+                {removeScope !== "occurrence" && impacted.length > 0 && <p className="file-delete-warning">This removes the Attachment from {impacted.length} {impacted.length === 1 ? "Occurrence" : "Occurrences"}. The File stays in your Files section.</p>}
+                {(selected?.seriesId || selected?.recurrence) && <>
+                  <label className="field-label" htmlFor="remove-scope">Remove from</label>
+                  <select id="remove-scope" className="text-input" value={removeScope} onChange={(event) => setRemoveScope(event.target.value as "occurrence" | "following" | "series")}>
+                    <option value="occurrence">This Occurrence</option><option value="following">This and following</option><option value="series">Whole series</option>
+                  </select>
+                </>}
+              </>;
+            })()}
+            {dialog.file.attachments.length > 1 && <p className="file-delete-warning">Deleting this File removes all of its Attachments.</p>}
             <div className="files-dialog-actions"><button className="button button-secondary" type="button" disabled={busy} onClick={() => setDialog(null)}>Cancel</button><button className="button button-secondary" type="button" disabled={busy} onClick={() => void removeAttachment(dialog.file, dialog.attachment)}>Remove Attachment</button><button className="button button-danger" type="button" disabled={busy} onClick={() => void deleteFile(dialog.file)}>{busy ? "Deleting…" : "Delete File"}</button></div>
           </> : <>
             <p className="eyebrow">FILES SECTION</p><h2 id="files-dialog-title">Delete this File?</h2>
