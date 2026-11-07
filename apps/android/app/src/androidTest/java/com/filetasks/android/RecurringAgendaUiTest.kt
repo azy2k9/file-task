@@ -401,8 +401,9 @@ class RecurringAgendaUiTest {
 
     private fun dialogTrees(): List<String> {
         val roots = compose.onAllNodes(isRoot(), useUnmergedTree = true)
-        return (0 until roots.fetchSemanticsNodes().size)
-            .map { roots.get(it).printToString() }
+        val rootCount = roots.fetchSemanticsNodes().size
+        return (0 until rootCount)
+            .mapNotNull { index -> runCatching { roots.get(index).printToString() }.getOrNull() }
             .filter { it.contains("[IsDialog]") }
     }
 
