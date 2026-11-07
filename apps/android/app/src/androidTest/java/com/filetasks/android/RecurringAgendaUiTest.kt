@@ -197,7 +197,7 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("Create").performClick()
         waitFor("the simple item editor to close") {
             items(api, token).any { it.title == title }
-                && compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
+                && compose.onAllNodes(isDialog(), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
         }
     }
 
@@ -211,7 +211,7 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("Save").performClick()
         waitFor("the simple item editor to close after editing") {
             compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty()
-                && compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
+                && compose.onAllNodes(isDialog(), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
         }
     }
 
@@ -233,7 +233,7 @@ class RecurringAgendaUiTest {
         clickDeleteConfirmation()
         waitFor("the deleted item and confirmation dialog to leave the agenda") {
             compose.onAllNodes(hasTestTag(itemTag)).fetchSemanticsNodes().isEmpty()
-                && compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
+                && compose.onAllNodes(isDialog(), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
         }
     }
 
@@ -249,12 +249,12 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("Create").performClick()
         waitFor("the create editor to close") {
             items(api, token).any { it.title == title }
-                && compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
+                && compose.onAllNodes(isDialog(), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
         }
     }
 
     private fun edit(item: WorkspaceItem, title: String, scope: String, api: ApiClient, token: String) {
-        waitFor("any previous editor to close") { compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty() }
+        waitFor("any previous editor to close") { compose.onAllNodes(isDialog(), useUnmergedTree = true).fetchSemanticsNodes().isEmpty() }
         compose.onNodeWithText("Refresh").performScrollTo().performClick()
         compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
         val editButton = compose.onNodeWithTag("agenda.edit.${item.id}")
@@ -308,7 +308,7 @@ class RecurringAgendaUiTest {
 
     private fun clearEventDate(item: WorkspaceItem, api: ApiClient, token: String) {
         waitFor("any previous editor to close before clearing the Event date") {
-            compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
+            compose.onAllNodes(isDialog(), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
         }
         compose.onNodeWithText("Refresh").performScrollTo().performClick()
         compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
@@ -350,7 +350,7 @@ class RecurringAgendaUiTest {
         waitFor("the deleted Event and confirmation to leave the workspace") {
             items(api, token).none { it.id == item.id }
                 && compose.onAllNodes(hasTestTag(itemTag)).fetchSemanticsNodes().isEmpty()
-                && compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
+                && compose.onAllNodes(isDialog(), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
         }
     }
 
