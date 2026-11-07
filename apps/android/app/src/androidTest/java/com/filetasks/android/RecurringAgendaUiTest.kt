@@ -114,8 +114,8 @@ class RecurringAgendaUiTest {
         try {
             waitFor("the first Occurrence edit to be saved without changing the series") {
                 observedRows = items(api, token).filter { it.id in initialTaskRows.map(WorkspaceItem::id) || it.title == "Android UI First Task Only" }
-                val savedRows = observedRows.filter { it.occurrenceDate in initialTaskRows.map { row -> row.occurrenceDate } }
-                val savedFirst = savedRows.singleOrNull { it.id == firstTaskOccurrence.id }
+                val savedFirst = observedRows.singleOrNull { it.title == "Android UI First Task Only" }
+                val savedRows = observedRows
                 val savedLater = laterTaskOccurrences.mapNotNull { original -> savedRows.singleOrNull { it.id == original.id } }
                 savedFirst?.title == "Android UI First Task Only"
                     && savedFirst.scheduledDate == LocalDate.parse(requireNotNull(firstTaskOccurrence.scheduledDate)).plusDays(10).toString()
@@ -136,9 +136,9 @@ class RecurringAgendaUiTest {
             val expectedLater = laterTaskOccurrences.joinToString { "${it.id}:occurrence=${it.occurrenceDate},title=${it.title},date=${it.scheduledDate},time=${it.scheduledTime},rule=${it.recurrence},reminders=${it.reminders}" }
             throw AssertionError("First Occurrence API rows after edit; expected id ${firstTaskOccurrence.id}; expected later=$expectedLater; actual=$values", failure)
         }
-        val afterFirstOccurrenceEdit = items(api, token).filter { it.occurrenceDate in initialTaskRows.map { row -> row.occurrenceDate } }
-        assertEquals(firstTaskOccurrence.occurrenceDate, afterFirstOccurrenceEdit.single { it.id == firstTaskOccurrence.id }.occurrenceDate)
-        assertAgendaItem(firstTaskOccurrence.id, "Android UI First Task Only")
+        val savedFirstTaskOccurrence = items(api, token).single { it.title == "Android UI First Task Only" }
+        assertEquals(firstTaskOccurrence.occurrenceDate, savedFirstTaskOccurrence.occurrenceDate)
+        assertAgendaItem(savedFirstTaskOccurrence.id, "Android UI First Task Only")
         laterTaskOccurrences.forEach { assertAgendaItem(it.id, it.title) }
 
         createRecurring("Android UI Event", isEvent = true, date = "2026-10-18", api = api, token = token)

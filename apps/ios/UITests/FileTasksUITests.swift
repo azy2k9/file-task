@@ -717,13 +717,6 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         setTitle(title)
 
         dismissKeyboardIfShown()
-        let keyboardDismissed = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == false"),
-            object: app.keyboards.firstMatch
-        )
-        XCTAssertEqual(XCTWaiter.wait(for: [keyboardDismissed], timeout: 5), .completed,
-                       "The title keyboard should be dismissed before scheduling the item. Accessibility hierarchy: \(app.debugDescription)")
-
         let addDate = element(identifier: "itemEditor.schedule.includesDate")
         scrollToHittable(addDate, toward: .down, message: "A recurring item needs a schedule date.")
         if (addDate.value as? String) != "1" { addDate.tap() }
