@@ -30,7 +30,7 @@ if (reverse.status !== 0) {
 
 const child = spawn(process.execPath, [
   "--test", "--test-concurrency=1",
-  "--test-name-pattern=Android UI acceptance: recurring agenda updates are visible across clients",
+  "--test-name-pattern=Android UI acceptance: recurring agenda and connected calendar workflows work natively",
   "apps/web/tests/workspace.test.mjs",
 ], {
   cwd: root,

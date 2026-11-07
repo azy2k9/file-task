@@ -26,13 +26,13 @@ npm run test:acceptance
 
 The harness keeps the API and fake calendar, delivery, and object-storage providers running while browser, Swift, and Android tests use the same account. The Android instrumentation case reads and downloads the File uploaded by iOS, uploads and downloads its own File, exercises scoped Recurrence and Attachment changes, registers and revokes a Push device, and triggers a due Reminder through the shared delivery fake. A focused Android run can target a test API with `./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.apiUrl=http://10.0.2.2:3107`.
 
-To exercise the real Android screens for recurring agenda creation and scoped saves, start a fresh Android emulator and run from the repository root:
+To exercise the real Android screens for recurring agenda creation, scoped saves, connected-calendar management, and provider-copy recovery, start a fresh Android emulator and run from the repository root:
 
 ```sh
 npm run test:android-ui
 ```
 
-Install the Android SDK and platform tools, JDK 17, and the Playwright Chromium browser (`npx playwright install chromium`) first. The emulator must be fully booted; set `ANDROID_SERIAL` if more than one device is connected. The runner starts the shared temporary API and provider fakes, uses `adb reverse` for the emulator, drives the app with Compose UI tests, and checks the saved items in the browser. Use a disposable emulator with no existing FileTasks session. The command fails when prerequisites are missing or the expected shared data was not created.
+Install the Android SDK and platform tools, JDK 17, and the Playwright Chromium browser (`npx playwright install chromium`) first. The emulator must be fully booted; set `ANDROID_SERIAL` if more than one device is connected. The runner starts the shared temporary API and provider fakes, uses `adb reverse` for the emulator, drives the app with Compose UI tests, and checks the saved items in the browser. The calendar UI case checks the Google system-browser URL, Apple connection and disconnection, imported Events and Files, provider errors, and native Sync Calendar recovery after an external edit or deletion. Use a disposable emulator with no existing FileTasks session. The command fails when prerequisites are missing or the expected shared data was not created.
 
 ## Account and data behavior
 
