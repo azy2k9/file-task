@@ -70,6 +70,7 @@ import com.filetasks.android.data.AccountUser
 import com.filetasks.android.data.AgendaRefreshResult
 import com.filetasks.android.data.ApiClient
 import com.filetasks.android.data.ApiException
+import com.filetasks.android.data.CalendarStatus
 import com.filetasks.android.data.ItemFields
 import com.filetasks.android.data.ItemKind
 import com.filetasks.android.data.FileAttachment
@@ -120,7 +121,7 @@ private enum class ItemFilter { All, Tasks, Events }
 private enum class WorkspaceSection { Agenda, Files }
 
 @Composable
-fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) {
+fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, resumeCount: Int = 0) {
     MaterialTheme(colorScheme = lightColorScheme(primary = Color(0xFF315F57))) {
         val preferences = remember(context) {
             context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
@@ -137,6 +138,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
         var workspaceItems by remember { mutableStateOf(emptyList<WorkspaceItem>()) }
         var workspaceFiles by remember { mutableStateOf(emptyList<WorkspaceFile>()) }
         var reminderSettings by remember { mutableStateOf(ReminderSettings.Empty) }
+        var calendarStatus by remember { mutableStateOf(CalendarStatus(emptyList(), emptyList(), emptyList())) }
         var pushDeviceId by remember { mutableStateOf<String?>(null) }
         var initialLoading by remember { mutableStateOf(true) }
         var working by remember { mutableStateOf(false) }
@@ -150,6 +152,8 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
         var workspaceSection by rememberSaveable { mutableStateOf(WorkspaceSection.Agenda.name) }
         var showSettings by remember { mutableStateOf(false) }
         var showReminderSettings by remember { mutableStateOf(false) }
+        var showCalendarSettings by remember { mutableStateOf(false) }
+        var calendarActionMessage by remember { mutableStateOf<String?>(null) }
         var editorTarget by remember { mutableStateOf<EditorTarget?>(null) }
         var confirmDelete by remember { mutableStateOf<WorkspaceItem?>(null) }
         var recurringDeleteScope by rememberSaveable { mutableStateOf("occurrence") }
@@ -165,8 +169,10 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
 
         suspend fun refreshCalendarDeliveryStatus(currentToken: String, outcome: String? = null) {
             try {
-                val statuses = ApiClient(apiBaseUrl).calendarSyncDelivery(currentToken)
+                val status = ApiClient(apiBaseUrl).calendarStatus(currentToken)
                 if (token != currentToken) return
+                calendarStatus = status
+                val statuses = status.syncDelivery
                 if (statuses.isEmpty()) {
                     if (outcome == null) {
                         calendarSyncNotice = null
@@ -228,6 +234,46 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                 if (token == currentToken) refreshCalendarDeliveryStatus(currentToken)
             }
         }
+        LaunchedEffect(resumeCount, token) {
+            val currentToken = token ?: return@LaunchedEffect
+            if (resumeCount < 2) return@LaunchedEffect
+            val currentUserId = user?.id ?: return@LaunchedEffect
+            operationMutex.lock()
+            try {
+                if (token != currentToken || user?.id != currentUserId) return@LaunchedEffect
+                val api = ApiClient(apiBaseUrl)
+                val refreshedItems = api.listItems(currentToken)
+                val refreshedFiles = api.listFiles(currentToken)
+                val status = api.calendarStatus(currentToken)
+                if (token != currentToken || user?.id != currentUserId) return@LaunchedEffect
+                workspaceItems = refreshedItems
+                workspaceFiles = refreshedFiles
+                calendarStatus = status
+                if (calendarActionMessage?.startsWith("In the browser,") == true) {
+                    calendarActionMessage = if (status.calendars.any { it.provider == "google" }) {
+                        "Google Calendar connected. Its status is now refreshed for this FileTasks account."
+                    } else {
+                        "Google Calendar is still disconnected. If you cancelled or used a different FileTasks account in the browser, this account was not changed."
+                    }
+                }
+            } catch (failure: Exception) {
+                if (token == currentToken && user?.id == currentUserId) {
+                    errorMessage = readableError(failure)
+                    if (failure is ApiException && failure.statusCode == 401) {
+                        withContext(Dispatchers.IO) { tokenStore.clear() }
+                        token = null
+                        user = null
+                        workspaceItems = emptyList()
+                        workspaceFiles = emptyList()
+                        reminderSettings = ReminderSettings.Empty
+                        calendarStatus = CalendarStatus(emptyList(), emptyList(), emptyList())
+                        showCalendarSettings = false
+                    }
+                }
+            } finally {
+                operationMutex.unlock()
+            }
+        }
         var handledOpenItemRequest by remember { mutableStateOf<Long?>(null) }
         LaunchedEffect(openItemRequest, workspaceItems) {
             val (itemId, requestId) = openItemRequest ?: return@LaunchedEffect
@@ -257,8 +303,10 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                         workspaceItems = emptyList()
                         workspaceFiles = emptyList()
                         reminderSettings = ReminderSettings.Empty
+                        calendarStatus = CalendarStatus(emptyList(), emptyList(), emptyList())
                         calendarSyncNotice = null
                         calendarNoticeVersion += 1
+                        showCalendarSettings = false
                     } else {
                         recoveryAvailable = true
                         errorMessage = readableError(failure)
@@ -283,9 +331,11 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                         workspaceItems = emptyList()
                         workspaceFiles = emptyList()
                         reminderSettings = ReminderSettings.Empty
+                        calendarStatus = CalendarStatus(emptyList(), emptyList(), emptyList())
                         recoveryAvailable = false
                         calendarSyncNotice = null
                         calendarNoticeVersion += 1
+                        showCalendarSettings = false
                         editorTarget = null
                         confirmDelete = null
                     }
@@ -343,6 +393,9 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
             workspaceItems = emptyList()
             workspaceFiles = emptyList()
             reminderSettings = ReminderSettings.Empty
+            calendarStatus = CalendarStatus(emptyList(), emptyList(), emptyList())
+            calendarActionMessage = null
+            showCalendarSettings = false
             calendarSyncNotice = null
             calendarNoticeVersion += 1
             pushDeviceId = null
@@ -578,6 +631,14 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                 onSignOut = ::signOut,
                 onSettings = { showSettings = true },
                 onReminderSettings = { showReminderSettings = true },
+                onCalendarSettings = {
+                    showCalendarSettings = true
+                    calendarActionMessage = null
+                    val currentToken = token
+                    if (currentToken != null) runAction {
+                        calendarStatus = ApiClient(apiBaseUrl).calendarStatus(currentToken)
+                    }
+                },
                 onCreate = { editorTarget = EditorTarget(null) },
                 onEdit = { editorTarget = EditorTarget(it) },
                 onDelete = { confirmDelete = it },
@@ -673,7 +734,12 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
         confirmDelete?.let { item ->
             AlertDialog(
                 onDismissRequest = { if (!working) confirmDelete = null },
-                title = { Text("Delete ${item.kind.displayName.lowercase()}?") },
+                title = {
+                    Text(
+                        "Delete ${item.kind.displayName.lowercase()}?",
+                        modifier = Modifier.testTag("item.delete.title"),
+                    )
+                },
                 text = {
                     Column {
                         Text("“${item.title}” will be removed from your workspace.")
@@ -690,6 +756,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                 confirmButton = {
                     Button(
                         enabled = !working,
+                        modifier = Modifier.testTag("item.delete.confirm"),
                         onClick = {
                             val currentToken = token
                             if (currentToken != null) {
@@ -906,6 +973,72 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
                 },
             )
         }
+
+        if (showCalendarSettings) {
+            CalendarSettingsDialog(
+                user = user!!,
+                status = calendarStatus,
+                isBusy = working,
+                error = errorMessage,
+                notice = calendarActionMessage,
+                onDismiss = { showCalendarSettings = false },
+                onRefresh = {
+                    val currentToken = token ?: return@CalendarSettingsDialog
+                    runAction {
+                        val api = ApiClient(apiBaseUrl)
+                        workspaceItems = api.listItems(currentToken)
+                        workspaceFiles = api.listFiles(currentToken)
+                        calendarStatus = api.calendarStatus(currentToken)
+                    }
+                },
+                onConnectApple = { username, applePassword, calendarUrl ->
+                    val currentToken = token
+                    if (currentToken != null) runAction {
+                        val api = ApiClient(apiBaseUrl)
+                        api.connectAppleCalendar(currentToken, username, applePassword, calendarUrl)
+                        calendarStatus = api.calendarStatus(currentToken)
+                        calendarActionMessage = "Apple Calendar connected. Credentials are stored by FileTasks securely."
+                        workspaceItems = api.listItems(currentToken)
+                        workspaceFiles = api.listFiles(currentToken)
+                    }
+                },
+                onDisconnect = { provider ->
+                    val currentToken = token
+                    if (currentToken != null) runAction {
+                        val api = ApiClient(apiBaseUrl)
+                        api.disconnectCalendar(currentToken, provider)
+                        calendarStatus = api.calendarStatus(currentToken)
+                        calendarActionMessage = "${provider.replaceFirstChar { it.uppercase() }} Calendar disconnected."
+                    }
+                },
+                onSync = {
+                    val currentToken = token
+                    if (currentToken != null) runAction {
+                        val api = ApiClient(apiBaseUrl)
+                        val result = api.syncCalendars(currentToken)
+                        workspaceItems = api.listItems(currentToken)
+                        workspaceFiles = api.listFiles(currentToken)
+                        calendarStatus = api.calendarStatus(currentToken)
+                        calendarActionMessage = when {
+                            calendarStatus.calendars.isEmpty() -> "Connect a calendar first."
+                            result.synced.isEmpty() -> "Calendar sync finished. No calendars reported changes."
+                            else -> "Synced ${result.synced.joinToString(" and ") { it.replaceFirstChar { char -> char.uppercase() } }} Calendar${if (result.synced.size == 1) "" else "s"}. ${result.eventCount} ${if (result.eventCount == 1) "Event" else "Events"} refreshed." +
+                                if (result.syncLimitations.isNotEmpty()) " ${result.syncLimitations.size} Event sync limitation${if (result.syncLimitations.size == 1) "" else "s"}." else ""
+                        }
+                    }
+                },
+                onOpenGoogleBrowser = {
+                    try {
+                        errorMessage = null
+                        val browserUrl = apiBaseUrl.trimEnd('/') + "/"
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(browserUrl)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        calendarActionMessage = "In the browser, sign in as ${user?.email}, then choose Connect Google Calendar. Return here and refresh the calendar status when finished."
+                    } catch (failure: Exception) {
+                        errorMessage = "Could not open the system browser. ${readableError(failure)}"
+                    }
+                },
+            )
+        }
     }
 }
 
@@ -1001,6 +1134,7 @@ private fun WorkspaceScreen(
     onSignOut: () -> Unit,
     onSettings: () -> Unit,
     onReminderSettings: () -> Unit,
+    onCalendarSettings: () -> Unit,
     onCreate: () -> Unit,
     onEdit: (WorkspaceItem) -> Unit,
     onDelete: (WorkspaceItem) -> Unit,
@@ -1053,6 +1187,7 @@ private fun WorkspaceScreen(
                     TextButton(onClick = onRefresh, enabled = !isBusy) { Text("Refresh") }
                     TextButton(onClick = onSettings, enabled = !isBusy) { Text("Server") }
                     TextButton(onClick = onReminderSettings, enabled = !isBusy) { Text("Reminders") }
+                    TextButton(onClick = onCalendarSettings, enabled = !isBusy) { Text("Calendars") }
                     TextButton(onClick = onSignOut, enabled = !isBusy) { Text("Sign out") }
                 }
                 Spacer(Modifier.height(12.dp))
@@ -1238,7 +1373,7 @@ private fun WorkspaceItemCard(
                     checked = item.completed == true,
                     onCheckedChange = { onToggleTask() },
                     enabled = enabled,
-                    modifier = Modifier.padding(top = 0.dp),
+                    modifier = Modifier.padding(top = 0.dp).testTag("agenda.complete.${item.id}"),
                 )
                 Spacer(Modifier.width(4.dp))
             }
@@ -1287,7 +1422,11 @@ private fun WorkspaceItemCard(
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.align(Alignment.End)) {
                     TextButton(onClick = onEdit, enabled = enabled, modifier = Modifier.testTag("agenda.edit.${item.id}")) { Text("Edit") }
-                    TextButton(onClick = onDelete, enabled = enabled) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+                    TextButton(
+                        onClick = onDelete,
+                        enabled = enabled,
+                        modifier = Modifier.testTag("agenda.delete.${item.id}"),
+                    ) { Text("Delete", color = MaterialTheme.colorScheme.error) }
                 }
             }
         }
@@ -1408,6 +1547,7 @@ private fun ItemEditorDialog(
                             if (item == null && !reminderRowsTouched) reminders = reminderSettings.eventReminders
                         },
                         enabled = item == null && !saving && !isBusy,
+                        modifier = Modifier.testTag("item.editor.kind.event"),
                         label = { Text("Event") },
                     )
                 }
@@ -1658,6 +1798,139 @@ private fun SettingsDialog(
             }) { Text("Save") }
         },
         dismissButton = { TextButton(enabled = !isBusy, onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun CalendarSettingsDialog(
+    user: AccountUser,
+    status: CalendarStatus,
+    isBusy: Boolean,
+    error: String?,
+    notice: String?,
+    onDismiss: () -> Unit,
+    onRefresh: () -> Unit,
+    onConnectApple: (String, String, String) -> Unit,
+    onDisconnect: (String) -> Unit,
+    onSync: () -> Unit,
+    onOpenGoogleBrowser: () -> Unit,
+) {
+    var appleUsername by rememberSaveable { mutableStateOf("") }
+    var applePassword by remember { mutableStateOf("") }
+    var calendarUrl by rememberSaveable { mutableStateOf("") }
+    LaunchedEffect(user.id) { applePassword = "" }
+    val hasGoogle = status.calendars.any { it.provider == "google" }
+    val hasApple = status.calendars.any { it.provider == "apple" }
+    AlertDialog(
+        onDismissRequest = { if (!isBusy) { applePassword = ""; onDismiss() } },
+        title = { Text("Connected calendars") },
+        text = {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 600.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text("Calendar connections for ${user.email}", style = MaterialTheme.typography.bodySmall)
+                Text("Sync Calendar keeps FileTasks Events authoritative. Imported Events and their Files stay in your workspace.")
+                status.calendars.forEach { calendar ->
+                    Row(
+                        Modifier.fillMaxWidth().testTag("calendar.connection.${calendar.provider}"),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(if (calendar.provider == "google") "Google Calendar" else "Apple Calendar", fontWeight = FontWeight.SemiBold)
+                            Text(calendar.accountLabel, style = MaterialTheme.typography.bodySmall)
+                        }
+                        TextButton(
+                            enabled = !isBusy,
+                            modifier = Modifier.testTag("calendar.disconnect.${calendar.provider}"),
+                            onClick = { onDisconnect(calendar.provider) },
+                        ) { Text("Disconnect") }
+                    }
+                }
+                if (!hasGoogle) {
+                    Text("Google Calendar", fontWeight = FontWeight.SemiBold)
+                    Text("Continue in your system browser. Sign in to FileTasks there as ${user.email}, then use Connect Google Calendar. Your Android session token is never sent to the browser.", style = MaterialTheme.typography.bodySmall)
+                    Button(
+                        enabled = !isBusy,
+                        modifier = Modifier.testTag("calendar.connect.google"),
+                        onClick = onOpenGoogleBrowser,
+                    ) { Text("Connect Google Calendar") }
+                }
+                if (!hasApple) {
+                    Text("Apple Calendar", fontWeight = FontWeight.SemiBold)
+                    OutlinedTextField(
+                        value = appleUsername,
+                        onValueChange = { appleUsername = it },
+                        modifier = Modifier.fillMaxWidth().testTag("calendar.apple.username"),
+                        label = { Text("Apple ID") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email, imeAction = ImeAction.Next),
+                        enabled = !isBusy,
+                    )
+                    OutlinedTextField(
+                        value = applePassword,
+                        onValueChange = { applePassword = it },
+                        modifier = Modifier.fillMaxWidth().testTag("calendar.apple.password"),
+                        label = { Text("App-specific password") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Next),
+                        enabled = !isBusy,
+                    )
+                    OutlinedTextField(
+                        value = calendarUrl,
+                        onValueChange = { calendarUrl = it },
+                        modifier = Modifier.fillMaxWidth().testTag("calendar.apple.url"),
+                        label = { Text("CalDAV calendar URL (optional)") },
+                        placeholder = { Text("Discover from iCloud when blank") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Done),
+                        enabled = !isBusy,
+                    )
+                    Button(
+                        enabled = !isBusy && appleUsername.isNotBlank() && applePassword.isNotBlank(),
+                        modifier = Modifier.testTag("calendar.connect.apple"),
+                        onClick = {
+                            val submittedPassword = applePassword
+                            applePassword = ""
+                            onConnectApple(appleUsername.trim(), submittedPassword, calendarUrl.trim())
+                        },
+                    ) { Text("Connect Apple Calendar") }
+                    Text("Credentials are sent to FileTasks over the configured server connection and are retained only in encrypted server storage.", style = MaterialTheme.typography.bodySmall)
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Button(enabled = !isBusy && status.calendars.isNotEmpty(), modifier = Modifier.testTag("calendar.sync"), onClick = onSync) {
+                        Text(if (isBusy) "Syncing…" else "Sync Calendar")
+                    }
+                    TextButton(enabled = !isBusy, modifier = Modifier.testTag("calendar.refresh"), onClick = onRefresh) { Text("Refresh status") }
+                }
+                status.syncDelivery.forEach { delivery ->
+                    val provider = if (delivery.provider == "google") "Google" else "Apple"
+                    Text(
+                        "$provider Calendar delivery ${delivery.state}." +
+                            (delivery.lastError?.let { " $it" } ?: "") +
+                            if (!delivery.connected) " Reconnect this calendar to resume retries." else "",
+                        modifier = Modifier.testTag("calendar.delivery.${delivery.provider}"),
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                if (status.syncLimitations.isNotEmpty()) {
+                    Text("Event sync limitations", fontWeight = FontWeight.SemiBold)
+                    status.syncLimitations.forEach { limitation ->
+                        Text(
+                            "${limitation.title} · ${if (limitation.provider == "google") "Google" else "Apple"}: ${limitation.message}",
+                            modifier = Modifier.testTag("calendar.limitation.${limitation.itemId}.${limitation.provider}"),
+                            color = MaterialTheme.colorScheme.tertiary,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+                notice?.let { Text(it, modifier = Modifier.testTag("calendar.notice"), color = MaterialTheme.colorScheme.tertiary) }
+                error?.let { Text(it, modifier = Modifier.testTag("calendar.error"), color = MaterialTheme.colorScheme.error) }
+            }
+        },
+        confirmButton = { TextButton(enabled = !isBusy, onClick = onDismiss) { Text("Done") } },
     )
 }
 

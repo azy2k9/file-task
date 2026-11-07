@@ -8,13 +8,19 @@ import com.filetasks.android.ui.FileTasksApp
 
 class MainActivity : ComponentActivity() {
     private val openItemRequest = mutableStateOf<Pair<String, Long>?>(null)
+    private val resumeCount = mutableStateOf(0)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setOpenItemRequest(intent)
         setContent {
-            FileTasksApp(applicationContext, openItemRequest.value)
+            FileTasksApp(applicationContext, openItemRequest.value, resumeCount.value)
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumeCount.value += 1
     }
 
     override fun onNewIntent(intent: android.content.Intent) {

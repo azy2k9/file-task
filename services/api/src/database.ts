@@ -61,9 +61,59 @@ export function database() {
         connection_scope_id TEXT NOT NULL,
         event_id TEXT NOT NULL,
         ownership_token TEXT NOT NULL,
+        attempted INTEGER NOT NULL DEFAULT 0 CHECK(attempted IN (0,1)),
+        active_attempts INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(user_id,item_id,provider,connection_scope_id),
         FOREIGN KEY(user_id,item_id) REFERENCES items(user_id,id) ON DELETE CASCADE
       );
+      CREATE TABLE IF NOT EXISTS apple_creation_reservations (
+        user_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        provider TEXT NOT NULL CHECK(provider = 'apple'),
+        connection_scope_id TEXT NOT NULL,
+        resource_uid TEXT NOT NULL,
+        attempted INTEGER NOT NULL DEFAULT 0 CHECK(attempted IN (0,1)),
+        active_attempts INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(user_id,item_id,provider,connection_scope_id),
+        UNIQUE(user_id,provider,connection_scope_id,resource_uid),
+        FOREIGN KEY(user_id,item_id) REFERENCES items(user_id,id) ON DELETE CASCADE
+      );
+      CREATE TABLE IF NOT EXISTS calendar_creation_cleanup (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL CHECK(provider IN ('google','apple')),
+        connection_scope_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        external_id TEXT NOT NULL,
+        ownership_token TEXT,
+        uncertain INTEGER NOT NULL DEFAULT 0 CHECK(uncertain IN (0,1)),
+        pending_attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(user_id,provider,connection_scope_id,item_id)
+      );
+      CREATE TABLE IF NOT EXISTS calendar_creation_attempts (
+        attempt_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        provider TEXT NOT NULL CHECK(provider IN ('google','apple')),
+        connection_scope_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        external_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('active','uncertain','resolved')),
+        started_at INTEGER NOT NULL,
+        resolved_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS calendar_creation_attempts_identity
+        ON calendar_creation_attempts(user_id,provider,connection_scope_id,item_id,external_id,status);
+      CREATE TABLE IF NOT EXISTS calendar_schema_migrations (name TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS calendar_export_locks (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL CHECK(provider IN ('google','apple')),
+        connection_scope_id TEXT NOT NULL,
+        owner_token TEXT NOT NULL,
+        fence INTEGER NOT NULL,
+        lease_until INTEGER NOT NULL,
+        PRIMARY KEY(user_id,provider,connection_scope_id)
+      );
+      CREATE INDEX IF NOT EXISTS calendar_export_locks_lease ON calendar_export_locks(lease_until);
       CREATE TABLE IF NOT EXISTS user_preferences (
         user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
         task_reminders TEXT NOT NULL DEFAULT '[]', event_reminders TEXT NOT NULL DEFAULT '[]',
@@ -280,6 +330,71 @@ export function database() {
     db.exec("DROP TABLE IF EXISTS calendar_oauth_states");
     const copyColumns = new Set(db.prepare("PRAGMA table_info(calendar_copies)").all().map((column) => String(column.name)));
     if (!copyColumns.has("resource_uid")) db.exec("ALTER TABLE calendar_copies ADD COLUMN resource_uid TEXT");
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const cleanupColumns = new Set(db.prepare("PRAGMA table_info(calendar_creation_cleanup)").all().map((entry) => String(entry.name)));
+      if (!cleanupColumns.has("next_attempt_at")) db.exec("ALTER TABLE calendar_creation_cleanup ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0");
+      for (const [table,column] of [["google_creation_reservations","attempted"],["apple_creation_reservations","attempted"],["calendar_creation_cleanup","uncertain"],
+        ["google_creation_reservations","active_attempts"],["apple_creation_reservations","active_attempts"],["calendar_creation_cleanup","pending_attempts"]]) {
+        const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((entry) => String(entry.name)));
+        if (!columns.has(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0${column === "attempted" || column === "uncertain" ? " CHECK("+column+" IN (0,1))" : ""}`);
+      }
+      // Older rows recorded only a boolean. Migrate that uncertainty once; do
+      // not reinterpret a settled reservation as active on every process start.
+      const attemptMigration=db.prepare("SELECT 1 FROM calendar_schema_migrations WHERE name='calendar-attempt-identities-v1'").get();
+      if (!attemptMigration) {
+        db.exec(`UPDATE google_creation_reservations SET active_attempts=MAX(active_attempts,attempted);
+          UPDATE apple_creation_reservations SET active_attempts=MAX(active_attempts,attempted);
+          UPDATE calendar_creation_cleanup SET pending_attempts=MAX(pending_attempts,uncertain)`);
+        db.prepare("INSERT INTO calendar_schema_migrations(name) VALUES('calendar-attempt-identities-v1')").run();
+      }
+      // Replace the deletion trigger in the same write transaction as the attempt
+      // migration. No process can delete an Event between the snapshot and swap.
+      db.exec("DROP TRIGGER IF EXISTS preserve_calendar_creation_before_item_delete");
+      db.exec(`CREATE TRIGGER preserve_calendar_creation_before_item_delete
+      BEFORE DELETE ON items BEGIN
+        INSERT INTO calendar_creation_cleanup(user_id,provider,connection_scope_id,item_id,external_id,ownership_token,uncertain,pending_attempts)
+          SELECT r.user_id,'google',r.connection_scope_id,r.item_id,r.event_id,r.ownership_token,CASE WHEN r.active_attempts>0 THEN 1 ELSE r.attempted END,r.active_attempts
+          FROM google_creation_reservations r WHERE r.user_id=OLD.user_id AND r.item_id=OLD.id
+        ON CONFLICT(user_id,provider,connection_scope_id,item_id) DO UPDATE SET
+          external_id=excluded.external_id,ownership_token=excluded.ownership_token,uncertain=MAX(calendar_creation_cleanup.uncertain,excluded.uncertain),pending_attempts=MAX(calendar_creation_cleanup.pending_attempts,excluded.pending_attempts);
+        INSERT INTO calendar_creation_cleanup(user_id,provider,connection_scope_id,item_id,external_id,ownership_token,uncertain,pending_attempts)
+          SELECT r.user_id,'apple',r.connection_scope_id,r.item_id,r.resource_uid,NULL,CASE WHEN r.active_attempts>0 THEN 1 ELSE r.attempted END,r.active_attempts
+          FROM apple_creation_reservations r WHERE r.user_id=OLD.user_id AND r.item_id=OLD.id
+        ON CONFLICT(user_id,provider,connection_scope_id,item_id) DO UPDATE SET
+          external_id=excluded.external_id,uncertain=MAX(calendar_creation_cleanup.uncertain,excluded.uncertain),pending_attempts=MAX(calendar_creation_cleanup.pending_attempts,excluded.pending_attempts);
+      END`);
+      if (!attemptMigration) {
+        for (const table of ["google_creation_reservations", "apple_creation_reservations"]) {
+          const rows = db.prepare(`SELECT user_id,provider,connection_scope_id,item_id,${table === "google_creation_reservations" ? "event_id" : "resource_uid"} AS external_id,active_attempts FROM ${table} WHERE active_attempts>0`).all() as {user_id:string;provider:string;connection_scope_id:string;item_id:string;external_id:string;active_attempts:number}[];
+          for (const row of rows) {
+            for (let index=0; index<row.active_attempts; index++) db.prepare(`INSERT INTO calendar_creation_attempts(attempt_id,user_id,provider,connection_scope_id,item_id,external_id,status,started_at)
+              VALUES(?,?,?,?,?,?,'uncertain',?)`).run(randomUUID(),row.user_id,row.provider,row.connection_scope_id,row.item_id,row.external_id,Date.now());
+          }
+          db.prepare(`UPDATE ${table} SET active_attempts=0,attempted=CASE WHEN active_attempts>0 THEN 1 ELSE attempted END WHERE active_attempts>0`).run();
+        }
+        const cleanupAttempts=db.prepare("SELECT user_id,provider,connection_scope_id,item_id,external_id,pending_attempts FROM calendar_creation_cleanup WHERE pending_attempts>0")
+          .all() as {user_id:string;provider:string;connection_scope_id:string;item_id:string;external_id:string;pending_attempts:number}[];
+        for (const row of cleanupAttempts) for (let index=0; index<row.pending_attempts; index++) {
+          db.prepare(`INSERT INTO calendar_creation_attempts(attempt_id,user_id,provider,connection_scope_id,item_id,external_id,status,started_at)
+            VALUES(?,?,?,?,?,?,'uncertain',?)`).run(randomUUID(),row.user_id,row.provider,row.connection_scope_id,row.item_id,row.external_id,Date.now());
+        }
+        db.prepare("UPDATE calendar_creation_cleanup SET pending_attempts=0,uncertain=1 WHERE pending_attempts>0").run();
+      }
+      // On process startup, any prior active attempt is treated as uncertain.
+      // Other replicas may still complete it; its distinct identity lets that
+      // response resolve only its own row without decrementing another attempt.
+      const recoveredAttempts=db.prepare("UPDATE calendar_creation_attempts SET status='uncertain' WHERE status='active'").run();
+      if (recoveredAttempts.changes) {
+        db.prepare(`UPDATE google_creation_reservations SET active_attempts=(SELECT count(*) FROM calendar_creation_attempts a WHERE a.user_id=google_creation_reservations.user_id AND a.item_id=google_creation_reservations.item_id AND a.provider='google' AND a.connection_scope_id=google_creation_reservations.connection_scope_id AND a.external_id=google_creation_reservations.event_id AND a.status='active')`).run();
+        db.prepare(`UPDATE apple_creation_reservations SET active_attempts=(SELECT count(*) FROM calendar_creation_attempts a WHERE a.user_id=apple_creation_reservations.user_id AND a.item_id=apple_creation_reservations.item_id AND a.provider='apple' AND a.connection_scope_id=apple_creation_reservations.connection_scope_id AND a.external_id=apple_creation_reservations.resource_uid AND a.status='active')`).run();
+        db.prepare("UPDATE calendar_creation_cleanup SET pending_attempts=0,uncertain=1 WHERE pending_attempts>0").run();
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      try { db.exec("ROLLBACK"); } catch { /* Preserve the trigger replacement error. */ }
+      throw error;
+    }
     const attachmentColumns = new Set(db.prepare("PRAGMA table_info(attachments)").all().map((column) => String(column.name)));
     if (!attachmentColumns.has("scope")) db.exec("ALTER TABLE attachments ADD COLUMN scope TEXT NOT NULL DEFAULT 'occurrence' CHECK(scope IN ('occurrence','series'))");
     globalDatabase.filetasksDatabase = db;

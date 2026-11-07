@@ -332,6 +332,7 @@ struct WorkspaceView: View {
                             Task { await model.delete(item) }
                             itemPendingDeletion = nil
                         }
+                        .accessibilityIdentifier("agenda.delete.confirm")
                     }
                 }
                 Button("Cancel", role: .cancel) { itemPendingDeletion = nil }
@@ -509,6 +510,7 @@ struct WorkspaceView: View {
         } label: {
             Label("Delete", systemImage: "trash")
         }
+        .accessibilityIdentifier("agenda.delete.\(item.title)")
     }
 
     @ViewBuilder
@@ -526,7 +528,7 @@ struct WorkspaceView: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel(item.completed == true ? "Reopen Task" : "Complete Task")
+                .accessibilityLabel(item.completed == true ? "Reopen Task: \(item.title)" : "Complete Task: \(item.title)")
             } else {
                 Image(systemName: "calendar")
                     .font(.body)
@@ -549,6 +551,7 @@ struct WorkspaceView: View {
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
                             .background(item.kind == .task ? Color.blue.opacity(0.12) : Color.purple.opacity(0.12), in: Capsule())
+                            .accessibilityIdentifier("agenda.kind.\(item.title)")
                     }
                     if !item.details.isEmpty {
                         Text(item.details)
@@ -571,6 +574,7 @@ struct WorkspaceView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("agenda.open.\(item.title)")
             .accessibilityHint("Opens item details")
           }
           ForEach(item.files) { file in
