@@ -5,6 +5,7 @@ import { listItems } from "./workspace";
 import { reminderSettings } from "./reminder-settings";
 import type { ReminderRule, WorkspaceItem } from "./items";
 import { now, nowMs } from "./clock";
+import { processPendingPushCleanup } from "./push-devices";
 
 function zonedWallTime(date: string, time: string) {
   const zone = process.env.FILETASKS_TIME_ZONE || "UTC";
@@ -106,6 +107,7 @@ function deliverableJobs(userId: string, items: WorkspaceItem[], now: number) {
 export async function processDueReminders() {
   const db = database();
   const currentTime = nowMs();
+  await processPendingPushCleanup();
   let attempted = 0;
   let sent = 0;
   let failed = 0;
@@ -126,6 +128,10 @@ export async function processDueReminders() {
     }[];
   for (const job of pending) {
     if (!pendingIds.has(job.id)) continue;
+    if (job.channel === "push" && !db.prepare("SELECT 1 FROM push_devices WHERE id=? AND user_id=(SELECT user_id FROM reminder_deliveries WHERE id=?)").get(job.targetId, job.id)) {
+      db.prepare("DELETE FROM reminder_deliveries WHERE id=? AND status='pending'").run(job.id);
+      continue;
+    }
     attempted++;
     try {
       if (job.channel === "push" && !job.providerId) throw new Error("The registered push device is no longer available.");

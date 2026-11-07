@@ -37,6 +37,7 @@
 		B1000000000000000000000C /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B1000000000000000000000D /* FileTasks.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FileTasks.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B1000000000000000000000E /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		B1000000000000000000000F /* FileTasks-Personal.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "FileTasks-Personal.entitlements"; sourceTree = "<group>"; };
 		B20000000000000000000001 /* FileTasksUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FileTasksUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		B20000000000000000000002 /* FileTasksUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTasksUITests.swift; sourceTree = "<group>"; };
 		B20000000000000000000003 /* XCTest.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = XCTest.framework; path = Platforms/iPhoneSimulator.platform/Developer/Library/Frameworks/XCTest.framework; sourceTree = DEVELOPER_DIR; };
@@ -65,6 +66,7 @@
 			children = (
 				B10000000000000000000001 /* FileTasksApp.swift */,
 				B1000000000000000000000C /* Info.plist */,
+				B1000000000000000000000F /* FileTasks-Personal.entitlements */,
 				D10000000000000000000004 /* Domain */,
 				D10000000000000000000005 /* Networking */,
 				D10000000000000000000006 /* Security */,
@@ -283,6 +285,18 @@
 			};
 			name = Release;
 		};
+		F10000000000000000000007 /* Project Personal Team */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+			};
+			name = "Personal Team";
+		};
 		F10000000000000000000003 /* Target Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -321,6 +335,24 @@
 			};
 			name = Release;
 		};
+		F10000000000000000000008 /* Target Personal Team */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_ENTITLEMENTS = "FileTasks/FileTasks-Personal.entitlements";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = FileTasks/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.filetasks.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = "Personal Team";
+		};
 		F20000000000000000000001 /* FileTasksUITests Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -353,6 +385,22 @@
 			};
 			name = Release;
 		};
+		F20000000000000000000004 /* FileTasksUITests Personal Team */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.filetasks.ios.uitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = FileTasks;
+			};
+			name = "Personal Team";
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -361,6 +409,7 @@
 			buildConfigurations = (
 				F10000000000000000000001 /* Project Debug */,
 				F10000000000000000000002 /* Project Release */,
+				F10000000000000000000007 /* Project Personal Team */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
@@ -370,6 +419,7 @@
 			buildConfigurations = (
 				F10000000000000000000003 /* Target Debug */,
 				F10000000000000000000004 /* Target Release */,
+				F10000000000000000000008 /* Target Personal Team */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
@@ -379,6 +429,7 @@
 			buildConfigurations = (
 				F20000000000000000000001 /* FileTasksUITests Debug */,
 				F20000000000000000000002 /* FileTasksUITests Release */,
+				F20000000000000000000004 /* FileTasksUITests Personal Team */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

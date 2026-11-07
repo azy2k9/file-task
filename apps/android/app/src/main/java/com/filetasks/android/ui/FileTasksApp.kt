@@ -331,27 +331,52 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null) 
         fun signOut() {
             val currentToken = token
             val currentUserId = user?.id
-            runAction {
-                if (currentToken != null) {
-                    val api = ApiClient(apiBaseUrl)
-                    if (currentUserId != null) {
-                        val key = PushMessagingService.pushDeviceKey(currentUserId)
-                        pushDeviceId?.let { deviceId -> api.revokePushDevice(currentToken, PushDevice(deviceId, "android", "")) }
-                        preferences.edit().remove(key).remove(PushMessagingService.pushFidKey(currentUserId)).putBoolean("push_enabled", false).putBoolean("push_device_revoked", true).apply()
-                    }
-                    runCatching { FirebaseMessaging.getInstance().unregister().await() }
-                    runCatching { api.logout(currentToken) }
-                }
+            if (!operationMutex.tryLock()) return
+            val currentApiUrl = apiBaseUrl
+            val currentDeviceId = pushDeviceId
+            working = true
+            errorMessage = null
+
+            // Remove account data and credentials before attempting any network cleanup.
+            token = null
+            user = null
+            workspaceItems = emptyList()
+            workspaceFiles = emptyList()
+            reminderSettings = ReminderSettings.Empty
+            calendarSyncNotice = null
+            calendarNoticeVersion += 1
+            pushDeviceId = null
+            recoveryAvailable = false
+            if (currentUserId != null) {
+                preferences.edit()
+                    .remove(PushMessagingService.pushDeviceKey(currentUserId))
+                    .remove(PushMessagingService.pushFidKey(currentUserId))
+                    .putBoolean("push_enabled", false)
+                    .putBoolean("push_device_revoked", true)
+                    .apply()
+            }
+
+            scope.launch {
                 withContext(Dispatchers.IO) { tokenStore.clear() }
-                token = null
-                user = null
-                workspaceItems = emptyList()
-                workspaceFiles = emptyList()
-                reminderSettings = ReminderSettings.Empty
-                calendarSyncNotice = null
-                calendarNoticeVersion += 1
-                pushDeviceId = null
-                recoveryAvailable = false
+                working = false
+                operationMutex.unlock()
+
+                var remoteCleanupFailed = false
+                if (currentToken != null) {
+                    val api = ApiClient(currentApiUrl)
+                    if (currentUserId != null && currentDeviceId != null) {
+                        val revokeFailure = runCatching {
+                                api.revokePushDevice(currentToken, PushDevice(currentDeviceId, "android", ""))
+                            }.exceptionOrNull()
+                        if (revokeFailure != null && (revokeFailure as? ApiException)?.statusCode != 404) {
+                            remoteCleanupFailed = true
+                        }
+                    }
+                    if (runCatching { api.logout(currentToken) }.isFailure) remoteCleanupFailed = true
+                }
+                if (remoteCleanupFailed && token == null) {
+                    errorMessage = "Signed out on this device. Remote session and push cleanup could not be confirmed."
+                }
             }
         }
 
