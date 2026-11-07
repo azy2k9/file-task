@@ -202,8 +202,13 @@ class RecurringAgendaUiTest {
     }
 
     private fun editSimpleItem(item: WorkspaceItem, title: String, details: String) {
+        waitFor("any previous editor to close before editing a simple item") { !hasOpenDialog() }
         compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
-        compose.onNodeWithTag("agenda.edit.${item.id}").performClick()
+        val editButton = compose.onNodeWithTag("agenda.edit.${item.id}")
+        waitFor("the simple item edit action to be displayed and enabled") {
+            runCatching { editButton.assertIsDisplayed(); editButton.assertIsEnabled() }.isSuccess
+        }
+        editButton.performClick()
         waitFor("the simple item edit dialog to open") { hasDialogTitle("Edit item") }
         compose.onNodeWithText("Title").performTextClearance()
         compose.onNodeWithText("Title").performTextInput(title)
