@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Scheme LastUpgradeVersion="1500" version="1.7">
+   <BuildAction parallelizeBuildables="YES" buildImplicitDependencies="YES">
+      <BuildActionEntries>
+         <BuildActionEntry buildForTesting="YES" buildForRunning="YES" buildForProfiling="YES" buildForArchiving="YES" buildForAnalyzing="YES">
+            <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="E10000000000000000000001" BuildableName="FileTasks.app" BlueprintName="FileTasks" ReferencedContainer="container:FileTasks.xcodeproj"/>
+         </BuildActionEntry>
+         <BuildActionEntry buildForTesting="YES" buildForRunning="NO" buildForProfiling="NO" buildForArchiving="NO" buildForAnalyzing="YES">
+            <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="E20000000000000000000001" BuildableName="FileTasksUITests.xctest" BlueprintName="FileTasksUITests" ReferencedContainer="container:FileTasks.xcodeproj"/>
+         </BuildActionEntry>
+      </BuildActionEntries>
+   </BuildAction>
+   <TestAction buildConfiguration="Personal Team" selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier="Xcode.DebuggerFoundation.Launcher.LLDB" shouldUseLaunchSchemeArgsEnv="YES">
+      <Testables>
+         <TestableReference skipped="NO" parallelizable="NO">
+            <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="E20000000000000000000001" BuildableName="FileTasksUITests.xctest" BlueprintName="FileTasksUITests" ReferencedContainer="container:FileTasks.xcodeproj"/>
+         </TestableReference>
+      </Testables>
+      <MacroExpansion>
+         <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="E10000000000000000000001" BuildableName="FileTasks.app" BlueprintName="FileTasks" ReferencedContainer="container:FileTasks.xcodeproj"/>
+      </MacroExpansion>
+   </TestAction>
+   <LaunchAction buildConfiguration="Personal Team" selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier="Xcode.DebuggerFoundation.Launcher.LLDB" launchStyle="0" useCustomWorkingDirectory="NO" ignoresPersistentStateOnLaunch="NO" debugDocumentVersioning="YES" debugServiceExtension="internal" allowLocationSimulation="YES">
+      <BuildableProductRunnable runnableDebuggingMode="0">
+         <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="E10000000000000000000001" BuildableName="FileTasks.app" BlueprintName="FileTasks" ReferencedContainer="container:FileTasks.xcodeproj"/>
+      </BuildableProductRunnable>
+   </LaunchAction>
+   <ProfileAction buildConfiguration="Personal Team" shouldUseLaunchSchemeArgsEnv="YES" savedToolIdentifier="" useCustomWorkingDirectory="NO" debugDocumentVersioning="YES">
+      <BuildableProductRunnable runnableDebuggingMode="0">
+         <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="E10000000000000000000001" BuildableName="FileTasks.app" BlueprintName="FileTasks" ReferencedContainer="container:FileTasks.xcodeproj"/>
+      </BuildableProductRunnable>
+   </ProfileAction>
+   <AnalyzeAction buildConfiguration="Personal Team"/>
+   <ArchiveAction buildConfiguration="Personal Team" revealArchiveInOrganizer="YES"/>
+</Scheme>

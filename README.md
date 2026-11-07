@@ -59,7 +59,9 @@ Run the focused real-app iOS acceptance with `npm run test:ios-ui` on macOS with
 
 Run the focused Android recurring-agenda UI acceptance with `npm run test:android-ui` on a fresh, booted emulator with the Android SDK, JDK 17, and Playwright Chromium installed. It uses the shared temporary backend, controlled clock, and provider fakes; creates and edits recurring items through the app; and checks saved values in the browser. See [Android acceptance prerequisites](apps/android/README.md#acceptance-tests).
 
-CI checks the web application, runs the focused iOS and Android UI acceptances, and compiles both native projects with their platform SDKs. Native builds require their respective toolchains; a web build does not validate SwiftUI or Android code.
+Run the complete required cross-client workflow with `npm run test:shared-acceptance` on macOS with Xcode, an iOS Simulator runtime, a fresh booted Android emulator, Android SDK, JDK 17, and Playwright Chromium. It runs every web test file, the native client workflow, and both real app UI workflows using one temporary backend and provider fakes. The Android and iOS UI phases use the same account, and the browser checks items produced by both. To limit resource use it pauses the selected Android emulator outside its phases, then restores it on exit, and boots the disposable iOS Simulator for its phase. The command fails if a native phase or any test is skipped. Select one emulator with `ANDROID_SERIAL` if needed; port 3107 must be available for both the API and emulator port forwarding.
+
+CI runs this shared acceptance workflow alongside standalone web checks, dependency audit, native builds, and focused native UI runs. Native builds require their respective toolchains; a web build does not validate SwiftUI or Android code.
 
 See [the API contract](docs/api.md) for the shared client interface.
 

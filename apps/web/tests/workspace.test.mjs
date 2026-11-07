@@ -12,8 +12,10 @@ import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { chromium, expect } from "@playwright/test";
 import { stopTrackedProcessGroups, terminateProcessGroup, waitForProcessGroupExit } from "../../../scripts/test-ios-ui.mjs";
+import { setEmulatorRunning } from "../../../scripts/emulator-control.mjs";
 
 let server;
+let sharedUIOwner;
 let deliveryServer;
 let deliveryStopPromise;
 let uiAcceptanceBrowser;
@@ -25,6 +27,10 @@ let deliveryBase;
 let deliveryRequests = [];
 let deliveredKeys = new Set();
 let failNextEmail = 0;
+let failNextPushRevoke = 0;
+let holdNextPushRevoke = null;
+let pushRegistrationIds = new Map();
+let activePushRegistrations = new Set();
 let failNextGoogleRequest = null;
 let failNextAppleRequest = null;
 let loseNextGooglePostResponse = false;
@@ -50,7 +56,7 @@ let testClock = new Date("2026-10-13T12:00:00.000Z");
 let serverTimeZone = "UTC";
 const serverReadinessTimeoutMs = 120_000;
 const serverReadinessProbeTimeoutMs = 10_000;
-const serverShutdownTimeoutMs = 2_000;
+const serverShutdownTimeoutMs = process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1" ? 10_000 : 2_000;
 const setupShutdownTimeoutMs = 10_000;
 const commandShutdownTimeoutMs = 2_000;
 const browserShutdownTimeoutMs = 5_000;
@@ -294,7 +300,7 @@ async function startServerDuringSetup(setup) {
   logs = "";
   let child;
   try {
-    child = spawn(process.execPath, [nextBin, "dev", "--port", "3107"], {
+    child = spawn(process.execPath, [nextBin, "dev", ...(process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1" ? ["--webpack"] : []), "--port", "3107"], {
       cwd: projectRoot,
       detached: process.platform !== "win32",
       env: {
@@ -413,6 +419,10 @@ async function startDeliveryFakeDuringSetup(setup) {
   deliveryRequests = [];
   deliveredKeys = new Set();
   failNextEmail = 0;
+  failNextPushRevoke = 0;
+  holdNextPushRevoke = null;
+  pushRegistrationIds = new Map();
+  activePushRegistrations = new Set();
   failNextGoogleRequest = null;
   failNextAppleRequest = null;
   providerRequests = [];
@@ -502,6 +512,20 @@ async function startDeliveryFakeDuringSetup(setup) {
     if (url.pathname === "/email" && body.operation === "deliver" && failNextEmail > 0) {
       failNextEmail--;
       response.writeHead(503).end();
+      return;
+    }
+    if (url.pathname === "/push" && body.operation === "revoke" && failNextPushRevoke > 0) {
+      failNextPushRevoke--;
+      response.writeHead(503).end();
+      return;
+    }
+    if (url.pathname === "/push" && body.operation === "revoke" && holdNextPushRevoke) {
+      const gate = holdNextPushRevoke;
+      holdNextPushRevoke = null;
+      gate.started();
+      await gate.releasePromise;
+      activePushRegistrations.delete(body.registrationId);
+      response.writeHead(200).end();
       return;
     }
     if (url.pathname === "/google-token") {
@@ -630,6 +654,16 @@ async function startDeliveryFakeDuringSetup(setup) {
         response.writeHead(204).end();
         return;
       }
+    }
+    if (url.pathname === "/push" && body.operation === "register") {
+      let registrationId = pushRegistrationIds.get(idempotencyKey);
+      if (!registrationId) {
+        registrationId = `fake-${crypto.randomUUID()}`;
+        pushRegistrationIds.set(idempotencyKey, registrationId);
+      }
+      activePushRegistrations.add(registrationId);
+      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ registrationId }));
+      return;
     }
     if (body.operation === "register") {
       response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ registrationId: `fake-${crypto.randomUUID()}` }));
@@ -1341,9 +1375,120 @@ test("Email and push deliveries retry with a stable idempotency key and can be r
   assert.equal(deliveredKeys.size, 2);
 
   assert.equal((await request(`/api/devices/push/${device.id}`, { token: owner.token, method: "DELETE" })).status, 204);
+  const cleanupDb = new DatabaseSync(join(directory, "workspace.sqlite"));
+  assert.equal(cleanupDb.prepare("SELECT count(*) AS count FROM push_cleanup_jobs").get().count, 1,
+    "revocation should be durably queued before provider cleanup runs");
+  cleanupDb.close();
+  await runReminderWorker();
   assert.equal(deliveryRequests.some(({ body }) => body.operation === "revoke" && body.registrationId), true);
   assert.equal((await request(`/api/devices/push/${device.id}`, { token: owner.token, method: "DELETE" })).status, 404);
   assert.equal(item.kind, "event");
+});
+
+test("push revoke is durable during provider outages and remains scoped to the signed-out device", async () => {
+  const owner = await account();
+  const providerStart = providerRequests.length;
+  const anotherSession = await request("/api/auth/login", { method: "POST", body: {
+    email: owner.user.email, password: "correct-horse-battery",
+  } });
+  const otherSession = await anotherSession.json();
+  const otherAccount = await account();
+  await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: { pushEnabled: true } });
+  await request("/api/settings/reminders", { token: otherAccount.token, method: "PATCH", body: { pushEnabled: true } });
+  const revokedResponse = await request("/api/devices/push", { token: owner.token, method: "POST", body: {
+    platform: "ios", token: `revoked-${crypto.randomUUID()}`,
+  } });
+  const retainedResponse = await request("/api/devices/push", { token: owner.token, method: "POST", body: {
+    platform: "ios", token: `retained-${crypto.randomUUID()}`,
+  } });
+  const otherDeviceResponse = await request("/api/devices/push", { token: otherAccount.token, method: "POST", body: {
+    platform: "android", token: `other-${crypto.randomUUID()}`,
+  } });
+  const revoked = (await revokedResponse.json()).device;
+  const retained = (await retainedResponse.json()).device;
+  const otherDevice = (await otherDeviceResponse.json()).device;
+  const beforeRevokeDb = new DatabaseSync(join(directory, "workspace.sqlite"));
+  const revokedRegistrationId = beforeRevokeDb.prepare("SELECT provider_id AS providerId FROM push_devices WHERE id=?").get(revoked.id).providerId;
+  const retainedRegistrationId = beforeRevokeDb.prepare("SELECT provider_id AS providerId FROM push_devices WHERE id=?").get(retained.id).providerId;
+  const otherRegistrationId = beforeRevokeDb.prepare("SELECT provider_id AS providerId FROM push_devices WHERE id=?").get(otherDevice.id).providerId;
+  beforeRevokeDb.close();
+
+  await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "task", title: "Push after sign-out", scheduledDate: "2020-02-03",
+    reminders: [{ delivery: "notification", amount: 0, unit: "days", time: "10:00" }],
+  } });
+  failNextPushRevoke = 1;
+  const revoke = await request(`/api/devices/push/${revoked.id}`, { token: owner.token, method: "DELETE" });
+  assert.equal(revoke.status, 204, "provider availability must not block local revocation");
+  assert.equal((await request("/api/auth/logout", { token: owner.token, method: "POST" })).status, 204);
+  assert.equal((await request("/api/items", { token: owner.token })).status, 401);
+  assert.equal((await request("/api/items", { token: otherSession.token })).status, 200,
+    "signing out one session must leave another session for the same account valid");
+  assert.equal((await request("/api/items", { token: otherAccount.token })).status, 200);
+
+  await runReminderWorker();
+  const pushCalls = providerRequests.slice(providerStart).filter(({ path }) => path === "/push");
+  const ownerDeliveries = pushCalls.filter(({ body }) => body.operation === "deliver");
+  assert.ok(ownerDeliveries.some(({ body }) => body.registrationId === retainedRegistrationId), "the still-registered device should continue receiving sends");
+  assert.equal(ownerDeliveries.some(({ body }) => body.registrationId === revokedRegistrationId), false,
+    "the revoked device must not receive a newly scheduled send");
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  assert.equal(db.prepare("SELECT count(*) AS count FROM push_devices WHERE id=?").get(revoked.id).count, 0);
+  assert.equal(db.prepare("SELECT count(*) AS count FROM push_devices WHERE provider_id=?").get(otherRegistrationId).count, 1,
+    "another account's registered device should remain unaffected");
+  assert.equal(db.prepare("SELECT count(*) AS count FROM push_cleanup_jobs").get().count, 1,
+    "failed provider cleanup must remain durable after the sign-out bearer is invalidated");
+  db.close();
+
+  await stopServer();
+  await stopDeliveryFake();
+  await startDeliveryFake();
+  await startServer();
+  await advanceTestClock(1_100);
+  await runReminderWorker();
+  const recoveredCleanup = providerRequests.find(({ body }) => body.operation === "revoke");
+  assert.equal(recoveredCleanup?.body.registrationId, revokedRegistrationId,
+    "the restarted worker should recover the right cleanup without the signed-out bearer token");
+  const restartedDb = new DatabaseSync(join(directory, "workspace.sqlite"));
+  assert.equal(restartedDb.prepare("SELECT count(*) AS count FROM push_cleanup_jobs").get().count, 0);
+  restartedDb.close();
+  assert.equal(otherDevice.platform, "android");
+  assert.equal(retained.platform, "ios");
+});
+
+test("a concurrent re-registration survives an in-flight push cleanup", async () => {
+  const owner = await account();
+  const registration = { platform: "ios", token: `reused-${crypto.randomUUID()}` };
+  const firstResponse = await request("/api/devices/push", { token: owner.token, method: "POST", body: registration });
+  const firstDevice = (await firstResponse.json()).device;
+  const firstDb = new DatabaseSync(join(directory, "workspace.sqlite"));
+  const registrationId = firstDb.prepare("SELECT provider_id AS providerId FROM push_devices WHERE id=?").get(firstDevice.id).providerId;
+  firstDb.close();
+  assert.equal((await request(`/api/devices/push/${firstDevice.id}`, { token: owner.token, method: "DELETE" })).status, 204);
+
+  let signalRevokeStarted;
+  let finishRevoke;
+  const revokeStarted = new Promise((resolve) => { signalRevokeStarted = resolve; });
+  const revokeRelease = new Promise((resolve) => { finishRevoke = resolve; });
+  holdNextPushRevoke = { started: signalRevokeStarted, releasePromise: revokeRelease };
+  const cleanupPromise = runReminderWorker();
+  await revokeStarted;
+
+  const reRegistrationPromise = request("/api/devices/push", { token: owner.token, method: "POST", body: registration });
+  await delay(100);
+  finishRevoke();
+  assert.equal((await cleanupPromise).status, 200);
+  const reRegistration = await reRegistrationPromise;
+  assert.equal(reRegistration.status, 201);
+
+  const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  const currentRegistration = db.prepare("SELECT provider_id AS providerId FROM push_devices WHERE user_id=?").get(owner.user.id);
+  assert.equal(currentRegistration.providerId, registrationId);
+  assert.equal(activePushRegistrations.has(registrationId), true,
+    "registration must be restored after a cleanup request that was already in flight");
+  assert.equal(db.prepare("SELECT count(*) AS count FROM push_cleanup_jobs WHERE registration_id=?").get(registrationId).count, 0);
+  assert.equal(db.prepare("SELECT count(*) AS count FROM push_cleanup_completed WHERE registration_id=?").get(registrationId).count, 0);
+  db.close();
 });
 
 test("long-lead Reminders extend rolling Occurrence materialization beyond the former horizon", async () => {
@@ -2363,6 +2508,88 @@ test("recurring items create independent Occurrences and honor occurrence and se
   assert.equal(afterSeriesEdit.find(({ id }) => id === occurrenceId)?.completed, true);
 });
 
+test("editing the first Occurrence locally preserves its recurrence definition and series identity", async () => {
+  const owner = await account();
+  const previousClock = new Date(testClock);
+  try {
+    const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "task", title: "Original series title", details: "Original series details", scheduledDate: "2026-11-01", scheduledTime: "08:00",
+      recurrence: { interval: 1, unit: "days", end: { type: "never" } },
+      reminders: [{ delivery: "notification", amount: 1, unit: "days", time: "09:00" }],
+    } });
+    assert.equal(created.status, 201);
+    const root = (await created.json()).item;
+    const file = (await (await request("/api/files", { token: owner.token, method: "POST", body: { name: "Series notes", url: "https://example.com/series-notes" } })).json()).file;
+    assert.equal((await request(`/api/files/${file.id}/attachments`, { token: owner.token, method: "POST", body: { itemId: root.id, scope: "series" } })).status, 201);
+    assert.equal((await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: { completed: true } })).status, 200);
+    let series = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === root.id);
+    const laterBefore = series.find(({ id }) => id !== root.id);
+    assert.ok(laterBefore);
+
+    const localEdit = await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: {
+      title: "First Occurrence only", details: "Local details", scheduledDate: "2026-10-20", scheduledTime: "12:30",
+      recurrence: null, reminders: [{ delivery: "notification", amount: 2, unit: "hours", time: "10:30" }], scope: "occurrence",
+    } });
+    assert.equal(localEdit.status, 200, await localEdit.clone().text());
+    const editedRoot = (await localEdit.json()).item;
+    assert.equal(editedRoot.id, root.id);
+    assert.equal(editedRoot.seriesId, root.id);
+    assert.equal(editedRoot.occurrenceDate, "2026-11-01", "moving the first Occurrence must retain its original recurrence identity");
+    assert.equal(editedRoot.scheduledDate, "2026-10-20");
+    assert.equal(editedRoot.recurrence, null, "the first Occurrence can keep a local recurrence choice");
+    assert.equal(editedRoot.completed, true);
+    assert.deepEqual(editedRoot.files.map(({ id }) => id), [file.id]);
+
+    series = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === root.id);
+    const unchangedLater = series.find(({ id }) => id === laterBefore.id);
+    assert.ok(unchangedLater, "the later Occurrence keeps its stable id");
+    assert.equal(unchangedLater.title, "Original series title");
+    assert.equal(unchangedLater.scheduledTime, "08:00");
+    assert.deepEqual(unchangedLater.reminders, [{ delivery: "notification", amount: 1, unit: "days", time: "09:00" }]);
+    assert.deepEqual(unchangedLater.files.map(({ id }) => id), [file.id]);
+    assert.ok(series.some(({ id, occurrenceDate }) => id === root.id && occurrenceDate === "2026-11-01"),
+      "the moved first Occurrence keeps its original recurrence identity");
+
+    await setTestClock(previousClock.getTime() + 372 * 86_400_000);
+    series = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === root.id);
+    const generated = series.find(({ occurrenceDate }) => occurrenceDate === "2028-01-01");
+    assert.ok(generated, "advancing the controlled clock should materialize a date beyond the original rolling horizon");
+    assert.notEqual(generated.id, root.id);
+    assert.equal(generated.title, "Original series title");
+    assert.equal(generated.scheduledDate, "2028-01-01");
+    assert.equal(generated.scheduledTime, "08:00");
+    assert.deepEqual(generated.reminders, [{ delivery: "notification", amount: 1, unit: "days", time: "09:00" }]);
+    assert.deepEqual(generated.files.map(({ id }) => id), [file.id]);
+  } finally { await setTestClock(previousClock); }
+});
+
+test("turning an existing item into a recurrence creates its generation definition", async () => {
+  const owner = await account();
+  const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "task", title: "Existing task", details: "Keep this definition", scheduledDate: "2027-02-01", scheduledTime: "09:00",
+  } });
+  assert.equal(created.status, 201);
+  const item = (await created.json()).item;
+  const updated = await request(`/api/items/${item.id}`, { token: owner.token, method: "PATCH", body: {
+    recurrence: { interval: 1, unit: "days", end: { type: "count", count: 3 } },
+  } });
+  assert.equal(updated.status, 200, await updated.clone().text());
+  let items = (await (await request("/api/items", { token: owner.token })).json()).items;
+  let series = items.filter(({ seriesId }) => seriesId === item.id);
+  assert.equal(series.length, 3);
+  assert.deepEqual(series.map(({ scheduledDate }) => scheduledDate), ["2027-02-01", "2027-02-02", "2027-02-03"]);
+  const occurrenceIds = series.map(({ id }) => id).sort();
+
+  const previousClock = new Date(testClock);
+  try {
+    await setTestClock(previousClock.getTime() + 372 * 86_400_000);
+    items = (await (await request("/api/items", { token: owner.token })).json()).items;
+    series = items.filter(({ seriesId }) => seriesId === item.id);
+    assert.equal(series.length, 3, "the persisted count ending remains in effect after subsequent reads");
+    assert.deepEqual(series.map(({ id }) => id).sort(), occurrenceIds, "existing Occurrence identities remain stable");
+  } finally { await setTestClock(previousClock); }
+});
+
 test("a series Attachment is available from every Occurrence and can be removed from the whole series", async () => {
   const owner = await account();
   const created = await request("/api/items", { token: owner.token, method: "POST", body: {
@@ -2675,9 +2902,18 @@ test("Android UI acceptance: recurring agenda updates are visible across clients
   skip: process.env.FILETASKS_RUN_ANDROID_UI_ACCEPTANCE !== "1",
 }, async () => {
   await setTestClock("2026-10-13T12:00:00.000Z");
-  const email = "android-ui-shared@example.com";
+  const shared = process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1";
+  const email = shared ? "ios-ui-shared@example.com" : "android-ui-shared@example.com";
   const password = "correct-horse-battery";
   const owner = await account(email);
+  if (shared) {
+    await setEmulatorRunning((args) => runCommand("adb", args), process.env.FILETASKS_ANDROID_EMULATOR_SERIAL, true);
+    sharedUIOwner = owner;
+    const mappings = await runCommand("adb", ["reverse", "--list"]);
+    assert.equal(mappings.split(/\r?\n/).some((line) => /\btcp:3107\b/.test(line)), false,
+      "The Android emulator port 3107 must be available for the shared UI workflow.");
+    await runCommand("adb", ["reverse", "tcp:3107", "tcp:3107"]);
+  }
   try {
     const authorization = await beginGoogleAuthorization(owner);
     assert.equal((await request(`/api/calendars/google/callback?state=${encodeURIComponent(authorization.state)}&code=fake-code`, {
@@ -2703,6 +2939,7 @@ test("Android UI acceptance: recurring agenda updates are visible across clients
     throw new Error(`${error.message}\nInstrumentation results:\n${reports}\nRecent test server output:\n${logs.slice(-10000)}`, { cause: error });
   } finally {
     failNextGoogleRequest = null;
+    if (shared) await runCommand("adb", ["reverse", "--remove", "tcp:3107"], process.env, repoRoot, { cleanup: true });
   }
 
   const response = await request("/api/items", { token: owner.token });
@@ -2736,10 +2973,12 @@ test("iOS, Android and web run against one shared account, API and provider fake
   skip: process.env.FILETASKS_RUN_NATIVE_ACCEPTANCE !== "1",
 }, async () => {
   await setTestClock("2026-10-13T12:00:00.000Z");
-  const email = `shared-native-${crypto.randomUUID()}@example.com`;
+  const shared = process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1";
+  const email = shared ? "ios-ui-shared@example.com" : `shared-native-${crypto.randomUUID()}@example.com`;
   const password = "correct-horse-battery";
   const namespace = crypto.randomUUID();
-  const sharedOwner = await account(email);
+  const sharedOwner = shared ? sharedUIOwner : await account(email);
+  assert.ok(sharedOwner, "The Android UI phase must create the account before the shared native workflow.");
   const providerIndex = providerRequests.length;
   const workerDeliveriesBefore = providerRequests.filter(({ path, body }) => path === "/push" && body.operation === "deliver").length;
   const nativeEnv = {
@@ -2766,10 +3005,15 @@ test("iOS, Android and web run against one shared account, API and provider fake
 
   const fakePort = new URL(deliveryBase).port;
   const reversedPorts = ["3107", fakePort];
+  const installedReverses = [];
   try {
-    for (const port of reversedPorts) await runCommand("adb", ["reverse", `tcp:${port}`, `tcp:${port}`]);
+    for (const port of reversedPorts) {
+      await runCommand("adb", ["reverse", `tcp:${port}`, `tcp:${port}`]);
+      installedReverses.push(port);
+    }
     await runCommand("./gradlew", [
       ":app:connectedDebugAndroidTest",
+      "-Pandroid.testInstrumentationRunnerArguments.class=com.filetasks.android.ApiClientAcceptanceTest",
       `-Pandroid.testInstrumentationRunnerArguments.apiUrl=${base}`,
       `-Pandroid.testInstrumentationRunnerArguments.email=${email}`,
       `-Pandroid.testInstrumentationRunnerArguments.password=${password}`,
@@ -2777,7 +3021,7 @@ test("iOS, Android and web run against one shared account, API and provider fake
       "-Pandroid.testInstrumentationRunnerArguments.workerSecret=test-worker-secret",
     ], process.env, join(repoRoot, "apps/android"));
   } finally {
-    for (const port of reversedPorts) await runCommand("adb", ["reverse", "--remove", `tcp:${port}`]).catch(() => {});
+    for (const port of installedReverses) await runCommand("adb", ["reverse", "--remove", `tcp:${port}`], process.env, repoRoot, { cleanup: true });
   }
 
   const nativeRequests = providerRequests.slice(providerIndex).filter(({ path }) => path === "/push");
@@ -2914,7 +3158,8 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, calenda
   const eventReminder = { delivery: "notification", amount: 3, unit: "weeks", time: "11:40" };
   const reverseTaskTitle = "UI Runner Event To Task";
   const noRemindersTitle = "UI Runner No Reminders";
-  const owner = await account(email);
+  const owner = process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1" ? sharedUIOwner : await account(email);
+  assert.ok(owner, "The Android UI phase must create the shared account before the iOS UI phase.");
 
   const settingsResponse = await request("/api/settings/reminders", {
     token: owner.token,
@@ -2982,6 +3227,11 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, calenda
 
   const simulatorId = process.env.FILETASKS_IOS_UI_SIMULATOR_ID;
   assert.ok(simulatorId, "The focused runner must create and pass a disposable iOS Simulator id.");
+  if (process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1") {
+    await setEmulatorRunning((args) => runCommand("adb", args), process.env.FILETASKS_ANDROID_EMULATOR_SERIAL, false);
+    await runCommand("xcrun", ["simctl", "boot", simulatorId]);
+    await runCommand("xcrun", ["simctl", "bootstatus", simulatorId, "-b"]);
+  }
   try {
     await runCommand("xcodebuild", [
       "-project", "apps/ios/FileTasks.xcodeproj",
@@ -3046,6 +3296,17 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, calenda
   assert.equal(noRemindersEvent.kind, "event");
   assert.deepEqual(noRemindersEvent.reminders, []);
 
+  const recurringTaskRows = items.filter(({ title }) => title === "UI Runner Whole Series Task");
+  assert.equal(recurringTaskRows.length, 2, "The iOS scoped saves should leave both affected Task Occurrences in the shared API.");
+  assert.ok(recurringTaskRows.every(({ recurrence }) => recurrence?.end?.type === "count" && recurrence.end.count === 2),
+    "The refreshed Task rows should retain the server-generated two-Occurrence Recurrence rule.");
+  assert.equal(items.filter(({ title }) => title === "UI Runner Recurring Task").length, 1,
+    "The unrelated earlier Task Occurrence should retain its original value.");
+  assert.equal(items.filter(({ title }) => title === "UI Runner Following Task").length, 0,
+    "The following series edit should update both affected loaded rows.");
+  assert.equal(items.filter(({ title }) => title === "UI Runner Recurring Event").length, 3,
+    "The iOS-created Event should be visible with its server-generated Occurrences.");
+
   uiAcceptanceBrowser = await launchUIAcceptanceBrowser();
   try {
     uiAcceptanceContext = await createUIAcceptanceContext(uiAcceptanceBrowser);
@@ -3056,11 +3317,21 @@ test("iOS UI acceptance: registration, cross-type Reminder preservation, calenda
       await page.getByLabel("Password", { exact: true }).fill(password);
       await page.locator("form").getByRole("button", { name: "Sign in", exact: true }).click();
       await page.getByRole("button", { name: "Events", exact: true }).click();
+      if (process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1") {
+        await expect(page.getByRole("heading", { name: "Android UI Following", exact: true }).first()).toBeVisible();
+      }
       await expect(page.getByRole("heading", { name: "UI Runner Event Default", exact: true }).first()).toBeVisible();
       await expect(page.getByRole("heading", { name: "UI Runner Customized Event", exact: true }).first()).toBeVisible();
       await expect(page.getByRole("heading", { name: noRemindersTitle, exact: true }).first()).toBeVisible();
       await page.getByRole("button", { name: "Tasks", exact: true }).click();
+      if (process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1") {
+        await expect(page.getByRole("heading", { name: "Android UI Whole Task", exact: true }).first()).toBeVisible();
+      }
       await expect(page.getByRole("heading", { name: reverseTaskTitle, exact: true }).first()).toBeVisible();
+      await expect(page.getByRole("heading", { name: "UI Runner Recurring Task", exact: true })).toHaveCount(1);
+      await expect(page.getByRole("heading", { name: "UI Runner Whole Series Task", exact: true })).toHaveCount(2);
+      await page.getByRole("button", { name: "Events", exact: true }).click();
+      await expect(page.getByRole("heading", { name: "UI Runner Recurring Event", exact: true })).toHaveCount(3);
     } finally {
       await closeUIAcceptanceContext();
     }
@@ -3082,13 +3353,15 @@ test("imported series normalization and splits retain export safeguards", async 
     assert.equal(root.calendarSync[0].state,"limited");
     assert.equal(root.calendarSync[0].recurrenceEdited,false);
     const later = items.find((item) => item.seriesId === root.id && item.id !== root.id);
+    const providerEventsBeforeSplit = structuredClone([...googleEvents.entries()]);
     const patch = await request(`/api/items/${later.id}`,{token:owner.token,method:"PATCH",body:{title:"Split later",scope:"following"}});
     assert.equal(patch.status,200);
     assert.equal((await patch.json()).item.calendarSync[0].limitationCode,"imported-series-split");
     const loaded = (await (await request(`/api/items/${later.id}`,{token:owner.token})).json()).item;
     assert.equal(loaded.calendarSync[0].state,"limited");
     assert.ok((await (await request("/api/calendars",{token:owner.token})).json()).syncLimitations.some((entry) => entry.itemId === later.id));
-    assert.equal(googleEvents.size,1);
+    assert.deepEqual([...googleEvents.entries()],providerEventsBeforeSplit,
+      "splitting an imported series must leave every Google provider copy unchanged");
     assert.deepEqual(googleEvents.get(source.id).start,source.start);
     assert.deepEqual(googleEvents.get(source.id).end,source.end);
   } finally { googleEvents.clear(); }

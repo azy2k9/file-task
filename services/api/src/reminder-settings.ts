@@ -73,8 +73,16 @@ export function updateReminderSettings(userId: string, body: Record<string, unkn
   write.run(userId, JSON.stringify(taskReminders), JSON.stringify(eventReminders), Number(pushEnabled), Number(emailEnabled));
   if (body.applyToExisting === true) {
     const sync = db.prepare("UPDATE items SET reminders_json=? WHERE user_id=? AND kind=? AND uses_reminder_default=1");
-    if (JSON.stringify(taskReminders) !== JSON.stringify(before.taskReminders)) sync.run(JSON.stringify(taskReminders), userId, "task");
-    if (JSON.stringify(eventReminders) !== JSON.stringify(before.eventReminders)) sync.run(JSON.stringify(eventReminders), userId, "event");
+    const syncSeries = db.prepare(`UPDATE item_series_definitions SET reminders_json=? WHERE user_id=? AND series_root_id IN
+      (SELECT id FROM items WHERE user_id=? AND kind=? AND uses_reminder_default=1)`);
+    if (JSON.stringify(taskReminders) !== JSON.stringify(before.taskReminders)) {
+      sync.run(JSON.stringify(taskReminders), userId, "task");
+      syncSeries.run(JSON.stringify(taskReminders), userId, userId, "task");
+    }
+    if (JSON.stringify(eventReminders) !== JSON.stringify(before.eventReminders)) {
+      sync.run(JSON.stringify(eventReminders), userId, "event");
+      syncSeries.run(JSON.stringify(eventReminders), userId, userId, "event");
+    }
   }
   return reminderSettings(userId);
 }

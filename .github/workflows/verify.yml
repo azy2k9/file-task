@@ -10,6 +10,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm audit
       - run: npm run typecheck
       - run: npx playwright install --with-deps chromium
       - run: npm test
@@ -26,6 +27,7 @@ jobs:
       - run: npx playwright install chromium
       - run: npm run test:ios-ui
       - run: xcodebuild -project apps/ios/FileTasks.xcodeproj -scheme FileTasks -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+      - run: xcodebuild -project apps/ios/FileTasks.xcodeproj -scheme "FileTasks Personal" -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
   android:
     runs-on: ubuntu-latest
     steps:
@@ -72,3 +74,27 @@ jobs:
           arch: x86_64
           disable-animations: true
           script: npm run test:android-ui
+  shared-acceptance:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - run: npm ci
+      - run: npx playwright install chromium
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          disable-animations: true
+          script: npm run test:shared-acceptance
