@@ -569,10 +569,11 @@ async function startDeliveryFakeDuringSetup(setup) {
     }
     if (url.pathname === "/__acceptance/apple-copy") {
       const uid = url.searchParams.get("uid") ?? body.uid;
+      const collectionPath = String(url.searchParams.get("collectionPath") ?? body.collectionPath ?? "/apple/calendar/").replace(/\/+$/, "") + "/";
       if (request.method === "POST") {
-        const path = `/apple/calendar/${uid}.ics`;
+        const path = `${collectionPath}${uid}.ics`;
         if (body.action === "failApple") {
-          failNextAppleRequest = { method: body.method ?? "PROPFIND", path: body.path ?? "/apple/calendar/", status: body.status ?? 503 };
+          failNextAppleRequest = { method: body.method ?? "PROPFIND", path: body.path ?? collectionPath, status: body.status ?? 503 };
         } else if (body.action === "seed") {
           const title = String(body.title ?? "Imported acceptance Event");
           appleEvents.set(path, `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//FileTasks Test//Calendar//EN\r\nBEGIN:VEVENT\r\nUID:${uid}\r\nDTSTAMP:20261013T120000Z\r\nDTSTART;VALUE=DATE:20270114\r\nDTEND;VALUE=DATE:20270115\r\nSUMMARY:${title}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n`);
@@ -589,7 +590,7 @@ async function startDeliveryFakeDuringSetup(setup) {
         return;
       }
       if (request.method === "GET") {
-        const copies = [...appleEvents.entries()].filter(([path]) => path.endsWith(`/${uid}.ics`))
+        const copies = [...appleEvents.entries()].filter(([path]) => path.startsWith(collectionPath) && path.endsWith(`/${uid}.ics`))
           .map(([path, calendarData]) => ({ path, calendarData }));
         response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ copies }));
         return;
@@ -3897,6 +3898,8 @@ test("Android UI acceptance: recurring agenda and connected calendar workflows w
   }
   const calendarEmail = `android-calendar-ui-${crypto.randomUUID()}@example.com`;
   await account(calendarEmail);
+  const appleCollectionPath = `/apple/android-ui-${crypto.randomUUID()}/`;
+  const appleCalendarUrl = `${deliveryBase}${appleCollectionPath}`;
   const undatedEventTitle = "Android UI date clearing Event";
   const deleteEventTitle = "Android UI delete Event";
   let undatedEvent;
@@ -3957,7 +3960,7 @@ test("Android UI acceptance: recurring agenda and connected calendar workflows w
         `-Pandroid.testInstrumentationRunnerArguments.calendarEmail=${calendarEmail}`,
         `-Pandroid.testInstrumentationRunnerArguments.password=${password}`,
         `-Pandroid.testInstrumentationRunnerArguments.providerFakeUrl=${deliveryBase}`,
-        `-Pandroid.testInstrumentationRunnerArguments.appleCalendarUrl=${deliveryBase}/apple/calendar/`,
+        `-Pandroid.testInstrumentationRunnerArguments.appleCalendarUrl=${appleCalendarUrl}`,
       ], process.env, join(repoRoot, "apps/android"), { detached: true });
     } finally {
       await runCommand("adb", ["reverse", "--remove", `tcp:${fakePort}`]).catch(() => {});

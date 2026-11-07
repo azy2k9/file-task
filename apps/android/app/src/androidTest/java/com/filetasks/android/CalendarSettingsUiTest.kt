@@ -48,6 +48,7 @@ class CalendarSettingsUiTest {
         val password = args.getString("password") ?: error("password is required")
         val providerFakeUrl = args.getString("providerFakeUrl") ?: error("providerFakeUrl is required")
         val appleCalendarUrl = args.getString("appleCalendarUrl") ?: error("appleCalendarUrl is required")
+        val appleCollectionPath = Uri.parse(appleCalendarUrl).path ?: error("appleCalendarUrl must have a collection path")
         val token = ApiClient(apiUrl).login(email, password).first
 
         waitFor("the API server configuration button") {
@@ -93,8 +94,8 @@ class CalendarSettingsUiTest {
         assertTrue("Returning from an incomplete browser authorization must leave Google disconnected",
             ApiClient(apiUrl).calendarStatus(token).calendars.none { it.provider == "google" })
 
-        providerAction(providerFakeUrl, "seed", "android-ui-apple-${email.hashCode()}", "Android UI imported Apple Event")
-        providerAction(providerFakeUrl, "failApple", "android-ui-apple-${email.hashCode()}", "Android UI imported Apple Event")
+        providerAction(providerFakeUrl, "seed", "android-ui-apple-${email.hashCode()}", "Android UI imported Apple Event", collectionPath = appleCollectionPath)
+        providerAction(providerFakeUrl, "failApple", "android-ui-apple-${email.hashCode()}", "Android UI imported Apple Event", collectionPath = appleCollectionPath)
         compose.onNodeWithTag("calendar.apple.username").performScrollTo().performTextInput("android-calendar@example.com")
         compose.onNodeWithTag("calendar.apple.password").performScrollTo().performTextInput("fake-app-specific-password")
         compose.onNodeWithTag("calendar.apple.url").performScrollTo().performTextInput(appleCalendarUrl)
@@ -125,23 +126,23 @@ class CalendarSettingsUiTest {
             runBlocking { ApiClient(apiUrl).listItems(token).count { it.title == "Android UI imported Apple Event" } == 1 }
         }
 
-        providerAction(providerFakeUrl, "edit", "android-ui-apple-${email.hashCode()}", "Android UI imported Apple Event", "External edit")
+        providerAction(providerFakeUrl, "edit", "android-ui-apple-${email.hashCode()}", "Android UI imported Apple Event", "External edit", appleCollectionPath)
         compose.onNodeWithTag("calendar.sync").performScrollTo().performClick()
         waitFor("native sync restoring the authoritative title") {
-            providerInspect(providerFakeUrl, "android-ui-apple-${email.hashCode()}").let { copies ->
+            providerInspect(providerFakeUrl, "android-ui-apple-${email.hashCode()}", appleCollectionPath).let { copies ->
                 copies.length() == 1 && copies.getJSONObject(0).getString("calendarData").contains("SUMMARY:Android UI imported Apple Event")
             }
         }
 
-        providerAction(providerFakeUrl, "delete", "android-ui-apple-${email.hashCode()}", "Android UI imported Apple Event")
+        providerAction(providerFakeUrl, "delete", "android-ui-apple-${email.hashCode()}", "Android UI imported Apple Event", collectionPath = appleCollectionPath)
         compose.onNodeWithTag("calendar.sync").performScrollTo().performClick()
         waitFor("native sync restoring a deleted copy without duplication") {
-            val copies = providerInspect(providerFakeUrl, "android-ui-apple-${email.hashCode()}")
+            val copies = providerInspect(providerFakeUrl, "android-ui-apple-${email.hashCode()}", appleCollectionPath)
             copies.length() == 1 && copies.getJSONObject(0).getString("calendarData").contains("SUMMARY:Android UI imported Apple Event")
         }
         val imported = ApiClient(apiUrl).listItems(token).filter { it.title == "Android UI imported Apple Event" }
         assertEquals("Provider restoration must not duplicate the imported Event", 1, imported.size)
-        assertTrue(providerInspect(providerFakeUrl, "android-ui-apple-${email.hashCode()}").getJSONObject(0)
+        assertTrue(providerInspect(providerFakeUrl, "android-ui-apple-${email.hashCode()}", appleCollectionPath).getJSONObject(0)
             .getString("calendarData").contains("URL:${apiUrl.trimEnd('/')}/?event=${imported.single().id}"))
 
         compose.onNodeWithText("Done").performClick()
@@ -175,22 +176,22 @@ class CalendarSettingsUiTest {
         }
     }
 
-    private fun providerAction(base: String, action: String, uid: String, title: String, changedTitle: String? = null) {
+    private fun providerAction(base: String, action: String, uid: String, title: String, changedTitle: String? = null, collectionPath: String = "/apple/calendar/") {
         val connection = URL("${base.trimEnd('/')}/__acceptance/apple-copy").openConnection() as HttpURLConnection
         try {
             connection.requestMethod = "POST"
             connection.doOutput = true
             connection.setRequestProperty("Content-Type", "application/json")
-            val payload = JSONObject().put("action", action).put("uid", uid).put("title", title)
-            if (action == "failApple") payload.put("method", "PROPFIND").put("path", "/apple/calendar/").put("status", 503)
+            val payload = JSONObject().put("action", action).put("uid", uid).put("title", title).put("collectionPath", collectionPath)
+            if (action == "failApple") payload.put("method", "PROPFIND").put("path", collectionPath).put("status", 503)
             changedTitle?.let { payload.put("changedTitle", it) }
             connection.outputStream.use { it.write(payload.toString().toByteArray()) }
             assertEquals(200, connection.responseCode)
         } finally { connection.disconnect() }
     }
 
-    private fun providerInspect(base: String, uid: String): org.json.JSONArray {
-        val connection = URL("${base.trimEnd('/')}/__acceptance/apple-copy?uid=$uid").openConnection() as HttpURLConnection
+    private fun providerInspect(base: String, uid: String, collectionPath: String = "/apple/calendar/"): org.json.JSONArray {
+        val connection = URL("${base.trimEnd('/')}/__acceptance/apple-copy?uid=$uid&collectionPath=${Uri.encode(collectionPath)}").openConnection() as HttpURLConnection
         return try {
             assertEquals(200, connection.responseCode)
             JSONObject(connection.inputStream.bufferedReader().use { it.readText() }).getJSONArray("copies")
