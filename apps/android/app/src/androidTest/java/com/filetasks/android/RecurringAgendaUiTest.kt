@@ -273,7 +273,7 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("Offset").performTextInput("2")
         compose.onNodeWithText("Clock time").performTextClearance()
         compose.onNodeWithText("Clock time").performTextInput("11:00")
-        compose.onNodeWithText("hours").performScrollTo().performClick()
+        compose.onNodeWithText("ho").performScrollTo().performClick()
 
         compose.onNodeWithText("This Occurrence").performScrollTo().performClick()
         compose.onNodeWithText("Save").performClick()
