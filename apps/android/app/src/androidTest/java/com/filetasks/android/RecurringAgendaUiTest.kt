@@ -130,7 +130,8 @@ class RecurringAgendaUiTest {
                 }
         } catch (failure: AssertionError) {
             val values = observedRows.joinToString { "${it.id}:series=${it.seriesId},occurrence=${it.occurrenceDate},title=${it.title},date=${it.scheduledDate},time=${it.scheduledTime},rule=${it.recurrence},reminders=${it.reminders}" }
-            throw AssertionError("First Occurrence API rows after edit; expected id ${firstTaskOccurrence.id}: $values", failure)
+            val expectedLater = laterTaskOccurrences.joinToString { "${it.id}:occurrence=${it.occurrenceDate},title=${it.title},date=${it.scheduledDate},time=${it.scheduledTime},rule=${it.recurrence},reminders=${it.reminders}" }
+            throw AssertionError("First Occurrence API rows after edit; expected id ${firstTaskOccurrence.id}; expected later=$expectedLater; actual=$values", failure)
         }
         val afterFirstOccurrenceEdit = items(api, token).filter { it.occurrenceDate in initialTaskRows.map { row -> row.occurrenceDate } }
         assertEquals(firstTaskOccurrence.occurrenceDate, afterFirstOccurrenceEdit.single { it.id == firstTaskOccurrence.id }.occurrenceDate)
