@@ -288,7 +288,9 @@ class RecurringAgendaUiTest {
             overlapsFab = deleteBounds.left < fabBounds.right && fabBounds.left < deleteBounds.right
                 && deleteBounds.top < fabBounds.bottom && fabBounds.top < deleteBounds.bottom
             if (!overlapsFab || scrollCount == 4) break
-            agenda.performTouchInput { swipeUp() }
+            agenda.performTouchInput {
+                swipeUp(startY = bottom * 0.85f, endY = bottom * 0.70f)
+            }
             scrollCount += 1
         }
         assertFalse("Delete action $deleteTag overlaps the Add item button after scrolling", overlapsFab)
