@@ -8,7 +8,6 @@ import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
-import androidx.compose.ui.test.isDialog
 import androidx.compose.ui.test.isRoot
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -197,7 +196,7 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("Create").performClick()
         waitFor("the simple item editor to close") {
             items(api, token).any { it.title == title }
-                && compose.onAllNodes(isDialog(), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
+                && !hasOpenDialog()
         }
     }
 
@@ -210,8 +209,7 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("Details").performTextInput(details)
         compose.onNodeWithText("Save").performClick()
         waitFor("the simple item editor to close after editing") {
-            compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty()
-                && compose.onAllNodes(isDialog(), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
+            !hasDialogTitle("Edit item") && !hasOpenDialog()
         }
     }
 
@@ -233,7 +231,7 @@ class RecurringAgendaUiTest {
         clickDeleteConfirmation()
         waitFor("the deleted item and confirmation dialog to leave the agenda") {
             compose.onAllNodes(hasTestTag(itemTag)).fetchSemanticsNodes().isEmpty()
-                && compose.onAllNodes(isDialog(), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
+                && !hasOpenDialog()
         }
     }
 
@@ -249,18 +247,18 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("Create").performClick()
         waitFor("the create editor to close") {
             items(api, token).any { it.title == title }
-                && compose.onAllNodes(isDialog(), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
+                && !hasOpenDialog()
         }
     }
 
     private fun edit(item: WorkspaceItem, title: String, scope: String, api: ApiClient, token: String) {
-        waitFor("any previous editor to close") { compose.onAllNodes(isDialog(), useUnmergedTree = true).fetchSemanticsNodes().isEmpty() }
+        waitFor("any previous editor to close") { !hasOpenDialog() }
         compose.onNodeWithText("Refresh").performScrollTo().performClick()
         compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
         val editButton = compose.onNodeWithTag("agenda.edit.${item.id}")
         waitFor("the requested item's edit action to be enabled") { runCatching { editButton.assertIsEnabled() }.isSuccess }
         editButton.performClick()
-        waitFor("the requested item editor to open") { compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isNotEmpty() }
+        waitFor("the requested item editor to open") { hasDialogTitle("Edit item") }
         compose.onNodeWithText("Title").performTextClearance()
         compose.onNodeWithText("Title").performTextInput(title)
         try {
@@ -272,7 +270,7 @@ class RecurringAgendaUiTest {
             throw AssertionError("Could not select edit scope '$scope' for item ${item.id}; passed seriesId=${item.seriesId}; server=$serverItem; cause=${failure.message}; UI=$ui", failure)
         }
         compose.onNodeWithText("Save").performClick()
-        waitFor("the edit editor to close") { compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty() }
+        waitFor("the edit editor to close") { !hasDialogTitle("Edit item") }
     }
 
     private fun editFirstOccurrence(item: WorkspaceItem) {
@@ -302,26 +300,26 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("This Occurrence").performScrollTo().performClick()
         compose.onNodeWithText("Save").performClick()
         waitFor("the first Occurrence editor to close") {
-            compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty()
+            !hasDialogTitle("Edit item")
         }
     }
 
     private fun clearEventDate(item: WorkspaceItem, api: ApiClient, token: String) {
         waitFor("any previous editor to close before clearing the Event date") {
-            compose.onAllNodes(isDialog(), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
+            !hasOpenDialog()
         }
         compose.onNodeWithText("Refresh").performScrollTo().performClick()
         compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
         val editButton = compose.onNodeWithTag("agenda.edit.${item.id}")
         waitFor("the Event edit action to be enabled") { runCatching { editButton.assertIsEnabled() }.isSuccess }
         editButton.performClick()
-        waitFor("the Event edit dialog to open") { compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isNotEmpty() }
+        waitFor("the Event edit dialog to open") { hasDialogTitle("Edit item") }
         compose.onNodeWithText("Date (YYYY-MM-DD, optional)").performScrollTo().performTextClearance()
         val saveButton = compose.onNodeWithText("Save")
         waitFor("the Event Save button to be enabled") { runCatching { saveButton.assertIsEnabled() }.isSuccess }
         saveButton.performClick()
         waitFor("the date-clearing editor to close") {
-            compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty()
+            !hasDialogTitle("Edit item")
         }
         waitFor("the Event to remain undated with its File") {
             val saved = items(api, token).singleOrNull { it.id == item.id }
@@ -350,7 +348,7 @@ class RecurringAgendaUiTest {
         waitFor("the deleted Event and confirmation to leave the workspace") {
             items(api, token).none { it.id == item.id }
                 && compose.onAllNodes(hasTestTag(itemTag)).fetchSemanticsNodes().isEmpty()
-                && compose.onAllNodes(isDialog(), useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
+                && !hasOpenDialog()
         }
     }
 
@@ -400,4 +398,15 @@ class RecurringAgendaUiTest {
             throw AssertionError("Failed while waiting for $description. UI: $ui", failure)
         }
     }
+
+    private fun dialogTrees(): List<String> {
+        val roots = compose.onAllNodes(isRoot(), useUnmergedTree = true)
+        return (0 until roots.fetchSemanticsNodes().size)
+            .map { roots.get(it).printToString() }
+            .filter { it.contains("[IsDialog]") }
+    }
+
+    private fun hasOpenDialog(): Boolean = dialogTrees().isNotEmpty()
+
+    private fun hasDialogTitle(title: String): Boolean = dialogTrees().any { it.contains("[$title]") }
 }
