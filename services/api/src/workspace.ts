@@ -114,7 +114,10 @@ function plusMonths(date: Date, count: number) {
 function reminderLeadDays(raw: unknown) {
   const reminders = json<ReminderRule[]>(raw, []);
   return reminders.reduce((max, reminder) => {
-    const days = reminder.unit === "minutes" || reminder.unit === "hours" ? 0
+    // Occurrences are date based, so round sub-day lead times up to the next
+    // day. This also covers a Reminder whose due time falls on the prior date.
+    const days = reminder.unit === "minutes" ? Math.ceil(reminder.amount / 1_440)
+      : reminder.unit === "hours" ? Math.ceil(reminder.amount / 24)
       : reminder.unit === "days" ? reminder.amount
         : reminder.unit === "weeks" ? reminder.amount * 7
           : reminder.amount * 31;
@@ -122,23 +125,37 @@ function reminderLeadDays(raw: unknown) {
   }, 0);
 }
 
-function occurrenceDates(startValue: string, rule: RecurrenceRule, leadDays = 0) {
+function occurrenceDates(startValue: string, rule: RecurrenceRule, leadDays = 0, rollingFrom?: string) {
   const start = new Date(`${startValue}T00:00:00Z`);
   const horizon = now(); horizon.setUTCDate(horizon.getUTCDate() + Math.max(370, leadDays) + 2);
   const stop = rule.end.type === "date" ? new Date(`${rule.end.date}T00:00:00Z`) : horizon;
   const maxDate = rule.end.type === "date" && stop < horizon ? stop : horizon;
   const dates = [startValue];
+  // An unending series can be arbitrarily old. Keep its generated window
+  // bounded while leaving persisted Occurrences (and their history) intact.
+  // COUNT/date-ended rules still need their original origin to preserve the
+  // established end semantics.
+  const rollingStart = rule.end.type === "never" && rollingFrom && rollingFrom > startValue
+    ? new Date(`${rollingFrom}T00:00:00Z`) : start;
   if (rule.end.type === "count" && rule.end.count <= 1) return dates;
   if (rule.unit === "weeks") {
     const weekdays = rule.weekdays ?? [start.getUTCDay()];
-    let cursor = new Date(start);
+    let cursor = new Date(rollingStart);
+    if (cursor > start) {
+      const elapsed = Math.floor((cursor.getTime() - start.getTime()) / 86_400_000);
+      cursor = new Date(start.getTime() + Math.max(0, elapsed - 7) * 86_400_000);
+    }
     while (cursor <= maxDate && dates.length < (rule.end.type === "count" ? rule.end.count : 10_000)) {
       cursor.setUTCDate(cursor.getUTCDate() + 1);
       const weeks = Math.floor((cursor.getTime() - start.getTime()) / 604_800_000);
       if (weeks % rule.interval === 0 && weekdays.includes(cursor.getUTCDay()) && cursor > start) dates.push(formatDate(cursor));
     }
   } else {
-    for (let index = 1; dates.length < (rule.end.type === "count" ? rule.end.count : 10_000); index++) {
+    let firstIndex = 1;
+    if (rule.unit === "days" && rollingStart > start) {
+      firstIndex = Math.max(1, Math.ceil((rollingStart.getTime() - start.getTime()) / (86_400_000 * rule.interval)));
+    }
+    for (let index = firstIndex; dates.length < (rule.end.type === "count" ? rule.end.count : 10_000); index++) {
       let next: Date;
       if (rule.unit === "days") { next = new Date(start); next.setUTCDate(next.getUTCDate() + index * rule.interval); }
       else if (rule.unit === "months" && rule.ordinalWeekday) {
@@ -175,21 +192,30 @@ function occurrenceDates(startValue: string, rule: RecurrenceRule, leadDays = 0)
 
 function ensureOccurrences(userId: string) {
   const db = database();
-  const roots = db.prepare(`SELECT d.*,i.id,i.kind FROM item_series_definitions d JOIN items i
+  const roots = db.prepare(`SELECT d.*,i.id,i.kind,i.uses_reminder_default FROM item_series_definitions d JOIN items i
     ON i.user_id=d.user_id AND i.id=d.series_root_id WHERE d.user_id=?`).all(userId);
   for (const row of roots) {
     const rule = json<RecurrenceRule | null>(row.recurrence_json, null);
     if (!rule || typeof row.scheduled_date !== "string") continue;
+    // Repair generated Occurrences from before default-following state was
+    // inherited. Only rows still matching the series definition are eligible;
+    // rows with their own Reminder values remain customized.
+    if (Number(row.uses_reminder_default ?? 1) === 0) {
+      db.prepare(`UPDATE items SET uses_reminder_default=0 WHERE user_id=? AND series_root_id=?
+        AND uses_reminder_default=1 AND reminders_json=?`).run(userId, row.id, row.reminders_json ?? "[]");
+    }
     const exists = db.prepare("SELECT occurrence_date FROM items WHERE series_root_id=?").all(row.id).map((item) => String(item.occurrence_date));
     const known = new Set(exists);
     const excluded = new Set(db.prepare("SELECT occurrence_date FROM occurrence_exclusions WHERE series_root_id=?").all(row.id).map((item) => String(item.occurrence_date)));
-    for (const date of occurrenceDates(String(row.scheduled_date), rule, reminderLeadDays(row.reminders_json))) {
+    const rollingFrom = now().toISOString().slice(0, 10);
+    for (const date of occurrenceDates(String(row.scheduled_date), rule, reminderLeadDays(row.reminders_json), rollingFrom)) {
       if (known.has(date) || excluded.has(date)) continue;
       const id = randomUUID(); const createdAt = now().toISOString();
       db.prepare(`INSERT INTO items(id,user_id,kind,title,details,scheduled_date,scheduled_time,completed,created_at,updated_at,
-        recurrence_json,reminders_json,series_root_id,occurrence_date)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, userId, row.kind, row.title, row.details, date, row.scheduled_time,
-        row.kind === "task" ? 0 : null, createdAt, createdAt, null, row.reminders_json ?? "[]", row.id, date);
+        recurrence_json,reminders_json,series_root_id,occurrence_date,uses_reminder_default)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, userId, row.kind, row.title, row.details, date, row.scheduled_time,
+        row.kind === "task" ? 0 : null, createdAt, createdAt, null, row.reminders_json ?? "[]", row.id, date,
+        row.uses_reminder_default ?? 1);
       db.prepare(`INSERT OR IGNORE INTO calendar_import_split_blocks(user_id,item_id,provider)
         SELECT user_id,?,provider FROM calendar_import_split_blocks WHERE user_id=? AND item_id=?`).run(id,userId,row.id);
     }
@@ -219,7 +245,7 @@ function withFiles(items: WorkspaceItem[], userId: string) {
     WHERE i.user_id=? AND f.status='ready' AND NOT EXISTS(
       SELECT 1 FROM attachment_exclusions x JOIN items excluded ON excluded.id=x.item_id
       WHERE x.file_id=f.id AND ((x.scope='occurrence' AND x.item_id=target.id)
-        OR (x.scope='following' AND excluded.series_root_id=target.series_root_id AND target.occurrence_date>=excluded.occurrence_date)))
+        OR (a.scope='series' AND x.scope='following' AND excluded.series_root_id=target.series_root_id AND target.occurrence_date>=excluded.occurrence_date)))
     UNION
     SELECT target.id AS item_id, f.id, f.name, f.source_type FROM following_attachments a
     JOIN items anchor ON anchor.id=a.item_id JOIN items target ON target.user_id=anchor.user_id
@@ -463,8 +489,11 @@ function saveItemInTransaction(userId: string, body: Record<string, unknown>, id
   };
   if (existing?.seriesId && scope !== "occurrence") {
     const series = scope === "series" ? existing.seriesId : existing.seriesId;
+    // A moved Occurrence keeps its original occurrence_date. Use that key to
+    // find the future segment; scheduled_date is only its current placement.
+    const splitIdentity = existing.occurrenceDate ?? existing.scheduledDate;
     const comparison = scope === "following" ? " AND occurrence_date >= ?" : "";
-    const params: (string | null)[] = scope === "following" ? [userId, series, existing.scheduledDate] : [userId, series];
+    const params: (string | null)[] = scope === "following" ? [userId, series, splitIdentity] : [userId, series];
     const targets = db.prepare(`SELECT id,occurrence_date FROM items WHERE user_id=? AND series_root_id=?${comparison} ORDER BY occurrence_date,id`).all(...params);
     // Retain inherited split safeguards before any Occurrences can become standalone.
     db.prepare(`INSERT OR IGNORE INTO calendar_import_split_blocks(user_id,item_id,provider)
@@ -496,12 +525,21 @@ function saveItemInTransaction(userId: string, body: Record<string, unknown>, id
       for (const target of targets) write(String(target.id), String(target.id) === series, String(target.occurrence_date ?? item.scheduledDate));
     }
     if (scope === "following" && id !== series) {
-      if (item.recurrence && existing?.scheduledDate) {
-        const earlierCount = Number(db.prepare("SELECT COUNT(*) AS count FROM items WHERE user_id=? AND series_root_id=? AND occurrence_date < ?").get(userId,series,existing.scheduledDate)?.count ?? 0);
+      const splitAt = splitIdentity;
+      if (item.recurrence && splitAt !== null) {
+        // Count from the original recurrence definition instead of materialized
+        // rows: a previously deleted Occurrence still consumes COUNT.
+        const originalDefinition = db.prepare("SELECT scheduled_date,recurrence_json FROM item_series_definitions WHERE user_id=? AND series_root_id=?").get(userId,series);
+        const originalRule = json<RecurrenceRule | null>(originalDefinition?.recurrence_json, null);
+        const originalStart = typeof originalDefinition?.scheduled_date === "string" ? String(originalDefinition.scheduled_date) : String(root?.scheduled_date ?? existing.scheduledDate);
+        const earlierCount = originalRule
+          ? occurrenceDates(originalStart, originalRule).filter((date) => date < splitAt).length
+          : Number(db.prepare("SELECT COUNT(*) AS count FROM items WHERE user_id=? AND series_root_id=? AND occurrence_date < ?").get(userId,series,splitAt)?.count ?? 0);
         const splitRule: RecurrenceRule = item.recurrence.end.type === "count"
           ? { ...item.recurrence,end:{type:"count",count:Math.max(1,item.recurrence.end.count-earlierCount)} }
           : item.recurrence;
-        const followingDates = occurrenceDates(item.scheduledDate ?? existing.scheduledDate, splitRule, reminderLeadDays(JSON.stringify(item.reminders)));
+        const followingStart = item.scheduledDate ?? existing.scheduledDate ?? splitAt;
+        const followingDates = occurrenceDates(followingStart, splitRule, reminderLeadDays(JSON.stringify(item.reminders)));
         targets.forEach((target,index) => {
           if (index < followingDates.length) db.prepare("UPDATE items SET scheduled_date=?,series_root_id=?,occurrence_date=?,recurrence_json=? WHERE id=?")
             .run(followingDates[index],id,followingDates[index],index===0?JSON.stringify(splitRule):null,target.id);

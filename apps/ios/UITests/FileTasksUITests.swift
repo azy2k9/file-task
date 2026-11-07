@@ -110,6 +110,28 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         assertOccurrenceRows(title: "UI Runner Recurring Task", atLeast: 1)
         assertOccurrenceRows(title: "UI Runner Whole Series Task", atLeast: 2)
 
+        let localRootTitle = "UI Runner Local Root Task"
+        createRecurringItem(kind: "Task", title: localRootTitle)
+        let originalLocalSeries = try await sharedApiItems().filter { $0["title"] as? String == localRootTitle }
+        let originalRoot = try XCTUnwrap(originalLocalSeries.first { $0["isOccurrence"] as? Bool == false })
+        let originalRootID = try XCTUnwrap(originalRoot["id"] as? String)
+        let originalSeriesID = try XCTUnwrap(originalRoot["seriesId"] as? String)
+        let originalRows = originalLocalSeries.filter { $0["seriesId"] as? String == originalSeriesID }
+        XCTAssertEqual(originalRows.count, 3, "The public API should expose the root and its two generated Occurrences.")
+        let originalReminder = try XCTUnwrap((originalRoot["reminders"] as? [[String: Any]])?.first)
+
+        editFirstOccurrenceLocally(title: localRootTitle, newTitle: "UI Runner Local First Task")
+        assertOccurrenceRows(title: localRootTitle, atLeast: 2)
+        assertOccurrenceRows(title: "UI Runner Local First Task", atLeast: 1)
+        try await assertLocalFirstOccurrencePublicState(
+            originalRoot: originalRoot,
+            originalRootID: originalRootID,
+            originalSeriesID: originalSeriesID,
+            originalRows: originalRows,
+            originalReminder: originalReminder,
+            newTitle: "UI Runner Local First Task"
+        )
+
         createRecurringItem(kind: "Event", title: "UI Runner Recurring Event")
         openItem("iOS UI date clearing Event")
         let addDate = app.switches["Add date"]
@@ -336,6 +358,71 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
             let description = copy["description"] as? String ?? ""
             XCTAssertTrue(description.contains("?event="),
                           "The restored Google copy titled \(title) should retain its FileTasks Event backlink.")
+        }
+    }
+
+    private func sharedApiItems() async throws -> [[String: Any]] {
+        let rawURL = ProcessInfo.processInfo.environment["FILETASKS_TEST_API_URL"] ?? "http://localhost:3107"
+        let baseURL = try XCTUnwrap(URL(string: rawURL))
+        var loginRequest = URLRequest(url: baseURL.appendingPathComponent("api/auth/login"))
+        loginRequest.httpMethod = "POST"
+        loginRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        loginRequest.httpBody = try JSONSerialization.data(withJSONObject: ["email": sharedEmail, "password": password])
+        let (loginData, loginResponse) = try await URLSession.shared.data(for: loginRequest)
+        XCTAssertEqual((loginResponse as? HTTPURLResponse)?.statusCode, 200,
+                       "The UI acceptance account should be readable through the shared public API.")
+        let login = try XCTUnwrap(try JSONSerialization.jsonObject(with: loginData) as? [String: Any])
+        let token = try XCTUnwrap(login["token"] as? String)
+
+        var itemsRequest = URLRequest(url: baseURL.appendingPathComponent("api/items"))
+        itemsRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (itemsData, itemsResponse) = try await URLSession.shared.data(for: itemsRequest)
+        XCTAssertEqual((itemsResponse as? HTTPURLResponse)?.statusCode, 200,
+                       "The shared API should return saved items for the UI acceptance account.")
+        let response = try XCTUnwrap(try JSONSerialization.jsonObject(with: itemsData) as? [String: Any])
+        return try XCTUnwrap(response["items"] as? [[String: Any]])
+    }
+
+    private func assertLocalFirstOccurrencePublicState(
+        originalRoot: [String: Any],
+        originalRootID: String,
+        originalSeriesID: String,
+        originalRows: [[String: Any]],
+        originalReminder: [String: Any],
+        newTitle: String
+    ) async throws {
+        let updatedRows = try await sharedApiItems().filter { $0["seriesId"] as? String == originalSeriesID }
+        XCTAssertEqual(updatedRows.count, originalRows.count,
+                       "A first-Occurrence edit should retain all existing public Occurrences.")
+        let updatedRoot = try XCTUnwrap(updatedRows.first { $0["id"] as? String == originalRootID })
+        XCTAssertEqual(updatedRoot["title"] as? String, newTitle)
+        XCTAssertNil(updatedRoot["scheduledDate"], "The UI's local schedule edit should clear only the first Occurrence date.")
+        XCTAssertNil(updatedRoot["scheduledTime"], "Clearing the first Occurrence date should clear its local time.")
+        XCTAssertNil(updatedRoot["recurrence"], "The first Occurrence's local recurrence choice should be off.")
+        XCTAssertEqual(updatedRoot["occurrenceDate"] as? String, originalRoot["occurrenceDate"] as? String,
+                       "The first Occurrence should retain its immutable original identity.")
+
+        let updatedReminder = try XCTUnwrap((updatedRoot["reminders"] as? [[String: Any]])?.first)
+        let originalAmount = try XCTUnwrap(originalReminder["amount"] as? Int)
+        XCTAssertEqual(updatedReminder["amount"] as? Int, originalAmount + 1,
+                       "The first Occurrence's Reminder edit should be persisted independently.")
+        for key in ["delivery", "unit", "time"] {
+            XCTAssertEqual(updatedReminder[key] as? String, originalReminder[key] as? String,
+                           "The first Occurrence Reminder should preserve unchanged \(key).")
+        }
+
+        for original in originalRows where (original["id"] as? String) != originalRootID {
+            let occurrenceID = try XCTUnwrap(original["id"] as? String)
+            let updated = try XCTUnwrap(updatedRows.first { $0["id"] as? String == occurrenceID },
+                                        "The original generated Occurrence \(occurrenceID) should remain present.")
+            for key in ["title", "scheduledDate", "scheduledTime", "occurrenceDate"] {
+                XCTAssertEqual(updated[key] as? String, original[key] as? String,
+                               "A local first-Occurrence edit should not change a later Occurrence's \(key).")
+            }
+            XCTAssertEqual((updated["recurrence"] as? NSDictionary), (original["recurrence"] as? NSDictionary),
+                           "A local recurrence choice should not change the later Occurrences' series rule.")
+            XCTAssertEqual((updated["reminders"] as? NSArray), (original["reminders"] as? NSArray),
+                           "A local Reminder edit should not change later Occurrences' Reminders.")
         }
     }
 
@@ -732,6 +819,46 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: editor)
         XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 30), .completed,
                        "A successful scoped save should close the editor after refreshing every affected Occurrence.")
+    }
+
+    private func editFirstOccurrenceLocally(title: String, newTitle: String) {
+        let rows = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", title))
+        let firstOccurrence = rows.element(boundBy: 0)
+        scrollToHittable(firstOccurrence, toward: .down, maxSwipes: 12,
+                         message: "The first recurring Occurrence should be available for a local edit.")
+        firstOccurrence.tap()
+        XCTAssertTrue(app.navigationBars["Edit Task"].waitForExistence(timeout: 5),
+                      "The first recurring Task should open the real editor.")
+        setTitle(newTitle)
+
+        let repeatToggle = element(identifier: "itemEditor.recurrence.enabled")
+        scrollToHittable(repeatToggle, toward: .down, message: "The first Occurrence should expose its local Recurrence choice.")
+        XCTAssertEqual(repeatToggle.value as? String, "1", "The selected first Occurrence should initially inherit the series Recurrence rule.")
+        repeatToggle.tap()
+        XCTAssertEqual(repeatToggle.value as? String, "0", "The first Occurrence should be able to turn off recurrence locally.")
+
+        let addDate = element(identifier: "itemEditor.schedule.includesDate")
+        scrollToHittable(addDate, toward: .down, message: "The first Occurrence should expose its local schedule.")
+        XCTAssertEqual(addDate.value as? String, "1")
+        addDate.tap()
+        XCTAssertEqual(addDate.value as? String, "0", "The first Occurrence should be able to clear its date locally.")
+
+        let amount = element(identifier: "itemEditor.reminder.amount.0")
+        let currentAmount = Int((amount.value as? String) ?? amount.label) ?? 0
+        setReminderAmount(amount, to: currentAmount + 1)
+
+        let scopePicker = element(identifier: "itemEditor.scope")
+        scrollToHittable(scopePicker, toward: .down, message: "A first-Occurrence edit should offer an explicit local scope.")
+        scopePicker.tap()
+        let occurrenceScope = app.buttons["This Occurrence"]
+        XCTAssertTrue(occurrenceScope.waitForExistence(timeout: 5), "The editor should offer this Occurrence scope.")
+        occurrenceScope.tap()
+
+        saveCurrentItem()
+        let editor = app.navigationBars["Edit Task"]
+        let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: editor)
+        XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 30), .completed,
+                       "A local first-Occurrence edit should save and refresh the real agenda.")
     }
 
     private func assertOccurrenceRows(title: String, atLeast count: Int) {

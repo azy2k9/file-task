@@ -3439,7 +3439,7 @@ test("editing the first Occurrence locally preserves its recurrence definition a
       recurrence: { interval: 1, unit: "days", end: { type: "never" } },
       reminders: [{ delivery: "notification", amount: 1, unit: "days", time: "09:00" }],
     } });
-    assert.equal(created.status, 201);
+    assert.equal(created.status, 201, await created.clone().text());
     const root = (await created.json()).item;
     const file = (await (await request("/api/files", { token: owner.token, method: "POST", body: { name: "Series notes", url: "https://example.com/series-notes" } })).json()).file;
     assert.equal((await request(`/api/files/${file.id}/attachments`, { token: owner.token, method: "POST", body: { itemId: root.id, scope: "series" } })).status, 201);
@@ -3482,6 +3482,53 @@ test("editing the first Occurrence locally preserves its recurrence definition a
     assert.equal(generated.scheduledTime, "08:00");
     assert.deepEqual(generated.reminders, [{ delivery: "notification", amount: 1, unit: "days", time: "09:00" }]);
     assert.deepEqual(generated.files.map(({ id }) => id), [file.id]);
+  } finally { await setTestClock(previousClock); }
+});
+
+test("legacy recurring roots are backfilled without changing public item data", async () => {
+  const owner = await account();
+  const previousClock = new Date(testClock);
+  const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "task", title: "Legacy recurring task", details: "Keep existing details", scheduledDate: "2026-11-01", scheduledTime: "08:15",
+    recurrence: { interval: 1, unit: "days", end: { type: "never" } },
+    reminders: [{ delivery: "notification", amount: 2, unit: "days", time: "09:30" }],
+  } });
+    assert.equal(created.status, 201, await created.clone().text());
+  const root = (await created.json()).item;
+  const before = (await (await request("/api/items", { token: owner.token })).json()).items
+    .filter(({ seriesId }) => seriesId === root.id).map(({ id, title, details, scheduledDate, scheduledTime, occurrenceDate, recurrence, reminders }) =>
+      ({ id, title, details, scheduledDate, scheduledTime, occurrenceDate, recurrence, reminders }));
+  assert.ok(before.length > 1);
+
+  try {
+    const db = new DatabaseSync(join(directory, "workspace.sqlite"));
+    try {
+      const row = db.prepare("SELECT user_id FROM items WHERE id=?").get(root.id);
+      assert.ok(row);
+      db.prepare("DELETE FROM item_series_definitions WHERE user_id=? AND series_root_id=?").run(row.user_id, root.id);
+    } finally { db.close(); }
+
+    await stopServer();
+    await startServer();
+    const after = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ seriesId }) => seriesId === root.id).map(({ id, title, details, scheduledDate, scheduledTime, occurrenceDate, recurrence, reminders }) =>
+        ({ id, title, details, scheduledDate, scheduledTime, occurrenceDate, recurrence, reminders }));
+    assert.deepEqual(after, before, "migration backfill must preserve existing Occurrences and their public values");
+
+    const firstOverride = await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: {
+      title: "Local legacy root override", scheduledDate: "2026-10-20", recurrence: null, scope: "occurrence",
+    } });
+    assert.equal(firstOverride.status, 200);
+
+    await setTestClock(previousClock.getTime() + 372 * 86_400_000);
+    const afterAdvance = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === root.id);
+    const previousIds = new Set(before.map(({ id }) => id));
+    const newlyGenerated = afterAdvance.find(({ id }) => !previousIds.has(id));
+    assert.ok(newlyGenerated, "the backfilled legacy series should materialize a new Occurrence after clock advancement");
+    assert.notEqual(newlyGenerated.id, root.id);
+    assert.equal(newlyGenerated.title, "Legacy recurring task", "migration must retain the saved series definition instead of replacing it with a root override");
+    assert.equal(newlyGenerated.scheduledTime, "08:15");
+    assert.deepEqual(newlyGenerated.reminders, [{ delivery: "notification", amount: 2, unit: "days", time: "09:30" }]);
   } finally { await setTestClock(previousClock); }
 });
 
@@ -3531,6 +3578,29 @@ test("a series Attachment is available from every Occurrence and can be removed 
   assert.deepEqual((await (await request("/api/files", { token: owner.token })).json()).files[0].attachments.map(({ scope }) => scope), ["series"]);
   assert.equal((await request(`/api/files/${file.id}/attachments/${series.id}?scope=series`, { token: owner.token, method: "DELETE" })).status, 204);
   assert.deepEqual((await (await request(`/api/items/${occurrences[1].id}`, { token: owner.token })).json()).item.files, []);
+});
+
+test("reattaching an excluded first Occurrence preserves its series Attachment", async () => {
+  const owner = await account();
+  const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "Quarterly review", scheduledDate: "2026-11-01",
+    recurrence: { interval: 1, unit: "months", end: { type: "count", count: 3 } },
+  } });
+  const series = (await created.json()).item;
+  const file = (await (await request("/api/files", { token: owner.token, method: "POST", body: {
+    name: "Review notes", url: "https://example.com/review-notes",
+  } })).json()).file;
+  assert.equal((await request(`/api/files/${file.id}/attachments`, { token: owner.token, method: "POST", body: { itemId: series.id, scope: "series" } })).status, 201);
+  const before = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === series.id);
+  assert.equal((await request(`/api/files/${file.id}/attachments/${series.id}?scope=occurrence`, { token: owner.token, method: "DELETE" })).status, 204);
+  assert.equal((await request(`/api/items/${series.id}`, { token: owner.token })).status, 200);
+  assert.deepEqual((await (await request(`/api/items/${series.id}`, { token: owner.token })).json()).item.files, []);
+
+  assert.equal((await request(`/api/files/${file.id}/attachments`, { token: owner.token, method: "POST", body: { itemId: series.id, scope: "occurrence" } })).status, 201);
+  const after = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === series.id);
+  assert.deepEqual(after.map(({ files }) => files.length), [1, 1, 1]);
+  assert.deepEqual((await (await request("/api/files", { token: owner.token })).json()).files[0].attachments.map(({ scope }) => scope), ["series"]);
+  assert.equal(before.length, 3);
 });
 
 test("a following Attachment and edit apply from the selected Occurrence onward", async () => {
@@ -3599,6 +3669,56 @@ test("the Apple provider fake validates iCalendar PUTs and reports stored calend
   assert.ok(reportXml.includes("UID:report-round-trip@example.test"));
   await fetch(`${deliveryBase}${resourcePath}`, { method: "DELETE" });
   assert.equal(appleEvents.has(resourcePath), false);
+});
+
+test("the browser editor keeps a first Occurrence edit local to the series root", async () => {
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const page = await context.newPage();
+  try {
+    await page.goto(base);
+    await page.getByRole("group", { name: "Account action" }).getByRole("button", { name: "Create account", exact: true }).click();
+    const email = `browser-first-occurrence-${crypto.randomUUID()}@example.com`;
+    await page.getByLabel("Email", { exact: true }).fill(email);
+    await page.getByLabel("Password", { exact: true }).fill("correct-horse-battery");
+    await page.locator("form").getByRole("button", { name: "Create account", exact: true }).click();
+
+    await page.getByRole("button", { name: "New Task", exact: true }).click();
+    await page.getByLabel("Title", { exact: true }).fill("Browser recurring root");
+    await page.getByLabel(/^Date\b/).fill("2026-11-04");
+    await page.getByLabel("Repeat", { exact: true }).check();
+    await page.getByRole("button", { name: "+ Add Reminder", exact: true }).click();
+    await page.getByLabel("Reminder 1 offset", { exact: true }).fill("1");
+    await page.getByRole("button", { name: "Save Task", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Browser recurring root", exact: true })).toBeVisible();
+
+    const login = await request("/api/auth/login", { method: "POST", body: { email, password: "correct-horse-battery" } });
+    const owner = await login.json();
+    const items = () => request("/api/items", { token: owner.token }).then((response) => response.json()).then(({ items }) => items);
+    const recurringRoot = (await items()).find(({ title, seriesId }) => title === "Browser recurring root" && seriesId);
+    assert.ok(recurringRoot);
+    const originalFollowing = (await items()).find(({ seriesId, id }) => seriesId === recurringRoot.id && id !== recurringRoot.id);
+    assert.ok(originalFollowing);
+
+    await page.getByRole("button", { name: "Edit Browser recurring root", exact: true }).click();
+    await page.getByLabel("Title", { exact: true }).fill("Browser local first Occurrence");
+    await page.getByLabel(/^Date\b/).fill("2026-11-05");
+    await page.getByLabel("Repeat", { exact: true }).uncheck();
+    await page.getByLabel("Reminder 1 offset", { exact: true }).fill("3");
+    await page.getByLabel("Apply changes to", { exact: true }).selectOption("occurrence");
+    await page.getByRole("button", { name: "Save Task", exact: true }).click();
+
+    const editedRoot = (await request(`/api/items/${recurringRoot.id}`, { token: owner.token }).then((response) => response.json())).item;
+    assert.equal(editedRoot.title, "Browser local first Occurrence");
+    assert.equal(editedRoot.scheduledDate, "2026-11-05");
+    assert.equal(editedRoot.recurrence, null);
+    assert.equal(editedRoot.reminders[0].amount, 3);
+    const followingAfterLocalEdit = (await request(`/api/items/${originalFollowing.id}`, { token: owner.token }).then((response) => response.json())).item;
+    assert.equal(followingAfterLocalEdit.title, "Browser recurring root");
+    assert.equal(followingAfterLocalEdit.scheduledDate, originalFollowing.scheduledDate);
+    assert.equal(followingAfterLocalEdit.recurrence.unit, "weeks");
+    assert.equal(followingAfterLocalEdit.reminders[0].amount, 1);
+  } finally { await context.close(); await browser.close(); }
 });
 
 test("a person can manage Tasks and Events through the browser and see another client's changes", async () => {
