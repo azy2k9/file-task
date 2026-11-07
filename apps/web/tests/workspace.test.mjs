@@ -108,6 +108,18 @@ function validCompactDateTime(value, requireZulu = false) {
     && hour < 24 && minute < 60 && second < 60;
 }
 
+function appleCopiesForItem(title) {
+  return [...appleEvents.entries()].filter(([, calendarData]) => calendarData.includes(`SUMMARY:${title}\r\n`));
+}
+
+function googleCopiesForItem(title) {
+  return [...googleEvents.entries()].filter(([, event]) => event.summary === title);
+}
+
+function withoutAppleSyncMetadata(calendarData) {
+  return calendarData.replace(/^URL:.*\r?\n/gm, "").replace(/^X-FILETASKS-SYNC-GENERATION:.*\r?\n/gm, "");
+}
+
 function validIcsDateValue(value, parameters = {}) {
   return parameters.VALUE?.toUpperCase() === "DATE" ? validCompactDate(value) : validCompactDateTime(value);
 }
@@ -4234,7 +4246,7 @@ test("a person can manage Tasks and Events through the browser and see another c
     await expect(page.getByText("Synced apple Calendar.", { exact: false })).toBeVisible();
     await expect(page.getByLabel("Calendar sync limitations")).toContainText("earlier or unknown connection");
     assert.equal(appleEvents.get(oldCollectionCopy[0]), oldCollectionCopy[1], "reconnect must preserve the previous collection's copy");
-    assert.equal(appleEvents.get("/apple/calendar-b/unrelated-b.ics"), unrelatedCollectionCopy, "sync must preserve an unrelated Event in the selected collection");
+    assert.equal(withoutAppleSyncMetadata(appleEvents.get("/apple/calendar-b/unrelated-b.ics")), unrelatedCollectionCopy, "sync must preserve an unrelated Event in the selected collection");
     assert.ok([...appleEvents.entries()].some(([path, calendarData]) => path.startsWith("/apple/calendar-b/")
       && calendarData.includes("SUMMARY:New collection B event")), "new work should export to the selected collection");
     assert.ok(providerRequests.slice(appleRequestsBeforeSwitch).filter(({ path }) => path.startsWith("/apple/"))
@@ -6150,7 +6162,7 @@ test("Apple schedule edits that end in the repeated DST hour pause export", asyn
     const sync = await request("/api/calendars/sync",{token:owner.token,method:"POST"});
     assert.ok((await sync.json()).syncLimitations.some((entry) => entry.itemId === item.id));
     assert.equal(appleEvents.size,1);
-    assert.equal(appleEvents.get(path),original);
+    assert.equal(withoutAppleSyncMetadata(appleEvents.get(path)),original);
   } finally { appleEvents=priorAppleEvents; }
 });
 
@@ -6624,7 +6636,7 @@ test("imported provider titles preserve whitespace until deliberately edited", a
       if (provider === "apple") appleEvents.set(path, original);
       else googleEvents.set("whitespace", {id: "whitespace", summary: title, start: {date: "2027-01-14"}, end: {date: "2027-01-15"}});
       assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
-      if (provider === "apple") assert.equal(appleEvents.get(path), original);
+      if (provider === "apple") assert.equal(withoutAppleSyncMetadata(appleEvents.get(path)), original);
       else assert.equal(googleEvents.get("whitespace").summary, title);
       const item = (await (await request("/api/items", {token: owner.token})).json()).items.find(entry => entry.title.trim() === "Whitespace title");
       assert.ok(item);
