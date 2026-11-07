@@ -254,7 +254,12 @@ class RecurringAgendaUiTest {
         compose.onNodeWithTag("agenda.edit.${item.id}").performClick()
         compose.onNodeWithText("Title").performTextClearance()
         compose.onNodeWithText("Title").performTextInput(title)
-        compose.onNodeWithText(scope).performScrollTo().performClick()
+        try {
+            compose.onNodeWithText(scope).performScrollTo().performClick()
+        } catch (failure: AssertionError) {
+            val serverItem = items(api, token).singleOrNull { it.id == item.id }
+            throw AssertionError("Could not select edit scope '$scope' for item ${item.id}; passed seriesId=${item.seriesId}; server=$serverItem; UI=${compose.onRoot(useUnmergedTree = true).printToString()}", failure)
+        }
         compose.onNodeWithText("Save").performClick()
         waitFor("the edit editor to close") { compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty() }
     }
