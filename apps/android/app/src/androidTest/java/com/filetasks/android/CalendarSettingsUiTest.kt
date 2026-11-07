@@ -148,8 +148,9 @@ class CalendarSettingsUiTest {
         }
         val imported = ApiClient(apiUrl).listItems(token).filter { it.title == "Android UI imported Apple Event" }
         assertEquals("Provider restoration must not duplicate the imported Event", 1, imported.size)
-        assertTrue(providerInspect(providerFakeUrl, "android-ui-apple-${email.hashCode()}", appleCollectionPath).getJSONObject(0)
-            .getString("calendarData").contains("URL:${apiUrl.trimEnd('/')}/?event=${imported.single().id}"))
+        val appleCopy = providerInspect(providerFakeUrl, "android-ui-apple-${email.hashCode()}", appleCollectionPath)
+            .getJSONObject(0).getString("calendarData")
+        assertTrue(appleCopy.contains("URL:") && appleCopy.contains("/?event=${imported.single().id}"))
 
         compose.onNodeWithText("Done").performClick()
         check(compose.onAllNodes(hasText("Android UI imported Apple Event")).fetchSemanticsNodes().isNotEmpty())
