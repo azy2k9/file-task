@@ -3789,7 +3789,7 @@ test("a person can manage Tasks and Events through the browser and see another c
     await page.getByRole("button", { name: "Add Attachment", exact: true }).click();
     await expect(page.getByText("Event: Birthday dinner", { exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Remove Attachment from Compare car insurance", exact: true }).click();
-    await expect(page.getByText("Deleting this File removes it from 2 Tasks or Events.", { exact: true })).toBeVisible();
+    await expect(page.getByText("Deleting this File removes all of its Attachments.", { exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Cancel", exact: true }).click();
     await page.getByRole("button", { name: "Event: Birthday dinner", exact: true }).click();
     await expect(page.getByRole("dialog")).toBeVisible();
