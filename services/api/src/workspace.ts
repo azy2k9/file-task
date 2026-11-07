@@ -127,7 +127,13 @@ function reminderLeadDays(raw: unknown) {
 
 function occurrenceDates(startValue: string, rule: RecurrenceRule, leadDays = 0, rollingFrom?: string) {
   const start = new Date(`${startValue}T00:00:00Z`);
-  const horizon = now(); horizon.setUTCDate(horizon.getUTCDate() + Math.max(370, leadDays) + 2);
+  // Extend through the next recurrence boundary as well as the Reminder lead.
+  // Otherwise a monthly/yearly series can have no candidate inside the exact
+  // lead horizon, even though its next Occurrence is the one that must notify.
+  const recurrencePaddingDays = rule.unit === "weeks" ? rule.interval * 7
+    : rule.unit === "months" ? rule.interval * 31
+      : rule.unit === "years" ? rule.interval * 366 : 0;
+  const horizon = now(); horizon.setUTCDate(horizon.getUTCDate() + Math.max(370, leadDays) + recurrencePaddingDays + 2);
   const stop = rule.end.type === "date" ? new Date(`${rule.end.date}T00:00:00Z`) : horizon;
   const maxDate = rule.end.type === "date" && stop < horizon ? stop : horizon;
   const dates = [startValue];

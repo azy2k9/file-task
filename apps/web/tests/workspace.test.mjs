@@ -1779,6 +1779,56 @@ test("long-lead Reminders extend rolling Occurrence materialization beyond the f
   assert.equal(longLeadOccurrences.some(({ id }) => notifications.some(({ itemId }) => itemId === id)), true);
 });
 
+test("a 20,000-hour Reminder has its future Occurrence materialized before the provider due time", async () => {
+  const owner = await account();
+  const previousClock = new Date(testClock);
+  try {
+    await setTestClock("2026-11-07T12:00:00.000Z");
+    const today = testClock.toISOString().slice(0, 10);
+    assert.equal((await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: { emailEnabled: true } })).status, 200);
+    const root = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "event", title: "Twenty thousand hour Reminder", scheduledDate: today, scheduledTime: "10:00",
+      recurrence: { interval: 1, unit: "months", end: { type: "never" } },
+      reminders: [{ delivery: "email", amount: 20_000, unit: "hours", time: "10:00" }],
+    } })).json()).item;
+    const occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ seriesId, scheduledDate }) => seriesId === root.id && scheduledDate > today);
+    const target = occurrences.find(({ scheduledDate }) => Date.parse(`${scheduledDate}T10:00:00.000Z`) - testClock.getTime() >= 20_000 * 3_600_000);
+    assert.ok(target, "an Occurrence beyond the former 370-day horizon should already be visible");
+
+    const dueAt = Date.parse(`${target.scheduledDate}T10:00:00.000Z`) - 20_000 * 3_600_000;
+    await setTestClock(dueAt - 1);
+    await runReminderWorker();
+    assert.equal(deliveryRequests.some(({ body }) => body.operation === "deliver" && body.reminder?.itemId === target.id), false);
+    await setTestClock(dueAt);
+    await runReminderWorker();
+    const delivery = deliveryRequests.find(({ body }) => body.operation === "deliver" && body.reminder?.itemId === target.id);
+    assert.ok(delivery, "the provider should receive the delivery when the Reminder becomes due");
+    assert.equal(delivery.body.reminder.scheduledAt, new Date(dueAt).toISOString());
+  } finally { await setTestClock(previousClock); }
+});
+
+test("old never-ending daily series materialize current and upcoming Occurrences without losing root history", async () => {
+  const owner = await account();
+  const previousClock = new Date(testClock);
+  try {
+    await setTestClock("2026-11-07T12:00:00.000Z");
+    const root = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "task", title: "Old daily series", scheduledDate: "1990-01-01",
+      recurrence: { interval: 1, unit: "days", end: { type: "never" } },
+    } })).json()).item;
+    await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: { completed: true } });
+    const occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ seriesId }) => seriesId === root.id);
+    const dates = new Set(occurrences.map(({ scheduledDate }) => scheduledDate));
+    assert.equal(dates.has("2026-11-07"), true);
+    assert.equal(dates.has("2026-11-08"), true);
+    assert.equal(occurrences.some(({ id, completed }) => id === root.id && completed), true,
+      "materialization must preserve the root Occurrence completion history");
+    assert.ok(occurrences.length < 500, "generation should stay bounded to the rolling window");
+  } finally { await setTestClock(previousClock); }
+});
+
 test("recurring item deletion requires a scope and preserves the requested range", async () => {
   const owner = await account();
   const root = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
