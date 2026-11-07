@@ -108,7 +108,8 @@ class RecurringAgendaUiTest {
         val laterTaskOccurrences = initialTaskRows.drop(1)
         editFirstOccurrence(firstTaskOccurrence)
         waitFor("the first Occurrence edit to be saved without changing the series") {
-            val savedRows = items(api, token).filter { it.occurrenceDate in initialTaskRows.map { row -> row.occurrenceDate } }
+            val originalIds = initialTaskRows.map { it.id }.toSet()
+            val savedRows = items(api, token).filter { it.id in originalIds }
             val savedFirst = savedRows.singleOrNull { it.id == firstTaskOccurrence.id }
             val savedLater = laterTaskOccurrences.mapNotNull { original -> savedRows.singleOrNull { it.id == original.id } }
             savedFirst?.title == "Android UI First Task Only"
