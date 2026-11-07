@@ -566,6 +566,8 @@ function patchImportedAppleIcs(metadata: ImportMetadataRow, item: EventItem) {
   const baseline = JSON.parse(metadata.baseline_json) as {scheduledDate:string|null;scheduledTime:string|null;title?:string;details?:string};
   if (typeof baseline.title === "string" && baseline.title !== item.title) changes.set("SUMMARY",`SUMMARY:${escapeIcs(item.title)}`);
   if (typeof baseline.details === "string" && baseline.details !== item.details) changes.set("DESCRIPTION",item.details ? `DESCRIPTION:${escapeIcs(item.details)}` : null);
+  const backlink = filetasksEventUrl(item.id);
+  if (backlink) changes.set("URL",`URL:${backlink}`);
   const implicitAllDayEnd = timingResult.kind === "allDay" && directIndex("DTEND") < 0 && directIndex("DURATION") < 0;
   if (implicitAllDayEnd) changes.set("DTEND",`DTEND;VALUE=DATE:${compactDate(timingResult.endDate)}`);
   if (baseline.scheduledDate !== item.scheduledDate || baseline.scheduledTime !== item.scheduledTime) {
