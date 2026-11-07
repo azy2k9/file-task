@@ -2194,13 +2194,17 @@ test("a held DELETE authorization result survives a newer Event generation and r
     } });
     await deleteStarted;
 
-    failGoogleRequests = [{ path: deletePath, method: "DELETE", status: 503 }];
-    assert.equal((await request(`/api/items/${otherEvent.id}`, { token: owner.token, method: "PATCH", body: {
+    const generationAtDelete = db.prepare("SELECT generation FROM calendar_sync_state WHERE user_id=? AND provider='google'").get(owner.user.id).generation;
+    failGoogleRequests = Array.from({length:10}, () => ({ path: deletePath, method: "DELETE", status: 503 }));
+    const newerMutation = request(`/api/items/${otherEvent.id}`, { token: owner.token, method: "PATCH", body: {
       title: "Newer Event generation",
-    } })).status, 200);
-    assert.equal(failGoogleRequests.length, 0, "the newer generation's generic DELETE failure should be exercised");
+    } });
+    await expect.poll(() => db.prepare("SELECT generation FROM calendar_sync_state WHERE user_id=? AND provider='google'").get(owner.user.id).generation)
+      .toBeGreaterThan(generationAtDelete);
     releaseDelete();
     assert.equal((await firstMutation).status, 200);
+    assert.equal((await newerMutation).status, 200);
+    assert.ok(failGoogleRequests.length < 10, "the newer sync generation should retry the failed deletion");
     assert.equal(googleEvents.has(removedCopy[0]), true, "the denied DELETE should retain its provider identity");
 
     let delivery = (await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery;
@@ -2210,7 +2214,6 @@ test("a held DELETE authorization result survives a newer Event generation and r
     assert.match(status?.lastError ?? "", /Reauthorize Google Calendar/i);
     assert.equal(status?.state, "failed", "the newer generic retry state should remain intact");
 
-    failGoogleRequests = [{ path: deletePath, method: "DELETE", status: 503 }];
     assert.equal((await request("/api/calendars/sync", { token: owner.token, method: "POST" })).status, 200);
     delivery = (await (await request("/api/calendars", { token: owner.token })).json()).syncDelivery;
     status = delivery.find((entry) => entry.provider === "google");
@@ -2727,6 +2730,197 @@ test("Apple Calendar reconnect keeps Calendar copy identity scoped to its connec
   } finally {
     db.close();
     for (const path of appleEvents.keys()) if (path.startsWith("/apple/identity-a/") || path.startsWith("/apple/identity-b/")) appleEvents.delete(path);
+  }
+});
+
+test("Apple retry work is rebound to a new collection and cannot claim the prior scope", async () => {
+  const owner=await account();
+  const connect=(name)=>request("/api/calendars",{token:owner.token,method:"POST",body:{
+    username:`${name}@example.com`,password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/${name}/`,
+  }});
+  const db=new DatabaseSync(join(directory,"workspace.sqlite"));
+  try {
+    assert.equal((await connect("retry-a")).status,201);
+    const created=await request("/api/items",{token:owner.token,method:"POST",body:{
+      kind:"event",title:"Retry only on active collection",scheduledDate:"2027-04-14",
+    }});
+    assert.equal(created.status,201);
+    const event=(await created.json()).item;
+    const pathA=[...appleEvents.keys()].find((path)=>path.startsWith("/apple/retry-a/"));
+    assert.ok(pathA);
+    const originalA=appleEvents.get(pathA);
+    const oldState=db.prepare("SELECT generation,connection_scope_id FROM calendar_sync_state WHERE user_id=? AND provider='apple'")
+      .get(owner.user.id);
+    assert.ok(oldState);
+    db.prepare("UPDATE calendar_sync_state SET state='failed',attempts=1,next_attempt_at=0 WHERE user_id=? AND provider='apple'")
+      .run(owner.user.id);
+    const staleSnapshot={generation:oldState.generation,connectionScopeId:oldState.connection_scope_id,nextAttemptAt:0};
+
+    const unrelatedPath=pathA.replace("/retry-a/","/retry-b/");
+    const unrelated="BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:unrelated-retry-b\r\nDTSTAMP:20261013T120000Z\r\nDTSTART;VALUE=DATE:20270415\r\nDTEND;VALUE=DATE:20270416\r\nSUMMARY:Unrelated collection B event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    appleEvents.set(unrelatedPath,unrelated);
+    assert.equal((await connect("retry-b")).status,201);
+    const newConnection=db.prepare("SELECT connection_scope_id FROM calendar_connections WHERE user_id=? AND provider='apple'").get(owner.user.id);
+    const rebound=db.prepare("SELECT generation,connection_scope_id,state FROM calendar_sync_state WHERE user_id=? AND provider='apple'").get(owner.user.id);
+    assert.notEqual(newConnection.connection_scope_id,oldState.connection_scope_id);
+    assert.ok(rebound.generation>staleSnapshot.generation);
+    assert.equal(rebound.connection_scope_id,newConnection.connection_scope_id);
+    assert.equal(rebound.state,"pending");
+    const staleClaim=db.prepare(`UPDATE calendar_sync_state SET generation=generation+1,state='pending'
+      WHERE user_id=? AND provider='apple' AND generation=? AND connection_scope_id IS ? AND next_attempt_at=?
+        AND EXISTS(SELECT 1 FROM calendar_connections c WHERE c.user_id=calendar_sync_state.user_id AND c.provider=calendar_sync_state.provider AND c.connection_scope_id IS calendar_sync_state.connection_scope_id)`)
+      .run(owner.user.id,staleSnapshot.generation,staleSnapshot.connectionScopeId,staleSnapshot.nextAttemptAt);
+    assert.equal(staleClaim.changes,0,"a previously captured retry cannot claim after the destination changes");
+
+    providerRequests=[];
+    const worker=await runReminderWorker();
+    assert.equal(worker.status,200);
+    assert.ok(providerRequests.some(({path})=>path.startsWith("/apple/retry-b/")),"fresh work should use the selected collection");
+    assert.equal(providerRequests.some(({path})=>path.startsWith("/apple/retry-a/")),false,"the retry must not use the previous collection");
+    assert.equal(appleEvents.get(pathA),originalA,"the previous copy remains untouched");
+    assert.equal(appleEvents.get(unrelatedPath),unrelated,"unrelated Events in the selected collection remain untouched");
+    assert.equal(event.title,"Retry only on active collection");
+  } finally {
+    db.close();
+    for(const path of appleEvents.keys()) if(path.startsWith("/apple/retry-a/")||path.startsWith("/apple/retry-b/")) appleEvents.delete(path);
+  }
+});
+
+test("a claimed Calendar retry stops when its destination changes before execution", async () => {
+  const accounts=[await account(),await account()].sort((left,right)=>left.user.id.localeCompare(right.user.id));
+  const [blocker,target]=accounts;
+  const connect=(owner,path)=>request("/api/calendars",{token:owner.token,method:"POST",body:{
+    username:`${owner.user.id}@example.com`,password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/${path}/`,
+  }});
+  const db=new DatabaseSync(join(directory,"workspace.sqlite"));
+  let release; let arrived;
+  const ready=new Promise(resolve=>{release=resolve;});
+  const firstRequest=new Promise(resolve=>{arrived=resolve;});
+  let worker;
+  try {
+    assert.equal((await connect(blocker,"claimed-blocker")).status,201);
+    assert.equal((await connect(target,"claimed-a")).status,201);
+    for (const owner of [blocker,target]) {
+      const created=await request("/api/items",{token:owner.token,method:"POST",body:{
+        kind:"event",title:"Claimed work",scheduledDate:"2027-04-14",
+      }});
+      assert.equal(created.status,201);
+      db.prepare("UPDATE calendar_sync_state SET state='failed',next_attempt_at=0 WHERE user_id=? AND provider='apple'")
+        .run(owner.user.id);
+    }
+    const targetCopy=[...appleEvents.keys()].find(path=>path.startsWith("/apple/claimed-a/"));
+    assert.ok(targetCopy);
+    const targetSnapshot=appleEvents.get(targetCopy);
+    const unrelatedProviderPath=targetCopy.replace("/claimed-a/","/claimed-b/");
+    const unrelated="BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:unrelated-claimed-b\r\nDTSTAMP:20261013T120000Z\r\nDTSTART;VALUE=DATE:20270415\r\nDTEND;VALUE=DATE:20270416\r\nSUMMARY:Unrelated collection B event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    appleEvents.set(unrelatedProviderPath,unrelated);
+    db.prepare("UPDATE calendar_sync_state SET next_attempt_at=? WHERE state IN ('pending','failed') AND user_id NOT IN (?,?)")
+      .run(Number.MAX_SAFE_INTEGER,blocker.user.id,target.user.id);
+    db.prepare("UPDATE calendar_creation_cleanup SET next_attempt_at=? WHERE user_id NOT IN (?,?)")
+      .run(Number.MAX_SAFE_INTEGER,blocker.user.id,target.user.id);
+    appleInventoryBarrier={arrivals:0,ready,release,arrived};
+    const requestsBeforeWorker=providerRequests.length;
+    worker=runReminderWorker();
+    await firstRequest;
+    const reconnect=await connect(target,"claimed-b");
+    assert.equal(reconnect.status,201);
+    const requestsBeforeWorkerResumes=providerRequests.length;
+    release();
+    assert.equal((await worker).status,200);
+    assert.equal(providerRequests.slice(requestsBeforeWorkerResumes).some(({path})=>path.startsWith("/apple/claimed-a/")||path.startsWith("/apple/claimed-b/")),false,
+      "the old claimed generation cannot send requests to either collection after the switch");
+    assert.equal(appleEvents.get(targetCopy),targetSnapshot,"the former collection remains unchanged");
+    assert.equal(appleEvents.get(unrelatedProviderPath),unrelated,"the replacement collection's unrelated resource remains unchanged");
+    const current=db.prepare("SELECT connection_scope_id,state FROM calendar_sync_state WHERE user_id=? AND provider='apple'").get(target.user.id);
+    const active=db.prepare("SELECT connection_scope_id FROM calendar_connections WHERE user_id=? AND provider='apple'").get(target.user.id);
+    assert.equal(current.connection_scope_id,active.connection_scope_id);
+    assert.equal(current.state,"pending","the new connection's replacement work remains due");
+  } finally {
+    release?.();
+    appleInventoryBarrier=null;
+    if(worker) await worker.catch(()=>{});
+    db.close();
+    for(const path of appleEvents.keys()) if(path.startsWith("/apple/claimed-blocker/")||path.startsWith("/apple/claimed-a/")||path.startsWith("/apple/claimed-b/")) appleEvents.delete(path);
+  }
+});
+
+test("Apple scope follows both the account and collection", async () => {
+  const owner=await account();
+  const connect=(username)=>request("/api/calendars",{token:owner.token,method:"POST",body:{
+    username,password:"app-specific-password",calendarUrl:`${deliveryBase}/apple/shared-collection/`,
+  }});
+  const db=new DatabaseSync(join(directory,"workspace.sqlite"));
+  try {
+    assert.equal((await connect("same-account@example.com")).status,201);
+    const original=db.prepare("SELECT connection_scope_id FROM calendar_connections WHERE user_id=? AND provider='apple'").get(owner.user.id).connection_scope_id;
+    assert.equal((await connect(" SAME-ACCOUNT@example.com ")).status,201);
+    const sameAccount=db.prepare("SELECT connection_scope_id FROM calendar_connections WHERE user_id=? AND provider='apple'").get(owner.user.id).connection_scope_id;
+    assert.equal(sameAccount,original,"same account and collection keep their copy identity");
+    assert.equal((await connect("another-account@example.com")).status,201);
+    const otherAccount=db.prepare("SELECT connection_scope_id FROM calendar_connections WHERE user_id=? AND provider='apple'").get(owner.user.id).connection_scope_id;
+    assert.notEqual(otherAccount,sameAccount,"a different Apple ID on the same URL gets a new connection scope");
+  } finally { db.close(); }
+});
+
+test("a legacy Calendar retry stays visible while scoped cleanup resumes after migration", async () => {
+  const migrationPath=join(directory,"calendar-sync-migration.sqlite");
+  const collectionPath="/apple/migration-legacy/";
+  let replica;
+  let migrationDb;
+  const replicaRequest=async(path,{method="GET",token,body,headers:providedHeaders={}}={})=>{
+    const headers=new Headers(providedHeaders);
+    headers.set("Connection","close");
+    headers.set("Origin",base);
+    if(token) headers.set("Authorization",`Bearer ${token}`);
+    if(body!==undefined) headers.set("Content-Type","application/json");
+    return fetch(`http://localhost:3117${path}`,{method,headers,...(body===undefined?{}:{body:JSON.stringify(body)})});
+  };
+  try {
+    replica=await startCalendarApiReplica(3117,{FILETASKS_DATABASE_PATH:migrationPath});
+    const registration=await replicaRequest("/api/auth/register",{method:"POST",body:{
+      email:`migration-${crypto.randomUUID()}@example.com`,password:"correct-horse-battery",
+    }});
+    assert.equal(registration.status,201);
+    const owner=await registration.json();
+    assert.equal((await replicaRequest("/api/calendars",{token:owner.token,method:"POST",body:{
+      username:"migration@example.com",password:"app-specific-password",calendarUrl:`${deliveryBase}${collectionPath}`,
+    }})).status,201);
+    migrationDb=new DatabaseSync(migrationPath);
+    const connection=migrationDb.prepare("SELECT connection_scope_id FROM calendar_connections WHERE user_id=? AND provider='apple'").get(owner.user.id);
+    migrationDb.prepare(`INSERT INTO calendar_creation_cleanup(user_id,provider,connection_scope_id,item_id,external_id,uncertain,pending_attempts,next_attempt_at)
+      VALUES(?,'apple',?,'deleted-before-upgrade','missing-before-upgrade',0,0,0)`).run(owner.user.id,connection.connection_scope_id);
+    migrationDb.prepare(`UPDATE calendar_sync_state SET state='failed',attempts=2,next_attempt_at=0,last_error='Unresolved delivery before upgrade'
+      WHERE user_id=? AND provider='apple'`).run(owner.user.id);
+    await stopCalendarApiReplica(replica);
+    replica=null;
+    migrationDb.exec("ALTER TABLE calendar_sync_state DROP COLUMN connection_scope_id");
+    migrationDb.close();
+    migrationDb=null;
+    replica=await startCalendarApiReplica(3117,{FILETASKS_DATABASE_PATH:migrationPath});
+
+    const migrated=(await (await replicaRequest("/api/calendars",{token:owner.token})).json()).syncDelivery.find((entry)=>entry.provider==="apple");
+    assert.equal(migrated?.state,"failed","the migration must keep unresolved delivery visible");
+    assert.match(migrated?.lastError??"",/Unresolved delivery before upgrade/);
+    const migratedDb=new DatabaseSync(migrationPath);
+    try {
+      const state=migratedDb.prepare("SELECT connection_scope_id,state FROM calendar_sync_state WHERE user_id=? AND provider='apple'").get(owner.user.id);
+      assert.equal(state.connection_scope_id,null,"an unknown prior retry scope must not be assigned to the active credentials");
+      assert.equal(state.state,"failed");
+    } finally { migratedDb.close(); }
+
+    assert.equal((await replicaRequest("/api/internal/reminders/deliver",{method:"POST",headers:{Authorization:"Bearer test-worker-secret"}})).status,200);
+    const finalDb=new DatabaseSync(migrationPath);
+    try {
+      assert.equal(finalDb.prepare("SELECT 1 FROM calendar_creation_cleanup WHERE user_id=? AND item_id='deleted-before-upgrade'").get(owner.user.id),undefined,
+        "the cleanup tombstone's own scope allows safe retry after migration");
+      const state=finalDb.prepare("SELECT state,connection_scope_id FROM calendar_sync_state WHERE user_id=? AND provider='apple'").get(owner.user.id);
+      assert.equal(state.state,"synced");
+      assert.ok(state.connection_scope_id);
+    } finally { finalDb.close(); }
+  } finally {
+    try { migrationDb?.close(); } catch {}
+    if(replica) await stopCalendarApiReplica(replica);
+    appleEvents.delete(`${collectionPath}missing-before-upgrade.ics`);
   }
 });
 
@@ -3407,6 +3601,10 @@ test("the Apple provider fake validates iCalendar PUTs and reports stored calend
 });
 
 test("a person can manage Tasks and Events through the browser and see another client's changes", async () => {
+  const previousAppleEvents=appleEvents;
+  const previousAppleEventVersions=appleEventVersions;
+  appleEvents=new Map();
+  appleEventVersions=new Map();
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   const page = await context.newPage();
@@ -3496,6 +3694,32 @@ test("a person can manage Tasks and Events through the browser and see another c
     assert.ok(postSyncItems.find(({ id }) => id === birthday.id)?.files.some(({ name }) => name === "Application form"));
     const postSyncFiles = (await (await request("/api/files", { token: native.token })).json()).files;
     assert.ok(postSyncFiles.find(({ name }) => name === "Application form").attachments.some(({ itemId }) => itemId === birthday.id));
+    const oldCollectionCopy = [...appleEvents.entries()].find(([path, calendarData]) => path.startsWith("/apple/calendar/")
+      && calendarData.includes(`URL:${base}/?event=${birthday.id}`));
+    assert.ok(oldCollectionCopy, "the first collection should contain the synced Event");
+    const unrelatedCollectionCopy = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//FileTasks Test//Calendar//EN\r\nBEGIN:VEVENT\r\nUID:unrelated-b\r\nDTSTAMP:20261013T120000Z\r\nDTSTART;VALUE=DATE:20271114\r\nDTEND;VALUE=DATE:20271115\r\nSUMMARY:Unrelated collection B event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    appleEvents.set("/apple/calendar-b/unrelated-b.ics", unrelatedCollectionCopy);
+    const appleRequestsBeforeSwitch = providerRequests.length;
+    await page.getByRole("button", { name: "Disconnect", exact: true }).click();
+    await expect(page.getByText("Apple Calendar · browser-calendar@example.com", { exact: true })).toHaveCount(0);
+    await page.getByLabel("Apple ID", { exact: true }).fill("browser-calendar-b@example.com");
+    await page.getByLabel("App-specific password", { exact: true }).fill("fake-app-password-b");
+    await page.getByLabel(/CalDAV calendar URL/).fill(`${deliveryBase}/apple/calendar-b/`);
+    await page.getByRole("button", { name: "Connect Apple Calendar", exact: true }).click();
+    await expect(page.getByText("Apple Calendar · browser-calendar-b@example.com", { exact: true })).toBeVisible();
+    const newCollectionEventResponse = await request("/api/items", { token: native.token, method: "POST", body: {
+      kind: "event", title: "New collection B event", scheduledDate: "2027-12-05",
+    } });
+    assert.equal(newCollectionEventResponse.status, 201);
+    await page.getByRole("button", { name: "Sync Calendar", exact: true }).click();
+    await expect(page.getByText("Synced apple Calendar.", { exact: false })).toBeVisible();
+    await expect(page.getByLabel("Calendar sync limitations")).toContainText("earlier or unknown connection");
+    assert.equal(appleEvents.get(oldCollectionCopy[0]), oldCollectionCopy[1], "reconnect must preserve the previous collection's copy");
+    assert.equal(appleEvents.get("/apple/calendar-b/unrelated-b.ics"), unrelatedCollectionCopy, "sync must preserve an unrelated Event in the selected collection");
+    assert.ok([...appleEvents.entries()].some(([path, calendarData]) => path.startsWith("/apple/calendar-b/")
+      && calendarData.includes("SUMMARY:New collection B event")), "new work should export to the selected collection");
+    assert.ok(providerRequests.slice(appleRequestsBeforeSwitch).filter(({ path }) => path.startsWith("/apple/"))
+      .every(({ path }) => path.startsWith("/apple/calendar-b/")), "provider calls after reconnect must use only the selected collection");
     await page.getByRole("button", { name: "Close settings", exact: true }).click();
     await page.getByRole("button", { name: "Agenda", exact: true }).click();
     await page.getByRole("button", { name: "New Event", exact: true }).click();
@@ -3526,7 +3750,11 @@ test("a person can manage Tasks and Events through the browser and see another c
     if (browserErrors.length) console.error("Browser errors:", browserErrors);
     console.error("Recent server output:", logs.slice(-4000));
     throw error;
-  } finally { await browser.close(); }
+  } finally {
+    await browser.close();
+    appleEvents=previousAppleEvents;
+    appleEventVersions=previousAppleEventVersions;
+  }
 });
 
 test("browser Event saves and deletions remain local when Google delivery fails", async () => {
@@ -5968,7 +6196,12 @@ test("dual verified NULL-scope Calendar copies update on first sync without stal
     const sync = await request("/api/calendars/sync", {token: owner.token, method: "POST"});
     assert.equal(sync.status, 200);
     const result = await sync.json();
-    assert.equal(googleEvents.get(googleId).summary, "Authoritative title");
+    assert.equal(googleEvents.get(googleId).summary, "Authoritative title", JSON.stringify({
+      sync:result,
+      connection:db.prepare("SELECT connection_scope_id,legacy_identity_eligible FROM calendar_connections WHERE user_id=? AND provider='google'").get(owner.user.id),
+      copy:db.prepare("SELECT external_id,connection_scope_id FROM calendar_copies WHERE user_id=? AND provider='google' AND item_id=?").get(owner.user.id,item.id),
+      state:db.prepare("SELECT generation,connection_scope_id,state,last_error FROM calendar_sync_state WHERE user_id=? AND provider='google'").get(owner.user.id),
+    }));
     assert.match(appleEvents.get(applePath), /SUMMARY:Authoritative title/);
     assert.ok(!result.syncLimitations.some(entry => entry.itemId === item.id));
     const updated = (await (await request(`/api/items/${item.id}`, {token: owner.token})).json()).item;

@@ -130,6 +130,7 @@ export function database() {
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         provider TEXT NOT NULL CHECK(provider IN ('google','apple')),
         generation INTEGER NOT NULL DEFAULT 0,
+        connection_scope_id TEXT,
         state TEXT NOT NULL CHECK(state IN ('pending','failed','synced')),
         attempts INTEGER NOT NULL DEFAULT 0,
         next_attempt_at INTEGER,
@@ -299,6 +300,19 @@ export function database() {
     const itemColumns = new Set(db.prepare("PRAGMA table_info(items)").all().map((column) => String(column.name)));
     const syncStateColumns = new Set(db.prepare("PRAGMA table_info(calendar_sync_state)").all().map((column) => String(column.name)));
     if (!syncStateColumns.has("last_error_code")) db.exec("ALTER TABLE calendar_sync_state ADD COLUMN last_error_code TEXT");
+    if (!syncStateColumns.has("connection_scope_id")) {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        db.exec(`ALTER TABLE calendar_sync_state ADD COLUMN connection_scope_id TEXT;
+          UPDATE calendar_sync_state SET generation=generation+1,state='failed',next_attempt_at=NULL,
+            last_error=COALESCE(last_error,'The previous Calendar retry has no verified destination. Run Sync Calendar to retry safely.')
+          WHERE state IN ('pending','failed')`);
+        db.exec("COMMIT");
+      } catch (error) {
+        try { db.exec("ROLLBACK"); } catch { /* Preserve the retry-scope migration error. */ }
+        throw error;
+      }
+    }
     if (!itemColumns.has("recurrence_json")) db.exec("ALTER TABLE items ADD COLUMN recurrence_json TEXT");
     if (!itemColumns.has("reminders_json")) db.exec("ALTER TABLE items ADD COLUMN reminders_json TEXT NOT NULL DEFAULT '[]'");
     if (!itemColumns.has("series_root_id")) db.exec("ALTER TABLE items ADD COLUMN series_root_id TEXT REFERENCES items(id) ON DELETE CASCADE");

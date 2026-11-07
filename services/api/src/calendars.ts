@@ -16,6 +16,7 @@ import {
   failCalendarSync,
   recordCalendarSyncAuthorizationFailure,
   clearCalendarSyncAuthorization,
+  replaceCalendarSyncConnection,
   type CalendarSyncGeneration,
   type CalendarSyncProvider,
   type DueCalendarSync,
@@ -253,6 +254,7 @@ export async function finishGoogleAuthorization(userId: string, code: string) {
       access_token=excluded.access_token,refresh_token=excluded.refresh_token,calendar_url=excluded.calendar_url,
       connected_at=excluded.connected_at,expires_at=excluded.expires_at,connection_scope_id=excluded.connection_scope_id,
       credential_generation_id=excluded.credential_generation_id,legacy_identity_eligible=0`).run(userId,calendar.summary ?? "Google Calendar",encrypt(tokens.access_token),refreshCipher,calendar.id,now().toISOString(),nowMs()+Math.max(60,tokens.expires_in ?? 3600)*1000-60_000,connectionScopeId,credentialGenerationId);
+    replaceCalendarSyncConnection(userId,"google",connectionScopeId);
     db.exec("COMMIT");
   } catch (error) {
     try { db.exec("ROLLBACK"); }
@@ -305,21 +307,49 @@ export async function connectAppleCalendar(userId: string, body: Record<string, 
   if (validation.status === 401 || validation.status === 403) throw new HttpError(400, "Apple Calendar rejected the Apple ID or app-specific password.");
   if (!validation.ok && validation.status !== 207) throw new HttpError(400, "Could not verify the Apple CalDAV calendar URL.");
   const connectedAt = now().toISOString();
-  const previous = database().prepare("SELECT calendar_url,connection_scope_id FROM calendar_connections WHERE user_id=? AND provider='apple'")
-    .get(userId) as { calendar_url: string | null; connection_scope_id: string | null } | undefined;
-  const connectionScopeId = previous?.calendar_url === url.toString() && previous.connection_scope_id?.trim()
-    ? previous.connection_scope_id
-    : randomUUID();
-  database().prepare(`INSERT INTO calendar_connections(user_id,provider,account_label,access_token,refresh_token,calendar_url,connected_at,connection_scope_id,credential_generation_id)
-    VALUES(?,'apple',?,?,NULL,?,?,?,?) ON CONFLICT(user_id,provider) DO UPDATE SET account_label=excluded.account_label,
-    access_token=excluded.access_token,calendar_url=excluded.calendar_url,connected_at=excluded.connected_at,connection_scope_id=excluded.connection_scope_id,
-    credential_generation_id=excluded.credential_generation_id,legacy_identity_eligible=0`).run(userId,label,encrypt(JSON.stringify({ username: body.username.trim(), password: body.password })),url.toString(),connectedAt,connectionScopeId,randomUUID());
+  const db=database();
+  db.exec("BEGIN IMMEDIATE");
+  let connectionScopeId: string;
+  try {
+    const previous = db.prepare("SELECT calendar_url,connection_scope_id,access_token FROM calendar_connections WHERE user_id=? AND provider='apple'")
+      .get(userId) as { calendar_url: string | null; connection_scope_id: string | null; access_token: string | null } | undefined;
+    let previousUsername: string | null = null;
+    if (previous?.access_token) {
+      try {
+        const credentials=JSON.parse(decrypt(previous.access_token)) as {username?:unknown};
+        if (typeof credentials.username === "string") previousUsername=credentials.username.trim().toLowerCase();
+      } catch { /* Unknown legacy identity gets a new scope. */ }
+    }
+    const sameAccount=previousUsername === body.username.trim().toLowerCase();
+    connectionScopeId = sameAccount && previous?.calendar_url === url.toString() && previous.connection_scope_id?.trim()
+      ? previous.connection_scope_id
+      : randomUUID();
+    db.prepare(`INSERT INTO calendar_connections(user_id,provider,account_label,access_token,refresh_token,calendar_url,connected_at,connection_scope_id,credential_generation_id)
+      VALUES(?,'apple',?,?,NULL,?,?,?,?) ON CONFLICT(user_id,provider) DO UPDATE SET account_label=excluded.account_label,
+      access_token=excluded.access_token,calendar_url=excluded.calendar_url,connected_at=excluded.connected_at,connection_scope_id=excluded.connection_scope_id,
+      credential_generation_id=excluded.credential_generation_id,legacy_identity_eligible=0`).run(userId,label,encrypt(JSON.stringify({ username: body.username.trim(), password: body.password })),url.toString(),connectedAt,connectionScopeId,randomUUID());
+    replaceCalendarSyncConnection(userId,"apple",connectionScopeId);
+    db.exec("COMMIT");
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* Preserve the connection update error. */ }
+    throw error;
+  }
   return { provider: "apple", accountLabel: label, connectedAt };
 }
 
 export function disconnectCalendar(userId: string, provider: Provider) {
   if (provider !== "google" && provider !== "apple") throw new HttpError(400, "Choose Google Calendar or Apple Calendar.");
-  database().prepare("DELETE FROM calendar_connections WHERE user_id=? AND provider=?").run(userId,provider);
+  const db=database();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare(`UPDATE calendar_sync_state SET generation=generation+1,connection_scope_id=NULL,state='synced',attempts=0,next_attempt_at=NULL,
+      last_attempt_at=NULL,last_error=NULL,last_error_code=NULL WHERE user_id=? AND provider=?`).run(userId,provider);
+    db.prepare("DELETE FROM calendar_connections WHERE user_id=? AND provider=?").run(userId,provider);
+    db.exec("COMMIT");
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* Preserve the disconnect error. */ }
+    throw error;
+  }
 }
 
 export function excludeDeletedCalendarImports(userId: string, itemId: string) {
@@ -813,8 +843,8 @@ function assertActiveScope(connection: Connection, allowStaleGeneration = false)
   const active = database().prepare("SELECT 1 FROM calendar_connections WHERE user_id=? AND provider=? AND connection_scope_id=? AND credential_generation_id=?")
     .get(connection.user_id,connection.provider,connection.connection_scope_id,connection.credential_generation_id);
   if (!active) throw new HttpError(409, "Calendar connection changed. Please sync again.");
-  if (!allowStaleGeneration && connection.syncGeneration !== undefined && !database().prepare(`SELECT 1 FROM calendar_sync_state WHERE user_id=? AND provider=? AND generation=?`)
-    .get(connection.user_id,connection.provider,connection.syncGeneration)) throw new HttpError(409,"Calendar sync generation changed. Please sync again.");
+  if (!allowStaleGeneration && connection.syncGeneration !== undefined && !database().prepare(`SELECT 1 FROM calendar_sync_state WHERE user_id=? AND provider=? AND generation=? AND connection_scope_id IS ?`)
+    .get(connection.user_id,connection.provider,connection.syncGeneration,connection.connection_scope_id)) throw new HttpError(409,"Calendar sync generation changed. Please sync again.");
   const lock = (connection as Connection & {exportLock?:{ownerToken:string;fence:number}}).exportLock;
   if (lock && !database().prepare(`SELECT 1 FROM calendar_export_locks WHERE user_id=? AND provider=? AND connection_scope_id=?
     AND owner_token=? AND fence=? AND lease_until>?`).get(connection.user_id,connection.provider,connection.connection_scope_id,
@@ -2492,9 +2522,13 @@ async function syncApple(connection: Connection, events: EventItem[], missingHre
   }
 }
 
-async function performCalendarSync(userId: string, exportProviders: ReadonlySet<Provider> | undefined, generations: ReadonlyMap<Provider,number>, onDeleteAuthorizationFailure: (connection: Connection) => void = () => {}, onProviderSyncSuccess: (connection: Connection) => void = () => {}) {
+async function performCalendarSync(userId: string, exportProviders: ReadonlySet<Provider> | undefined, generations: ReadonlyMap<Provider,CalendarSyncGeneration>, onDeleteAuthorizationFailure: (connection: Connection) => void = () => {}, onProviderSyncSuccess: (connection: Connection) => void = () => {}) {
   const connections = database().prepare("SELECT * FROM calendar_connections WHERE user_id=?").all(userId) as Connection[];
-  for (const connection of connections) connection.syncGeneration=generations.get(connection.provider);
+  for (const connection of connections) {
+    const generation=generations.get(connection.provider);
+    if (generation && connection.connection_scope_id !== generation.connectionScopeId) throw new HttpError(409,"Calendar connection changed. Please sync again.");
+    connection.syncGeneration=generation?.generation;
+  }
   if (!connections.length) return { synced: [], message: "Connect a calendar first." };
   const synced: string[] = [];
   const limitations = new Map<string,SyncLimitation>();
@@ -2508,6 +2542,12 @@ async function performCalendarSync(userId: string, exportProviders: ReadonlySet<
         .run(scope,connection.user_id,connection.provider,connection.credential_generation_id,connection.access_token,connection.refresh_token,connection.calendar_url);
       if (!result.changes) throw new HttpError(409, "Calendar connection changed. Please sync again.");
       connection.connection_scope_id = scope;
+      const generation=generations.get(connection.provider);
+      if (generation?.connectionScopeId === null) generation.connectionScopeId=scope;
+      if (connection.syncGeneration !== undefined) {
+        database().prepare("UPDATE calendar_sync_state SET connection_scope_id=? WHERE user_id=? AND provider=? AND generation=? AND connection_scope_id IS NULL")
+          .run(scope,userId,connection.provider,connection.syncGeneration);
+      }
     }
     const verified=await withCalendarExportLock(connection,async () => reconcileDeletedCreationReservations(connection,onDeleteAuthorizationFailure));
     for (const identity of verified) verifiedCleanup.add(identity);
@@ -2538,8 +2578,8 @@ async function performCalendarSync(userId: string, exportProviders: ReadonlySet<
       const events = listItemsForCalendarSync(userId).filter((item) => item.kind === "event");
       const generation = generations.get(connection.provider);
       if (generation === undefined) throw new HttpError(409,"Calendar sync generation changed. Please sync again.");
-      if (connection.provider === "google") await syncGoogle(connection,events,limitations,verifiedAppleItems,verifiedCleanup,generation,onDeleteAuthorizationFailure);
-      else await syncApple(connection,events,missingAppleHrefs,limitations,verifiedAppleItems,verifiedCleanup,generation,onDeleteAuthorizationFailure);
+      if (connection.provider === "google") await syncGoogle(connection,events,limitations,verifiedAppleItems,verifiedCleanup,generation.generation,onDeleteAuthorizationFailure);
+      else await syncApple(connection,events,missingAppleHrefs,limitations,verifiedAppleItems,verifiedCleanup,generation.generation,onDeleteAuthorizationFailure);
     });
     assertActiveScope(connection);
     if (![...limitations.values(), ...calendarSyncLimitations(userId)].some((entry) => entry.provider === connection.provider && entry.title === "Deleted Event")) {
@@ -2560,7 +2600,7 @@ export async function syncCalendars(userId: string, providers?: readonly Calenda
 async function syncCalendarsWithRecovery(userId: string, providers: readonly CalendarSyncProvider[] | undefined, ownershipRecovery: number, preserveAttempts: boolean, claimedGenerations?: CalendarSyncGeneration[]) {
   const selectedProviders = providers === undefined ? undefined : new Set<Provider>(providers);
   const generations = claimedGenerations ?? beginCalendarSync(userId,providers,preserveAttempts);
-  const generationByProvider = new Map<Provider,number>(generations.map(({provider,generation}) => [provider,generation]));
+  const generationByProvider = new Map<Provider,CalendarSyncGeneration>(generations.map((entry) => [entry.provider,entry]));
   const authorizationFailuresPersisted = new Set<CalendarSyncProvider>();
   try {
     const result = await performCalendarSync(userId,selectedProviders,generationByProvider,(connection) => {
@@ -2604,10 +2644,12 @@ async function syncCalendarsWithRecovery(userId: string, providers: readonly Cal
       // Re-run under the current generation without superseding a concurrent
       // sync. The export lock serializes the repair and the latest Event wins.
       const providerFilter=providers===undefined?"":` AND s.provider IN (${providers.map(()=>"?").join(",")||"NULL"})`;
-      const currentGenerations=database().prepare(`SELECT s.provider,s.generation FROM calendar_sync_state s
+      const currentGenerations=database().prepare(`SELECT s.provider,s.generation,s.connection_scope_id AS connectionScopeId FROM calendar_sync_state s
         JOIN calendar_connections c ON c.user_id=s.user_id AND c.provider=s.provider
         WHERE s.user_id=?${providerFilter} ORDER BY s.provider`).all(userId,...(providers??[])) as CalendarSyncGeneration[];
-      if (currentGenerations.length) return syncCalendarsWithRecovery(userId,providers,ownershipRecovery+1,preserveAttempts,currentGenerations);
+      const recoveryKeepsConnection=generations.every((generation) => currentGenerations.some((current) =>
+        current.provider===generation.provider && current.connectionScopeId===generation.connectionScopeId));
+      if (currentGenerations.length && recoveryKeepsConnection) return syncCalendarsWithRecovery(userId,providers,ownershipRecovery+1,preserveAttempts,currentGenerations);
     }
     throw error;
   }
