@@ -203,7 +203,7 @@ class RecurringAgendaUiTest {
 
     private fun editSimpleItem(item: WorkspaceItem, title: String, details: String) {
         waitFor("any previous editor to close before editing a simple item") { !hasOpenDialog() }
-        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
+        scrollActionClearOfFab("agenda.edit.${item.id}")
         val editButton = compose.onNodeWithTag("agenda.edit.${item.id}")
         waitFor("the simple item edit action to be displayed and enabled") {
             runCatching { editButton.assertIsDisplayed(); editButton.assertIsEnabled() }.isSuccess
@@ -223,7 +223,7 @@ class RecurringAgendaUiTest {
     private fun deleteItem(item: WorkspaceItem) {
         val itemTag = "agenda.item.${item.id}"
         val deleteTag = "agenda.delete.${item.id}"
-        scrollDeleteActionClearOfFab(deleteTag)
+        scrollActionClearOfFab(deleteTag)
         val deleteButton = compose.onNodeWithTag(deleteTag)
         waitFor("the delete action to finish enabling") {
             runCatching {
@@ -261,7 +261,7 @@ class RecurringAgendaUiTest {
     private fun edit(item: WorkspaceItem, title: String, scope: String, api: ApiClient, token: String) {
         waitFor("any previous editor to close") { !hasOpenDialog() }
         compose.onNodeWithText("Refresh").performScrollTo().performClick()
-        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
+        scrollActionClearOfFab("agenda.edit.${item.id}")
         val editButton = compose.onNodeWithTag("agenda.edit.${item.id}")
         waitFor("the requested item's edit action to be enabled") { runCatching { editButton.assertIsEnabled() }.isSuccess }
         editButton.performClick()
@@ -281,7 +281,7 @@ class RecurringAgendaUiTest {
     }
 
     private fun editFirstOccurrence(item: WorkspaceItem) {
-        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
+        scrollActionClearOfFab("agenda.edit.${item.id}")
         compose.onNodeWithTag("agenda.edit.${item.id}").performClick()
         compose.onNodeWithText("Title").performTextClearance()
         compose.onNodeWithText("Title").performTextInput("Android UI First Task Only")
@@ -316,7 +316,7 @@ class RecurringAgendaUiTest {
             !hasOpenDialog()
         }
         compose.onNodeWithText("Refresh").performScrollTo().performClick()
-        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
+        scrollActionClearOfFab("agenda.edit.${item.id}")
         val editButton = compose.onNodeWithTag("agenda.edit.${item.id}")
         waitFor("the Event edit action to be enabled") { runCatching { editButton.assertIsEnabled() }.isSuccess }
         editButton.performClick()
@@ -339,7 +339,7 @@ class RecurringAgendaUiTest {
     private fun deleteEvent(item: WorkspaceItem, api: ApiClient, token: String) {
         val itemTag = "agenda.item.${item.id}"
         val deleteTag = "agenda.delete.${item.id}"
-        scrollDeleteActionClearOfFab(deleteTag)
+        scrollActionClearOfFab(deleteTag)
         val deleteButton = compose.onNodeWithTag(deleteTag)
         waitFor("the Event delete action to become available") {
             runCatching {
@@ -372,24 +372,24 @@ class RecurringAgendaUiTest {
         confirmDelete.performClick()
     }
 
-    private fun scrollDeleteActionClearOfFab(deleteTag: String) {
+    private fun scrollActionClearOfFab(actionTag: String) {
         val agenda = compose.onNodeWithTag("agenda.list")
-        val deleteButton = compose.onNodeWithTag(deleteTag)
-        agenda.performScrollToNode(hasTestTag(deleteTag))
+        val actionButton = compose.onNodeWithTag(actionTag)
+        agenda.performScrollToNode(hasTestTag(actionTag))
         var overlapsFab: Boolean
         var scrollCount = 0
         while (true) {
-            val deleteBounds = deleteButton.fetchSemanticsNode().boundsInRoot
+            val actionBounds = actionButton.fetchSemanticsNode().boundsInRoot
             val fabBounds = compose.onNodeWithTag("agenda.add").fetchSemanticsNode().boundsInRoot
-            overlapsFab = deleteBounds.left < fabBounds.right && fabBounds.left < deleteBounds.right
-                && deleteBounds.top < fabBounds.bottom && fabBounds.top < deleteBounds.bottom
+            overlapsFab = actionBounds.left < fabBounds.right && fabBounds.left < actionBounds.right
+                && actionBounds.top < fabBounds.bottom && fabBounds.top < actionBounds.bottom
             if (!overlapsFab || scrollCount == 4) break
             agenda.performTouchInput {
                 swipeUp(startY = bottom * 0.85f, endY = bottom * 0.70f)
             }
             scrollCount += 1
         }
-        assertFalse("Delete action $deleteTag overlaps the Add item button after scrolling", overlapsFab)
+        assertFalse("Agenda action $actionTag overlaps the Add item button after scrolling", overlapsFab)
     }
 
     private fun waitFor(description: String, condition: () -> Boolean) {
