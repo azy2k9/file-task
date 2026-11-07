@@ -3534,6 +3534,39 @@ test("following split uses original identity after a move and preserves a delete
   assert.equal(future.every(({ reminders }) => reminders[0]?.time === "09:00"), true);
 });
 
+test("following split retains later local schedule exceptions and inherited File identity", async () => {
+  const owner = await account();
+  const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "task", title: "Quarterly filing", scheduledDate: "2026-11-01",
+    recurrence: { interval: 1, unit: "days", end: { type: "count", count: 5 } },
+  } });
+  assert.equal(created.status, 201);
+  const root = (await created.json()).item;
+  let occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+    .filter(({ seriesId }) => seriesId === root.id).sort((a, b) => a.occurrenceDate.localeCompare(b.occurrenceDate));
+  const file = (await (await request("/api/files", { token: owner.token, method: "POST", body: {
+    name: "Filing notes", url: "https://example.com/filing-notes",
+  } })).json()).file;
+  assert.equal((await request(`/api/files/${file.id}/attachments`, { token: owner.token, method: "POST", body: {
+    itemId: root.id, scope: "following",
+  } })).status, 201);
+  const movedException = occurrences[4];
+  assert.equal((await request(`/api/items/${movedException.id}`, { token: owner.token, method: "PATCH", body: {
+    scheduledDate: "2026-12-20", scope: "occurrence",
+  } })).status, 200);
+  occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+    .filter(({ seriesId }) => seriesId === root.id).sort((a, b) => a.occurrenceDate.localeCompare(b.occurrenceDate));
+  const selected = occurrences[2];
+  assert.equal((await request(`/api/items/${selected.id}`, { token: owner.token, method: "PATCH", body: {
+    title: "Updated filing", scope: "following",
+  } })).status, 200);
+  const items = (await (await request("/api/items", { token: owner.token })).json()).items;
+  const retainedException = items.find(({ id }) => id === movedException.id);
+  assert.equal(retainedException.scheduledDate, "2026-12-20");
+  assert.deepEqual(retainedException.files.map(({ id }) => id), [file.id]);
+  assert.equal(items.filter(({ seriesId, title }) => seriesId === selected.id && title === "Updated filing").length, 3);
+});
+
 test("editing the first Occurrence locally preserves its recurrence definition and series identity", async () => {
   const owner = await account();
   const previousClock = new Date(testClock);
@@ -6548,10 +6581,10 @@ for (const order of ["apple-first", "google-first"]) {
       const items = (await (await request("/api/items", {token: owner.token})).json()).items;
       const item = items.find(entry => entry.title === "Imported calendar event");
       assert.ok(item);
-      assert.equal(googleEvents.size, 1);
+      assert.equal(googleEvents.size, 1, `Google resources after initial sync: ${[...googleEvents.keys()].join(", ")}`);
       appleEvents.clear(); googleEvents.clear();
       assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
-      assert.equal(appleEvents.size, 1);
+      assert.equal(appleEvents.size, 1, `Apple resources after recovery: ${[...appleEvents.keys()].join(", ")}`);
       assert.equal(googleEvents.size, 1);
       assert.equal((await request(`/api/items/${item.id}`, {token: owner.token, method: "PATCH", body: {title: "Recovered event edited"}})).status, 200);
       assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
