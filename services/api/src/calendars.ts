@@ -13,12 +13,16 @@ import {
   completeCalendarSync,
   dueCalendarSyncUsers,
   failCalendarSync,
+  recordCalendarSyncAuthorizationFailure,
+  clearCalendarSyncAuthorization,
   type CalendarSyncProvider,
+  type CalendarSyncConnection,
 } from "./calendar-sync-state";
 
 type Provider = "google" | "apple";
 type Connection = { connection_scope_id: string | null; credential_generation_id: string; user_id: string; provider: Provider; account_label: string; access_token: string | null; refresh_token: string | null; calendar_url: string | null; expires_at: number | null };
 type EventItem = ReturnType<typeof listItems>[number];
+type SyncLimitation = { itemId: string; title: string; provider: Provider; message: string; authorizationRequired?: boolean };
 type GoogleOAuthTransaction = { user_id: string; nonce_hash: string; session_hash: string; expires_at: number };
 type ProviderTiming = {
   kind: "allDay" | "timed";
@@ -248,10 +252,15 @@ export async function connectAppleCalendar(userId: string, body: Record<string, 
   if (validation.status === 401 || validation.status === 403) throw new HttpError(400, "Apple Calendar rejected the Apple ID or app-specific password.");
   if (!validation.ok && validation.status !== 207) throw new HttpError(400, "Could not verify the Apple CalDAV calendar URL.");
   const connectedAt = now().toISOString();
+  const previous = database().prepare("SELECT calendar_url,connection_scope_id FROM calendar_connections WHERE user_id=? AND provider='apple'")
+    .get(userId) as { calendar_url: string | null; connection_scope_id: string | null } | undefined;
+  const connectionScopeId = previous?.calendar_url === url.toString() && previous.connection_scope_id?.trim()
+    ? previous.connection_scope_id
+    : randomUUID();
   database().prepare(`INSERT INTO calendar_connections(user_id,provider,account_label,access_token,refresh_token,calendar_url,connected_at,connection_scope_id,credential_generation_id)
     VALUES(?,'apple',?,?,NULL,?,?,?,?) ON CONFLICT(user_id,provider) DO UPDATE SET account_label=excluded.account_label,
     access_token=excluded.access_token,calendar_url=excluded.calendar_url,connected_at=excluded.connected_at,connection_scope_id=excluded.connection_scope_id,
-    credential_generation_id=excluded.credential_generation_id,legacy_identity_eligible=0`).run(userId,label,encrypt(JSON.stringify({ username: body.username.trim(), password: body.password })),url.toString(),connectedAt,randomUUID(),randomUUID());
+    credential_generation_id=excluded.credential_generation_id,legacy_identity_eligible=0`).run(userId,label,encrypt(JSON.stringify({ username: body.username.trim(), password: body.password })),url.toString(),connectedAt,connectionScopeId,randomUUID());
   return { provider: "apple", accountLabel: label, connectedAt };
 }
 
@@ -540,11 +549,69 @@ function isScheduleUnchanged(metadata: ImportMetadataRow, item: EventItem) {
   return baseline.scheduledDate === item.scheduledDate && baseline.scheduledTime === item.scheduledTime;
 }
 
-function reportSyncLimitation(limits: Map<string,{itemId:string;title:string;provider:Provider;message:string}>, item:EventItem, provider:Provider, message:string) {
+function reportSyncLimitation(limits: Map<string,SyncLimitation>, item:EventItem, provider:Provider, message:string) {
   limits.set(`${item.id}:${provider}`,{itemId:item.id,title:item.title,provider,message});
 }
 
-function safeToSyncImportedEvent(userId: string, item: EventItem, destination: Provider, limits: Map<string,{itemId:string;title:string;provider:Provider;message:string}>) {
+function mustPreserveUndatedImportedSourceCopy(connection: Connection, itemId: string, sourceExternalId: string) {
+  if (!connection.connection_scope_id) return false;
+  const sourceAccountId = connection.calendar_url ?? (connection.provider === "google" ? "primary" : null);
+  if (!sourceAccountId) return false;
+  const imported = database().prepare(`SELECT i.connection_scope_id AS importScope,m.connection_scope_id AS metadataScope,
+      m.source_account_id AS sourceAccountId,m.state AS metadataState,cp.connection_scope_id AS copyScope,
+      cp.external_id AS copyExternalId,cp.resource_uid AS copyResourceUid,c.connection_scope_id AS connectionScope,
+      c.credential_generation_id AS credentialGenerationId,c.calendar_url AS calendarUrl
+    FROM calendar_imports i
+    JOIN calendar_copies cp ON cp.user_id=i.user_id AND cp.provider=i.provider AND cp.item_id=i.item_id
+    LEFT JOIN calendar_import_metadata m ON m.user_id=i.user_id AND m.provider=i.provider AND m.external_id=i.external_id AND m.item_id=i.item_id
+    LEFT JOIN calendar_connections c ON c.user_id=i.user_id AND c.provider=i.provider
+    WHERE i.user_id=? AND i.item_id=? AND i.provider=? AND i.external_id=?`).get(
+      connection.user_id,itemId,connection.provider,sourceExternalId,
+    ) as { importScope:string|null; metadataScope:string|null; sourceAccountId:string|null; metadataState:string|null;
+      copyScope:string|null; copyExternalId:string; copyResourceUid:string|null; connectionScope:string|null;
+      credentialGenerationId:string|null; calendarUrl:string|null } | undefined;
+  if (!imported) return false;
+  const copyMatchesSource = connection.provider === "google"
+    ? imported.copyExternalId === sourceExternalId
+    : imported.copyResourceUid === sourceExternalId;
+  const verifiedSupported = imported.metadataState === "supported"
+    && imported.importScope === connection.connection_scope_id
+    && imported.metadataScope === connection.connection_scope_id
+    && imported.sourceAccountId === sourceAccountId
+    && imported.copyScope === connection.connection_scope_id
+    && imported.connectionScope === connection.connection_scope_id
+    && imported.credentialGenerationId === connection.credential_generation_id
+    && imported.calendarUrl === connection.calendar_url
+    && copyMatchesSource
+    && !database().prepare("SELECT 1 FROM google_inventory_pending WHERE user_id=? AND item_id=? LIMIT 1")
+      .get(connection.user_id,itemId);
+  return !verifiedSupported;
+}
+
+function recordUndatedCopyRemovalFailure(connection: Connection, itemId: string, message: string) {
+  if (!connection.connection_scope_id) return;
+  database().prepare(`INSERT INTO calendar_destination_limitations(user_id,item_id,provider,connection_scope_id,code,message)
+    SELECT ?,?,?,?,'undated-copy-removal-failed',? WHERE EXISTS (
+      SELECT 1 FROM calendar_connections c JOIN items i ON i.user_id=c.user_id
+      WHERE c.user_id=? AND c.provider=? AND c.connection_scope_id=? AND c.credential_generation_id=?
+        AND i.id=? AND i.kind='event' AND i.scheduled_date IS NULL)
+    ON CONFLICT(user_id,item_id,provider,connection_scope_id) DO UPDATE SET
+      code=excluded.code,message=excluded.message`).run(
+        connection.user_id,itemId,connection.provider,connection.connection_scope_id,message,
+        connection.user_id,connection.provider,connection.connection_scope_id,connection.credential_generation_id,itemId,
+      );
+}
+
+function clearUndatedCopyRemovalFailure(connection: Connection, itemId: string) {
+  if (!connection.connection_scope_id) return;
+  database().prepare(`DELETE FROM calendar_destination_limitations WHERE user_id=? AND item_id=? AND provider=?
+    AND connection_scope_id=? AND code='undated-copy-removal-failed'
+    AND EXISTS (SELECT 1 FROM calendar_connections WHERE user_id=? AND provider=? AND connection_scope_id=? AND credential_generation_id=?)`)
+    .run(connection.user_id,itemId,connection.provider,connection.connection_scope_id,
+      connection.user_id,connection.provider,connection.connection_scope_id,connection.credential_generation_id);
+}
+
+function safeToSyncImportedEvent(userId: string, item: EventItem, destination: Provider, limits: Map<string,SyncLimitation>) {
   const unverified = database().prepare(`SELECT 1 FROM calendar_imports i
     LEFT JOIN calendar_connections c ON c.user_id=i.user_id AND c.provider=i.provider
     LEFT JOIN calendar_import_metadata m ON m.user_id=i.user_id AND m.provider=i.provider AND m.external_id=i.external_id AND m.item_id=i.item_id
@@ -560,7 +627,8 @@ function safeToSyncImportedEvent(userId: string, item: EventItem, destination: P
     reportSyncLimitation(limits,item,destination,"Google Calendar inventory is incomplete. Sync is paused to protect this Event.");
     return false;
   }
-  const sourceLimitation = item.calendarSync.find((status) => status.state === "limited");
+  const sourceLimitation = item.calendarSync.find((status) => status.state === "limited"
+    && !(item.scheduledDate && status.limitationCode === "undated-copy-removal-failed"));
   if (sourceLimitation) {
     reportSyncLimitation(limits,item,destination,sourceLimitation.limitation ?? "This Event cannot be synchronized safely.");
     return false;
@@ -1670,16 +1738,19 @@ async function verifyLegacyApple(connection: Connection, events: EventItem[]) {
   assertActiveScope(connection);
 }
 
-async function syncGoogle(connection: Connection, events: EventItem[], limits: Map<string,{itemId:string;title:string;provider:Provider;message:string}>, verifiedAppleItems: Set<string>) {
-  assertActiveScope(connection);
+async function syncGoogle(connection: Connection, events: EventItem[], limits: Map<string,SyncLimitation>, verifiedAppleItems: Set<string>, onDeleteAuthorizationFailure: (connection: Connection) => void) {
   assertActiveScope(connection);
   const access = await googleAccess(connection); const calendarId = encodeURIComponent(connection.calendar_url ?? "primary");
   assertActiveScope(connection);
   const maps = new Map(database().prepare("SELECT item_id,external_id,connection_scope_id FROM calendar_copies WHERE user_id=? AND provider='google'").all(connection.user_id).map((row) => [String(row.item_id),{ id:String(row.external_id), scope:row.connection_scope_id }]));
   const roots = events.filter((item) => (!item.seriesId || item.id === item.seriesId) && item.scheduledDate);
-  const liveIds = new Set(events.filter((item) => (!item.seriesId || item.id === item.seriesId) && (item.scheduledDate || item.calendarSync.length)).map((item) => item.id));
-  for (const item of events.filter((entry) => !entry.scheduledDate && entry.calendarSync.length)) reportSyncLimitation(limits,item,"google","This imported Event no longer has a schedule. Its Calendar copy is preserved and sync is paused.");
+  const liveIds = new Set(roots.map((item) => item.id));
   for (const [itemId, copy] of maps) if (!liveIds.has(itemId) && copy.scope === connection.connection_scope_id) {
+    const item = events.find((entry) => entry.id === itemId);
+    if (item && !item.scheduledDate && mustPreserveUndatedImportedSourceCopy(connection,itemId,copy.id)) {
+      reportSyncLimitation(limits,item,"google","This imported Event no longer has a schedule. Its original Google Calendar copy is preserved, while other Calendar copies are removed.");
+      continue;
+    }
     const eventId = copy.id;
     assertActiveScope(connection);
     let deleted: Response | undefined;
@@ -1688,7 +1759,18 @@ async function syncGoogle(connection: Connection, events: EventItem[], limits: M
     if (deleted && (deleted.ok || deleted.status === 404 || deleted.status === 410)) database().prepare(`DELETE FROM calendar_copies WHERE user_id=? AND provider='google' AND item_id=? AND connection_scope_id=?
       AND EXISTS (SELECT 1 FROM calendar_connections WHERE user_id=? AND provider='google' AND connection_scope_id=? AND credential_generation_id=?)`)
       .run(connection.user_id,itemId,connection.connection_scope_id,connection.user_id,connection.connection_scope_id,connection.credential_generation_id);
-    else limits.set(`${itemId}:google`,{itemId,title:"Deleted Event",provider:"google",message:"The deleted Event could not be removed from Google Calendar. Its Calendar copy is retained for retry."});
+    if (deleted && (deleted.ok || deleted.status === 404 || deleted.status === 410)) clearUndatedCopyRemovalFailure(connection,itemId);
+    else {
+      const authorizationRequired = deleted?.status === 401 || deleted?.status === 403;
+      if (authorizationRequired) onDeleteAuthorizationFailure(connection);
+      const message = authorizationRequired
+        ? "Google Calendar denied removal of this copy. Reauthorize Google Calendar to retry cleanup; its identity is retained and retries continue automatically."
+        : item && !item.scheduledDate
+          ? "This undated Event's dated Google Calendar copy could not be removed. Its identity is retained for retry."
+          : "The deleted Event could not be removed from Google Calendar. Its Calendar copy is retained for retry.";
+      if (item && !item.scheduledDate) recordUndatedCopyRemovalFailure(connection,itemId,message);
+      limits.set(`${itemId}:google`,{itemId,title:"Deleted Event",provider:"google",message,authorizationRequired});
+    }
   }
   for (const item of roots) {
     if (!safeToSyncImportedEvent(connection.user_id,item,"google",limits)) continue;
@@ -1783,6 +1865,7 @@ async function syncGoogle(connection: Connection, events: EventItem[], limits: M
       .run(connection.user_id,item.id,saved.id,connection.connection_scope_id,connection.user_id,connection.connection_scope_id,connection.credential_generation_id,intent?.eventId ?? null,mapped ?? intent?.eventId ?? null);
     if (!committed.changes) throw new HttpError(409, "Calendar connection or copy changed. Please sync again.");
     maps.set(item.id,{id:saved.id,scope:connection.connection_scope_id});
+    clearUndatedCopyRemovalFailure(connection,item.id);
   }
   const byId = new Map(roots.map((item) => [item.id,item]));
   for (const occurrence of events.filter((item) => item.seriesId && item.id !== item.seriesId && item.occurrenceDate)) {
@@ -1812,7 +1895,7 @@ async function syncGoogle(connection: Connection, events: EventItem[], limits: M
   }
 }
 
-async function syncApple(connection: Connection, events: EventItem[], missingHrefs: Set<string>, limits: Map<string,{itemId:string;title:string;provider:Provider;message:string}>, verifiedAppleItems: Set<string>) {
+async function syncApple(connection: Connection, events: EventItem[], missingHrefs: Set<string>, limits: Map<string,SyncLimitation>, verifiedAppleItems: Set<string>, onDeleteAuthorizationFailure: (connection: Connection) => void) {
   assertActiveScope(connection);
   ensureAppleRepresentationBaselines();
   if (!connection.access_token || !connection.calendar_url) throw new HttpError(503, "Reconnect Apple Calendar to continue syncing.");
@@ -1820,8 +1903,7 @@ async function syncApple(connection: Connection, events: EventItem[], missingHre
   const authorization = `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString("base64")}`;
   const maps = new Map(database().prepare("SELECT item_id,external_id,resource_uid,connection_scope_id FROM calendar_copies WHERE user_id=? AND provider='apple'").all(connection.user_id).map((row) => [String(row.item_id),{ href:String(row.external_id),uid:String(row.resource_uid ?? row.external_id),scope:row.connection_scope_id }]));
   const roots = events.filter((item) => (!item.seriesId || item.id === item.seriesId) && item.scheduledDate);
-  const liveIds = new Set(events.filter((item) => (!item.seriesId || item.id === item.seriesId) && (item.scheduledDate || item.calendarSync.length)).map((item) => item.id));
-  for (const item of events.filter((entry) => !entry.scheduledDate && entry.calendarSync.length)) reportSyncLimitation(limits,item,"apple","This imported Event no longer has a schedule. Its Calendar copy is preserved and sync is paused.");
+  const liveIds = new Set(roots.map((item) => item.id));
   const resourceUrl = (value: string) => {
     const url = /^https?:\/\//i.test(value) ? new URL(value) : new URL(`${connection.calendar_url!.replace(/\/$/,"")}/${encodeURIComponent(value)}.ics`);
     const collection = new URL(connection.calendar_url!);
@@ -1829,6 +1911,18 @@ async function syncApple(connection: Connection, events: EventItem[], missingHre
     return url.toString();
   };
   for (const [itemId, copy] of maps) if (!liveIds.has(itemId) && copy.scope === connection.connection_scope_id) {
+    const item = events.find((entry) => entry.id === itemId);
+    const identityLimitation = item?.calendarSync.find((status) => status.provider === "apple"
+      && ["identity-mismatch","unverifiable-event","transient-verification"].includes(status.limitationCode ?? ""));
+    if (item && !item.scheduledDate && identityLimitation) {
+      const message = identityLimitation.limitation ?? "The Apple Calendar copy could not be verified. Its identity is retained while cleanup is paused.";
+      limits.set(`${itemId}:apple`,{itemId,title:"Deleted Event",provider:"apple",message});
+      continue;
+    }
+    if (item && !item.scheduledDate && mustPreserveUndatedImportedSourceCopy(connection,itemId,copy.uid)) {
+      reportSyncLimitation(limits,item,"apple","This imported Event no longer has a schedule. Its original Apple Calendar copy is preserved, while other Calendar copies are removed.");
+      continue;
+    }
     assertActiveScope(connection);
     let deleted: Response | undefined;
     try { deleted = await fetch(resourceUrl(copy.href), { method: "DELETE", headers: { Authorization: authorization } }); } catch { /* Report below and retry on the next sync. */ }
@@ -1839,7 +1933,18 @@ async function syncApple(connection: Connection, events: EventItem[], missingHre
     if (deleted && (deleted.ok || deleted.status === 404 || deleted.status === 410)) database().prepare(`DELETE FROM apple_copy_representation_baselines WHERE user_id=? AND item_id=? AND connection_scope_id=?
       AND EXISTS (SELECT 1 FROM calendar_connections WHERE user_id=? AND provider='apple' AND connection_scope_id=? AND credential_generation_id=?)`)
       .run(connection.user_id,itemId,connection.connection_scope_id,connection.user_id,connection.connection_scope_id,connection.credential_generation_id);
-    else limits.set(`${itemId}:apple`,{itemId,title:"Deleted Event",provider:"apple",message:"The deleted Event could not be removed from Apple Calendar. Its Calendar copy is retained for retry."});
+    if (deleted && (deleted.ok || deleted.status === 404 || deleted.status === 410)) clearUndatedCopyRemovalFailure(connection,itemId);
+    else {
+      const authorizationRequired = deleted?.status === 401 || deleted?.status === 403;
+      if (authorizationRequired) onDeleteAuthorizationFailure(connection);
+      const message = authorizationRequired
+        ? "Apple Calendar denied removal of this copy. Reauthorize Apple Calendar to retry cleanup; its identity is retained and retries continue automatically."
+        : item && !item.scheduledDate
+          ? "This undated Event's dated Apple Calendar copy could not be removed. Its identity is retained for retry."
+          : "The deleted Event could not be removed from Apple Calendar. Its Calendar copy is retained for retry.";
+      if (item && !item.scheduledDate) recordUndatedCopyRemovalFailure(connection,itemId,message);
+      limits.set(`${itemId}:apple`,{itemId,title:"Deleted Event",provider:"apple",message,authorizationRequired});
+    }
   }
   for (const item of roots) {
     if (!safeToSyncImportedEvent(connection.user_id,item,"apple",limits)) continue;
@@ -1887,16 +1992,17 @@ async function syncApple(connection: Connection, events: EventItem[], missingHre
       .run(connection.user_id,item.id,targetUrl,uid,connection.connection_scope_id,connection.user_id,connection.connection_scope_id,connection.credential_generation_id,
         connection.user_id,connection.connection_scope_id,connection.credential_generation_id);
     if (!committed.changes) throw new HttpError(409, "Calendar connection changed. Please sync again.");
+    clearUndatedCopyRemovalFailure(connection,item.id);
     const representation = appleRepresentationSignature(calendarData);
     if (representation && connection.connection_scope_id) saveAppleRepresentation(connection,item.id,connection.connection_scope_id,targetUrl,representation);
   }
 }
 
-async function performCalendarSync(userId: string, exportProviders?: ReadonlySet<Provider>) {
+async function performCalendarSync(userId: string, exportProviders?: ReadonlySet<Provider>, onDeleteAuthorizationFailure: (connection: Connection) => void = () => {}, onProviderSyncSuccess: (connection: Connection) => void = () => {}) {
   const connections = database().prepare("SELECT * FROM calendar_connections WHERE user_id=?").all(userId) as Connection[];
   if (!connections.length) return { synced: [], message: "Connect a calendar first." };
   const synced: string[] = [];
-  const limitations = new Map<string,{itemId:string;title:string;provider:Provider;message:string}>();
+  const limitations = new Map<string,SyncLimitation>();
   let missingAppleHrefs = new Set<string>();
   const verifiedAppleItems = new Set<string>();
   for (const connection of connections) {
@@ -1922,12 +2028,15 @@ async function performCalendarSync(userId: string, exportProviders?: ReadonlySet
     if (exportProviders && !exportProviders.has(connection.provider)) continue;
     assertActiveScope(connection);
     const events = listItemsForCalendarSync(userId).filter((item) => item.kind === "event");
-    if (connection.provider === "google") await syncGoogle(connection,events,limitations,verifiedAppleItems);
-    else await syncApple(connection,events,missingAppleHrefs,limitations,verifiedAppleItems);
+    if (connection.provider === "google") await syncGoogle(connection,events,limitations,verifiedAppleItems,onDeleteAuthorizationFailure);
+    else await syncApple(connection,events,missingAppleHrefs,limitations,verifiedAppleItems,onDeleteAuthorizationFailure);
     assertActiveScope(connection);
-    if (![...limitations.values(), ...calendarSyncLimitations(userId)].some((entry) => entry.provider === connection.provider && entry.title === "Deleted Event")) synced.push(connection.provider);
+    if (![...limitations.values(), ...calendarSyncLimitations(userId)].some((entry) => entry.provider === connection.provider && entry.title === "Deleted Event")) {
+      synced.push(connection.provider);
+      onProviderSyncSuccess(connection);
+    }
   }
-  const syncLimitations = new Map<string,{itemId:string;title:string;provider:Provider;message:string}>();
+  const syncLimitations = new Map<string,SyncLimitation>();
   for (const limitation of calendarSyncLimitations(userId)) syncLimitations.set(`${limitation.itemId}:${limitation.provider}`,limitation);
   for (const [key,limitation] of limitations) syncLimitations.set(key,limitation);
   return { synced, eventCount, syncLimitations:[...syncLimitations.values()] };
@@ -1936,18 +2045,43 @@ async function performCalendarSync(userId: string, exportProviders?: ReadonlySet
 export async function syncCalendars(userId: string, providers?: readonly CalendarSyncProvider[]) {
   const selectedProviders = providers === undefined ? undefined : new Set<Provider>(providers);
   const generations = beginCalendarSync(userId,providers);
+  const generationByProvider = new Map(generations.map((generation) => [generation.provider,generation]));
+  const authorizationFailuresPersisted = new Set<CalendarSyncProvider>();
   try {
-    const result = await performCalendarSync(userId,selectedProviders);
+    const result = await performCalendarSync(userId,selectedProviders,(connection) => {
+      const identity = connection.connection_scope_id ? {
+        provider: connection.provider,
+        connection_scope_id: connection.connection_scope_id,
+        credential_generation_id: connection.credential_generation_id,
+      } satisfies CalendarSyncConnection : null;
+      if (!identity || authorizationFailuresPersisted.has(connection.provider)) return;
+      if (!recordCalendarSyncAuthorizationFailure(userId,identity)) return;
+      authorizationFailuresPersisted.add(connection.provider);
+      const generation = generationByProvider.get(connection.provider);
+      if (generation) failCalendarSync(userId,generation,true);
+    }, (connection) => {
+      if (!connection.connection_scope_id) return;
+      clearCalendarSyncAuthorization(userId,{
+        provider: connection.provider,
+        connection_scope_id: connection.connection_scope_id,
+        credential_generation_id: connection.credential_generation_id,
+      });
+    });
     const failedDeletionProviders = new Set((result.syncLimitations ?? [])
       .filter((limitation) => limitation.title === "Deleted Event")
       .map((limitation) => limitation.provider as CalendarSyncProvider));
+    const reauthorizationProviders = new Set((result.syncLimitations ?? [])
+      .filter((limitation) => limitation.authorizationRequired)
+      .map((limitation) => limitation.provider as CalendarSyncProvider));
     for (const generation of generations) {
-      if (failedDeletionProviders.has(generation.provider)) failCalendarSync(userId,generation);
+      if (failedDeletionProviders.has(generation.provider)) {
+        if (!authorizationFailuresPersisted.has(generation.provider)) failCalendarSync(userId,generation,reauthorizationProviders.has(generation.provider));
+      }
       else completeCalendarSync(userId,generation);
     }
     return { ...result, syncDelivery: calendarSyncDeliveryStatus(userId) };
   } catch (error) {
-    for (const generation of generations) failCalendarSync(userId,generation);
+    for (const generation of generations) if (!authorizationFailuresPersisted.has(generation.provider)) failCalendarSync(userId,generation);
     throw error;
   }
 }

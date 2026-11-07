@@ -76,6 +76,25 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         assertOccurrenceRows(title: "UI Runner Whole Series Task", atLeast: 2)
 
         createRecurringItem(kind: "Event", title: "UI Runner Recurring Event")
+        openItem("iOS UI date clearing Event")
+        let addDate = app.switches["Add date"]
+        scrollToHittable(addDate, toward: .down, message: "The seeded Event's date toggle should be visible.")
+        XCTAssertEqual(addDate.value as? String, "1", "The seeded Event should start with a date.")
+        // SwiftUI exposes the labelled Toggle row and a nested switch in
+        // accessibility. Tapping the row can leave the switch unchanged.
+        let addDateSwitch = addDate.switches.firstMatch
+        if addDateSwitch.exists {
+            addDateSwitch.tap()
+        } else {
+            addDate.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+        }
+        XCTAssertEqual(addDate.value as? String, "0", "The Event date should be cleared in the native editor.")
+        saveCurrentItem()
+        let retainedUndatedEvent = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "iOS UI date clearing Event")).firstMatch
+        XCTAssertTrue(retainedUndatedEvent.waitForExistence(timeout: 15),
+                      "The Event should remain in the workspace after clearing its date. Accessibility hierarchy: \(app.debugDescription)")
+
+        deleteEventThroughWorkspace("iOS UI delete Event")
         createEventAndExerciseItsLifecycle()
     }
 
@@ -548,6 +567,33 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
         let editor = app.navigationBars.matching(NSPredicate(format: "identifier BEGINSWITH %@", "Edit ")).firstMatch
         XCTAssertTrue(editor.waitForExistence(timeout: 30),
                       "The saved item should open in the editor. Accessibility hierarchy: \(app.debugDescription)")
+    }
+
+    private func deleteEventThroughWorkspace(_ title: String) {
+        let row = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", title)).firstMatch
+        scrollToHittable(row, toward: .down, maxSwipes: 10, message: "The dated Event should appear before deletion.")
+        row.swipeLeft()
+
+        let deleteAction = app.buttons["Delete"].firstMatch
+        XCTAssertTrue(deleteAction.waitForExistence(timeout: 5),
+                      "The native Event row should expose its Delete action. Accessibility hierarchy: \(app.debugDescription)")
+        let deleteActionReady = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true AND hittable == true"), object: deleteAction
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [deleteActionReady], timeout: 5), .completed,
+                       "The native Event Delete action should be hittable. Accessibility hierarchy: \(app.debugDescription)")
+        deleteAction.tap()
+
+        let confirmation = app.sheets.containing(.button, identifier: "Delete").firstMatch
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 5),
+                      "The Event deletion should require confirmation. Accessibility hierarchy: \(app.debugDescription)")
+        let confirmDelete = confirmation.buttons["Delete"]
+        XCTAssertTrue(confirmDelete.waitForExistence(timeout: 5))
+        confirmDelete.tap()
+
+        let rowRemoved = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: row)
+        XCTAssertEqual(XCTWaiter.wait(for: [rowRemoved], timeout: 15), .completed,
+                       "The deleted Event should leave the workspace. Accessibility hierarchy: \(app.debugDescription)")
     }
 
     private func cancelEditor() {

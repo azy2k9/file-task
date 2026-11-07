@@ -4,10 +4,12 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsOn
+import androidx.compose.ui.test.isRoot
+import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
-import androidx.compose.ui.test.isRoot
+import androidx.compose.ui.test.isDialog
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -55,7 +57,12 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("Password").performTextInput(password)
         compose.onNodeWithTag("auth.submit").performScrollTo().performClick()
         waitFor("the signed-in workspace") { compose.onAllNodes(hasTestTag("agenda.add")).fetchSemanticsNodes().isNotEmpty() }
-        waitFor("the initial empty agenda") { compose.onAllNodes(hasText("Nothing here yet")).fetchSemanticsNodes().isNotEmpty() }
+        val undatedEvent = items(api, token).single { it.title == "Android UI date clearing Event" }
+        val eventToDelete = items(api, token).single { it.title == "Android UI delete Event" }
+        assertEquals(ItemKind.Event, undatedEvent.kind)
+        assertEquals(ItemKind.Event, eventToDelete.kind)
+        assertAgendaItem(undatedEvent.id, undatedEvent.title)
+        assertAgendaItem(eventToDelete.id, eventToDelete.title)
 
         createSimpleItem("Android UI personal Task", isEvent = false, details = "Initial Task details")
         var personalTask = items(api, token).single { it.title == "Android UI personal Task" }
@@ -138,6 +145,9 @@ class RecurringAgendaUiTest {
         assertTrue(afterSeries.any { it.title == "Android UI Event" })
         assertEquals(2, afterSeries.count { it.title == "Android UI Following" })
         afterSeries.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
+
+        clearEventDate(undatedEvent, api, token)
+        deleteEvent(eventToDelete, api, token)
     }
 
     private fun items(api: ApiClient, token: String): List<WorkspaceItem> = runBlocking { api.listItems(token) }
@@ -209,6 +219,45 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText(scope).performScrollTo().performClick()
         compose.onNodeWithText("Save").performClick()
         waitFor("the edit editor to close") { compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty() }
+    }
+
+    private fun clearEventDate(item: WorkspaceItem, api: ApiClient, token: String) {
+        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
+        compose.onNodeWithTag("agenda.edit.${item.id}").performClick()
+        compose.onNodeWithText("Date (YYYY-MM-DD, optional)").performScrollTo().performTextClearance()
+        compose.onNodeWithText("Save").performClick()
+        waitFor("the date-clearing editor to close") {
+            compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isEmpty()
+        }
+        waitFor("the Event to remain undated with its File") {
+            val saved = items(api, token).singleOrNull { it.id == item.id }
+            saved != null && saved.scheduledDate == null && saved.scheduledTime == null
+                && saved.files.any { file -> file.name == "Android Event notes" }
+        }
+        assertAgendaItem(item.id, item.title)
+    }
+
+    private fun deleteEvent(item: WorkspaceItem, api: ApiClient, token: String) {
+        val itemTag = "agenda.item.${item.id}"
+        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag(itemTag))
+        val deleteButton = compose.onNode(hasText("Delete") and hasAnyAncestor(hasTestTag(itemTag)))
+        waitFor("the Event delete action to become available") {
+            runCatching {
+                deleteButton.assertIsDisplayed()
+                deleteButton.assertIsEnabled()
+            }.isSuccess
+        }
+        deleteButton.performClick()
+        waitFor("the Event delete confirmation") {
+            compose.onAllNodes(isDialog()).fetchSemanticsNodes().isNotEmpty()
+        }
+        val confirmDelete = compose.onNode(hasText("Delete") and hasAnyAncestor(isDialog()))
+        confirmDelete.performClick()
+        waitFor("the deleted Event and confirmation to leave the workspace") {
+            items(api, token).none { it.id == item.id }
+                && compose.onAllNodes(hasTestTag(itemTag)).fetchSemanticsNodes().isEmpty()
+                && compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
+        }
     }
 
     private fun assertAgendaItem(id: String, title: String) {

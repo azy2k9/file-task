@@ -1412,6 +1412,7 @@ private fun ItemEditorDialog(
                     )
                     FilterChip(
                         selected = kind == ItemKind.Event,
+                        modifier = Modifier.testTag("item.editor.kind.event"),
                         onClick = {
                             kindValue = ItemKind.Event.wireValue
                             if (item == null && !reminderRowsTouched) reminders = reminderSettings.eventReminders
