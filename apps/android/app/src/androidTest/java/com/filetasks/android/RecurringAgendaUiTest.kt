@@ -204,6 +204,7 @@ class RecurringAgendaUiTest {
     private fun editSimpleItem(item: WorkspaceItem, title: String, details: String) {
         compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
         compose.onNodeWithTag("agenda.edit.${item.id}").performClick()
+        waitFor("the simple item edit dialog to open") { hasDialogTitle("Edit item") }
         compose.onNodeWithText("Title").performTextClearance()
         compose.onNodeWithText("Title").performTextInput(title)
         compose.onNodeWithText("Details").performTextClearance()
