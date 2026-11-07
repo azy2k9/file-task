@@ -823,7 +823,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
         }
 
         confirmRemoveAttachment?.let { (file, attachment) ->
-            val attachmentItem = items.firstOrNull { it.id == attachment.itemId }
+            val attachmentItem = workspaceItems.firstOrNull { it.id == attachment.itemId }
             val isRecurringAttachment = attachmentItem?.seriesId != null || attachmentItem?.recurrence != null
             AlertDialog(
                 onDismissRequest = { if (!working) confirmRemoveAttachment = null },
