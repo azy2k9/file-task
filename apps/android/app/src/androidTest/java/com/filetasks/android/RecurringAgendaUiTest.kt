@@ -4,7 +4,6 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsOn
-import androidx.compose.ui.test.isRoot
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasTestTag
@@ -281,17 +280,20 @@ class RecurringAgendaUiTest {
         } catch (failure: Throwable) {
             val password = InstrumentationRegistry.getArguments().getString("password")
             val snapshot = runCatching {
-                compose.onAllNodes(isRoot(), useUnmergedTree = true).printToString()
+                compose.onRoot(useUnmergedTree = true).printToString()
             }.getOrElse { it.toString() }
             val dialogSnapshot = runCatching {
                 compose.onAllNodes(isDialog(), useUnmergedTree = true).printToString()
+            }.getOrElse { it.toString() }
+            val dialogContentsSnapshot = runCatching {
+                compose.onAllNodes(hasAnyAncestor(isDialog()), useUnmergedTree = true).printToString()
             }.getOrElse { it.toString() }
             val confirmSnapshot = runCatching {
                 compose.onAllNodes(hasTestTag("item.delete.confirm"), useUnmergedTree = true).printToString()
             }.getOrElse { it.toString() }
             val ui = if (password.isNullOrEmpty()) snapshot else snapshot.replace(password, "<redacted>")
             throw AssertionError(
-                "Failed while waiting for $description. UI: $ui\nDialogs: $dialogSnapshot\nDelete confirmation: $confirmSnapshot",
+                "Failed while waiting for $description. UI: $ui\nDialogs: $dialogSnapshot\nDialog contents: $dialogContentsSnapshot\nDelete confirmation: $confirmSnapshot",
                 failure,
             )
         }
