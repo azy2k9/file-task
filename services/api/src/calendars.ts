@@ -563,6 +563,10 @@ function patchImportedAppleIcs(metadata: ImportMetadataRow, item: EventItem, res
     }
     return -1;
   };
+  if (directIndex("URL") < 0) {
+    const backlink = filetasksEventUrl(item.id);
+    if (backlink) changes.set("URL",`URL:${backlink}`);
+  }
   const baseline = JSON.parse(metadata.baseline_json) as {scheduledDate:string|null;scheduledTime:string|null;title?:string;details?:string};
   const titleChanged = typeof baseline.title === "string" && baseline.title !== item.title;
   const detailsChanged = typeof baseline.details === "string" && baseline.details !== item.details;

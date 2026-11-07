@@ -18,7 +18,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 class PushMessagingService : FirebaseMessagingService() {
-    override fun onRegistered(installationId: String) {
+    override fun onNewToken(tokenValue: String) {
         val preferences = getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
         if (!preferences.getBoolean(PUSH_ENABLED_KEY, false) || preferences.getBoolean(PUSH_REVOKED_KEY, false)) return
         val token = TokenStore(this).read() ?: return
@@ -28,12 +28,17 @@ class PushMessagingService : FirebaseMessagingService() {
                 val api = ApiClient(baseUrl)
                 val user = api.session(token)
                 val key = pushDeviceKey(user.id)
-                val fidKey = pushFidKey(user.id)
+                val tokenKey = pushTokenKey(user.id)
                 val previousId = preferences.getString(key, null)
-                if (preferences.getString(fidKey, null) == installationId && previousId != null) return@runCatching
-                previousId?.let { api.revokePushDevice(token, PushDevice(it, "android", "")) }
-                val device = api.registerPushDevice(token, "android", installationId)
-                preferences.edit().putString(key, device.id).putString(fidKey, installationId).apply()
+                if (preferences.getString(tokenKey, null) == tokenValue && previousId != null) return@runCatching
+                val device = api.registerPushDevice(token, "android", tokenValue)
+                // Register first so a transient provider/API failure cannot leave
+                // this device without an active push registration. The API returns
+                // the existing registration when the token is already known.
+                if (previousId != null && previousId != device.id) {
+                    api.revokePushDevice(token, PushDevice(previousId, "android", ""))
+                }
+                preferences.edit().putString(key, device.id).putString(tokenKey, tokenValue).apply()
             }
         }
     }
@@ -72,6 +77,6 @@ class PushMessagingService : FirebaseMessagingService() {
         const val PUSH_REVOKED_KEY = "push_device_revoked"
         private const val CHANNEL_ID = "filetasks-reminders"
         fun pushDeviceKey(userId: String) = "push_device_id:$userId"
-        fun pushFidKey(userId: String) = "push_fid:$userId"
+        fun pushTokenKey(userId: String) = "push_token:$userId"
     }
 }

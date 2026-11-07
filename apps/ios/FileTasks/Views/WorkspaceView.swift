@@ -374,7 +374,7 @@ struct WorkspaceView: View {
                 get: { fileToAttach != nil }, set: { if !$0 { fileToAttach = nil } }
             )) {
                 if let file = fileToAttach {
-                    ForEach(model.items.filter { item in !file.attachments.contains(where: { $0.itemId == item.id }) }) { item in
+                    ForEach(model.items.filter { item in !item.files.contains(where: { $0.id == file.id }) }) { item in
                         if item.seriesId != nil {
                             Button("This Occurrence · \(item.kind.title): \(item.title)") { Task { await attach(file, to: item, scope: .occurrence) } }
                             Button("This and following · \(item.title)") { Task { await attach(file, to: item, scope: .following) } }
@@ -465,7 +465,7 @@ struct WorkspaceView: View {
                     }
                     HStack {
                         Button("Attach") { fileToAttach = file }
-                            .disabled(model.items.count == file.attachments.count)
+                            .disabled(!model.items.contains { item in !item.files.contains(where: { $0.id == file.id }) })
                         Spacer()
                         Button("Delete File", role: .destructive) { fileToDelete = file }
                     }
