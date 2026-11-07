@@ -252,7 +252,9 @@ class RecurringAgendaUiTest {
     private fun edit(item: WorkspaceItem, title: String, scope: String, api: ApiClient, token: String) {
         waitFor("any previous editor to close") { compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty() }
         compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag("agenda.edit.${item.id}"))
-        compose.onNodeWithTag("agenda.edit.${item.id}").performClick()
+        val editButton = compose.onNodeWithTag("agenda.edit.${item.id}")
+        waitFor("the requested item's edit action to be enabled") { runCatching { editButton.assertIsEnabled() }.isSuccess }
+        editButton.performClick()
         waitFor("the requested item editor to open") { compose.onAllNodes(hasText("Edit item")).fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("Title").performTextClearance()
         compose.onNodeWithText("Title").performTextInput(title)
