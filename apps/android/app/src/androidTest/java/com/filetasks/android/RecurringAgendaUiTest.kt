@@ -66,7 +66,7 @@ class RecurringAgendaUiTest {
         assertAgendaItem(undatedEvent.id, undatedEvent.title)
         assertAgendaItem(eventToDelete.id, eventToDelete.title)
 
-        createSimpleItem("Android UI personal Task", isEvent = false, details = "Initial Task details")
+        createSimpleItem("Android UI personal Task", isEvent = false, details = "Initial Task details", api = api, token = token)
         var personalTask = items(api, token).single { it.title == "Android UI personal Task" }
         assertEquals(ItemKind.Task, personalTask.kind)
         assertEquals(false, personalTask.completed)
@@ -98,7 +98,7 @@ class RecurringAgendaUiTest {
         assertEquals("Updated Task details", personalTask.details)
         assertAgendaItem(personalTask.id, personalTask.title)
 
-        createRecurring("Android UI Task", isEvent = false, date = "2026-10-14")
+        createRecurring("Android UI Task", isEvent = false, date = "2026-10-14", api = api, token = token)
         val initialTaskRows = items(api, token).filter { it.title == "Android UI Task" }.sortedBy { it.occurrenceDate }
         val task = initialTaskRows.sortedBy { it.scheduledDate }
         assertEquals("The UI-created Task must have three Occurrences", 3, task.size)
@@ -138,7 +138,7 @@ class RecurringAgendaUiTest {
         assertAgendaItem(firstTaskOccurrence.id, "Android UI First Task Only")
         laterTaskOccurrences.forEach { assertAgendaItem(it.id, it.title) }
 
-        createRecurring("Android UI Event", isEvent = true, date = "2026-10-18")
+        createRecurring("Android UI Event", isEvent = true, date = "2026-10-18", api = api, token = token)
         waitFor("the saved Event's Calendar failure status") {
             compose.onAllNodes(hasText("Calendar sync pending. Your Event is saved in FileTasks and will be retried. The last attempt failed; another retry is scheduled.")).fetchSemanticsNodes().isNotEmpty()
         }
@@ -146,7 +146,7 @@ class RecurringAgendaUiTest {
         assertEquals("The UI-created Event must have three Occurrences", 3, event.size)
         event.forEach { assertAgendaItem(it.id, it.title) }
 
-        createSimpleItem("Android UI personal Event", isEvent = true, details = "An undated Event")
+        createSimpleItem("Android UI personal Event", isEvent = true, details = "An undated Event", api = api, token = token)
         var personalEvent = items(api, token).single { it.title == "Android UI personal Event" }
         assertEquals(ItemKind.Event, personalEvent.kind)
         assertEquals(null, personalEvent.scheduledDate)
@@ -189,14 +189,15 @@ class RecurringAgendaUiTest {
 
     private fun items(api: ApiClient, token: String): List<WorkspaceItem> = runBlocking { api.listItems(token) }
 
-    private fun createSimpleItem(title: String, isEvent: Boolean, details: String) {
+    private fun createSimpleItem(title: String, isEvent: Boolean, details: String, api: ApiClient, token: String) {
         compose.onNodeWithTag("agenda.add").performClick()
         if (isEvent) compose.onNodeWithTag("item.editor.kind.event").performClick()
         compose.onNodeWithText("Title").performTextInput(title)
         compose.onNodeWithText("Details").performTextInput(details)
         compose.onNodeWithText("Create").performClick()
         waitFor("the simple item editor to close") {
-            compose.onAllNodes(hasText("Add to your workspace")).fetchSemanticsNodes().isEmpty()
+            items(api, token).any { it.title == title }
+                && compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
         }
     }
 
@@ -236,7 +237,7 @@ class RecurringAgendaUiTest {
         }
     }
 
-    private fun createRecurring(title: String, isEvent: Boolean, date: String) {
+    private fun createRecurring(title: String, isEvent: Boolean, date: String, api: ApiClient, token: String) {
         compose.onNodeWithTag("agenda.add").performClick()
         if (isEvent) compose.onNodeWithTag("item.editor.kind.event").performClick()
         compose.onNodeWithText("Title").performTextInput(title)
@@ -246,7 +247,10 @@ class RecurringAgendaUiTest {
         compose.onNodeWithText("On date").performScrollTo().performClick()
         compose.onNodeWithText("End date (YYYY-MM-DD)").performScrollTo().performTextInput(LocalDate.parse(date).plusDays(2).toString())
         compose.onNodeWithText("Create").performClick()
-        waitFor("the create editor to close") { compose.onAllNodes(hasText("Add to your workspace")).fetchSemanticsNodes().isEmpty() }
+        waitFor("the create editor to close") {
+            items(api, token).any { it.title == title }
+                && compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty()
+        }
     }
 
     private fun edit(item: WorkspaceItem, title: String, scope: String, api: ApiClient, token: String) {
