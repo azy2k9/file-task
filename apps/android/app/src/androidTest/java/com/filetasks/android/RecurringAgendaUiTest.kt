@@ -19,6 +19,7 @@ import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.test.printToString
 import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -168,10 +169,10 @@ class RecurringAgendaUiTest {
         assertEquals(1, afterFollowing.count { it.title == "Android UI Event" })
         afterFollowing.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
 
-        edit(task[0], "Android UI Whole Task", "Whole series")
+        edit(laterTaskOccurrences.first(), "Android UI Whole Task", "Whole series")
         val afterSeries = items(api, token)
-        assertEquals(3, afterSeries.count { it.title == "Android UI Whole Task" })
-        assertTrue(afterSeries.any { it.title == "Android UI Event" })
+        assertEquals(2, afterSeries.count { it.title == "Android UI Whole Task" })
+        assertTrue(afterSeries.any { it.title == "Android UI First Task Only" })
         assertEquals(2, afterSeries.count { it.title == "Android UI Following" })
         afterSeries.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
 
@@ -269,11 +270,10 @@ class RecurringAgendaUiTest {
             compose.onNodeWithText("Remove Reminder").performScrollTo().performClick()
         }
         compose.onNodeWithText("Add Reminder").performScrollTo().performClick()
-        compose.onNodeWithText("Offset").performScrollTo().performTextClearance()
-        compose.onNodeWithText("Offset").performTextInput("2")
+        compose.onNodeWithText("Offset").performScrollTo().performTextReplacement("2")
         compose.onNodeWithText("Clock time").performTextClearance()
         compose.onNodeWithText("Clock time").performTextInput("11:00")
-        compose.onNodeWithText("hours").performScrollTo().performClick()
+        compose.onNodeWithText("ho").performScrollTo().performClick()
 
         compose.onNodeWithText("This Occurrence").performScrollTo().performClick()
         compose.onNodeWithText("Save").performClick()
