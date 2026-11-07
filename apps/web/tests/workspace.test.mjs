@@ -3622,6 +3622,29 @@ test("editing the first Occurrence locally preserves its recurrence definition a
   } finally { await setTestClock(previousClock); }
 });
 
+test("a whole-series edit after a local first-Occurrence recurrence override keeps the saved series rule", async () => {
+  const owner = await account();
+  const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "task", title: "Series title", scheduledDate: "2026-11-01",
+    recurrence: { interval: 1, unit: "days", end: { type: "count", count: 4 } },
+  } });
+  assert.equal(created.status, 201);
+  const root = (await created.json()).item;
+  assert.equal((await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: {
+    title: "First Occurrence override", recurrence: null, scope: "occurrence",
+  } })).status, 200);
+  assert.equal((await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: {
+    title: "Renamed series", recurrence: null, scope: "series",
+  } })).status, 200);
+  const rows = (await (await request("/api/items", { token: owner.token })).json()).items
+    .filter(({ seriesId }) => seriesId === root.id).sort((a, b) => a.occurrenceDate.localeCompare(b.occurrenceDate));
+  assert.equal(rows.length, 4);
+  assert.ok(rows.every(({ title }) => title === "Renamed series"));
+  assert.deepEqual(rows.map(({ occurrenceDate }) => occurrenceDate), ["2026-11-01", "2026-11-02", "2026-11-03", "2026-11-04"]);
+  assert.equal(rows[0].recurrence.end.type, "count");
+  assert.equal(rows[0].recurrence.end.count, 4);
+});
+
 test("a root Occurrence edit with recurrence enabled does not replace the series generation template", async () => {
   const owner = await account();
   const previousClock = new Date(testClock);
