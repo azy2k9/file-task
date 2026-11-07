@@ -467,7 +467,7 @@ function validate(body: Record<string, unknown>, existing?: WorkspaceItem) {
 function saveItemInTransaction(userId: string, body: Record<string, unknown>, id?: string) {
   const db = database();
   const existing = id ? getItem(userId, id) : undefined;
-  const item = validate(body, existing);
+  let item = validate(body, existing);
   const unchangedEmailRules = existing !== undefined && JSON.stringify(item.reminders) === JSON.stringify(existing.reminders);
   if (body.reminders !== undefined && item.reminders.some((reminder) => reminder.delivery === "email")
     && !reminderSettings(userId).emailEnabled && !unchangedEmailRules) {
@@ -530,11 +530,15 @@ function saveItemInTransaction(userId: string, body: Record<string, unknown>, id
     const wholeSeries = scope === "series" || (scope === "following" && id === series);
     const root = db.prepare("SELECT scheduled_date,scheduled_time FROM items WHERE user_id=? AND id=?").get(userId,series);
     const definition = db.prepare("SELECT scheduled_date,scheduled_time,recurrence_json,reminders_json FROM item_series_definitions WHERE user_id=? AND series_root_id=?").get(userId,series);
+    const restoresRootSeriesRule = scope === "series" && id === series && existing?.recurrence === null
+      && body.recurrence === null && definition?.recurrence_json != null;
+    if (restoresRootSeriesRule) item = { ...item, recurrence:json<RecurrenceRule | null>(definition.recurrence_json,null) };
     const scheduleUnchanged = item.scheduledDate === existing?.scheduledDate && item.scheduledTime === existing?.scheduledTime;
     const recurrenceUnchanged = sameRecurrence(existing?.recurrence ?? null,item.recurrence);
     const preservesOccurrenceIdentity = scope === "series" && scheduleUnchanged
-      && (body.recurrence === undefined || recurrenceUnchanged);
-    const seriesStart = preservesOccurrenceIdentity ? String(root?.scheduled_date ?? item.scheduledDate) : item.scheduledDate;
+      && (body.recurrence === undefined || recurrenceUnchanged || restoresRootSeriesRule);
+    const seriesStart = preservesOccurrenceIdentity
+      ? String(definition?.scheduled_date ?? root?.scheduled_date ?? item.scheduledDate) : item.scheduledDate;
     const dates = wholeSeries && !preservesOccurrenceIdentity && item.recurrence && seriesStart
       ? occurrenceDates(seriesStart, item.recurrence, reminderLeadDays(JSON.stringify(item.reminders)))
       : [];
@@ -691,7 +695,7 @@ function saveItemInTransaction(userId: string, body: Record<string, unknown>, id
     if (scope === "series" || (scope === "following" && id === series)) {
       if (!preservesOccurrenceIdentity) for (const target of targets) db.prepare("UPDATE items SET occurrence_recurrence_json=NULL WHERE user_id=? AND id=?").run(userId,target.id);
       saveSeriesDefinition(userId,series,preservesOccurrenceIdentity
-        ? {...item,scheduledDate:String(root?.scheduled_date ?? item.scheduledDate),scheduledTime:root?.scheduled_time == null ? null : String(root.scheduled_time)}
+        ? {...item,scheduledDate:String(definition?.scheduled_date ?? root?.scheduled_date ?? item.scheduledDate),scheduledTime:definition?.scheduled_time == null ? (root?.scheduled_time == null ? null : String(root.scheduled_time)) : String(definition.scheduled_time)}
         : item);
     }
     if (item.recurrence) ensureOccurrences(userId);
