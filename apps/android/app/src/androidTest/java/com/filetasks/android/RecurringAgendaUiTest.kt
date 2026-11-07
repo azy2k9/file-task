@@ -9,13 +9,14 @@ import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isDialog
+import androidx.compose.ui.test.isRoot
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
-import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
+import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.printToString
@@ -26,6 +27,7 @@ import com.filetasks.android.data.ItemKind
 import com.filetasks.android.data.WorkspaceItem
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -178,8 +180,9 @@ class RecurringAgendaUiTest {
 
     private fun deleteItem(item: WorkspaceItem) {
         val itemTag = "agenda.item.${item.id}"
-        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag(itemTag))
-        val deleteButton = compose.onNode(hasText("Delete") and hasAnyAncestor(hasTestTag(itemTag)))
+        val deleteTag = "agenda.delete.${item.id}"
+        scrollDeleteActionClearOfFab(deleteTag)
+        val deleteButton = compose.onNodeWithTag(deleteTag)
         waitFor("the delete action to finish enabling") {
             runCatching {
                 deleteButton.assertIsDisplayed()
@@ -188,7 +191,7 @@ class RecurringAgendaUiTest {
         }
         deleteButton.performClick()
         waitFor("the delete confirmation dialog to appear") {
-            compose.onAllNodes(isDialog()).fetchSemanticsNodes().isNotEmpty()
+            compose.onAllNodes(hasTestTag("item.delete.title")).fetchSemanticsNodes().isNotEmpty()
         }
         clickDeleteConfirmation()
         waitFor("the deleted item and confirmation dialog to leave the agenda") {
@@ -238,8 +241,9 @@ class RecurringAgendaUiTest {
 
     private fun deleteEvent(item: WorkspaceItem, api: ApiClient, token: String) {
         val itemTag = "agenda.item.${item.id}"
-        compose.onNodeWithTag("agenda.list").performScrollToNode(hasTestTag(itemTag))
-        val deleteButton = compose.onNode(hasText("Delete") and hasAnyAncestor(hasTestTag(itemTag)))
+        val deleteTag = "agenda.delete.${item.id}"
+        scrollDeleteActionClearOfFab(deleteTag)
+        val deleteButton = compose.onNodeWithTag(deleteTag)
         waitFor("the Event delete action to become available") {
             runCatching {
                 deleteButton.assertIsDisplayed()
@@ -248,7 +252,7 @@ class RecurringAgendaUiTest {
         }
         deleteButton.performClick()
         waitFor("the Event delete confirmation") {
-            compose.onAllNodes(isDialog()).fetchSemanticsNodes().isNotEmpty()
+            compose.onAllNodes(hasTestTag("item.delete.title")).fetchSemanticsNodes().isNotEmpty()
         }
         clickDeleteConfirmation()
         waitFor("the deleted Event and confirmation to leave the workspace") {
@@ -264,14 +268,29 @@ class RecurringAgendaUiTest {
     }
 
     private fun clickDeleteConfirmation() {
-        val mergedConfirm = compose.onNodeWithTag("item.delete.confirm")
-        val unmergedConfirm = compose.onNodeWithTag("item.delete.confirm", useUnmergedTree = true)
-        var mergedReady = false
+        val confirmDelete = compose.onNodeWithTag("item.delete.confirm")
         waitFor("the delete confirmation button to become enabled") {
-            mergedReady = runCatching { mergedConfirm.assertIsEnabled() }.isSuccess
-            mergedReady || runCatching { unmergedConfirm.assertIsEnabled() }.isSuccess
+            runCatching { confirmDelete.assertIsEnabled() }.isSuccess
         }
-        if (mergedReady) mergedConfirm.performClick() else unmergedConfirm.performClick()
+        confirmDelete.performClick()
+    }
+
+    private fun scrollDeleteActionClearOfFab(deleteTag: String) {
+        val agenda = compose.onNodeWithTag("agenda.list")
+        val deleteButton = compose.onNodeWithTag(deleteTag)
+        agenda.performScrollToNode(hasTestTag(deleteTag))
+        var overlapsFab: Boolean
+        var scrollCount = 0
+        while (true) {
+            val deleteBounds = deleteButton.fetchSemanticsNode().boundsInRoot
+            val fabBounds = compose.onNodeWithTag("agenda.add").fetchSemanticsNode().boundsInRoot
+            overlapsFab = deleteBounds.left < fabBounds.right && fabBounds.left < deleteBounds.right
+                && deleteBounds.top < fabBounds.bottom && fabBounds.top < deleteBounds.bottom
+            if (!overlapsFab || scrollCount == 4) break
+            agenda.performTouchInput { swipeUp() }
+            scrollCount += 1
+        }
+        assertFalse("Delete action $deleteTag overlaps the Add item button after scrolling", overlapsFab)
     }
 
     private fun waitFor(description: String, condition: () -> Boolean) {
@@ -280,22 +299,11 @@ class RecurringAgendaUiTest {
         } catch (failure: Throwable) {
             val password = InstrumentationRegistry.getArguments().getString("password")
             val snapshot = runCatching {
-                compose.onRoot(useUnmergedTree = true).printToString()
-            }.getOrElse { it.toString() }
-            val dialogSnapshot = runCatching {
-                compose.onAllNodes(isDialog(), useUnmergedTree = true).printToString()
-            }.getOrElse { it.toString() }
-            val dialogContentsSnapshot = runCatching {
-                compose.onAllNodes(hasAnyAncestor(isDialog()), useUnmergedTree = true).printToString()
-            }.getOrElse { it.toString() }
-            val confirmSnapshot = runCatching {
-                compose.onAllNodes(hasTestTag("item.delete.confirm"), useUnmergedTree = true).printToString()
+                val roots = compose.onAllNodes(isRoot(), useUnmergedTree = true)
+                (0 until roots.fetchSemanticsNodes().size).joinToString("\n") { index -> roots.get(index).printToString() }
             }.getOrElse { it.toString() }
             val ui = if (password.isNullOrEmpty()) snapshot else snapshot.replace(password, "<redacted>")
-            throw AssertionError(
-                "Failed while waiting for $description. UI: $ui\nDialogs: $dialogSnapshot\nDialog contents: $dialogContentsSnapshot\nDelete confirmation: $confirmSnapshot",
-                failure,
-            )
+            throw AssertionError("Failed while waiting for $description. UI: $ui", failure)
         }
     }
 }
