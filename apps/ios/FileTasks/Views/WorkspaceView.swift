@@ -42,6 +42,7 @@ struct WorkspaceView: View {
     @State private var itemPendingDeletion: WorkspaceItem?
     @State private var showingLogoutConfirmation = false
     @State private var showingReminderSettings = false
+    @State private var showingCalendarSettings = false
     @State private var section: WorkspaceSection = .agenda
     @State private var showingLinkForm = false
     @State private var linkName = ""
@@ -264,6 +265,11 @@ struct WorkspaceView: View {
                 } label: {
                     Label("Reminder settings", systemImage: "bell")
                 }
+                Button {
+                    showingCalendarSettings = true
+                } label: {
+                    Label("Connected calendars", systemImage: "calendar")
+                }
                 Button(role: .destructive) {
                     showingLogoutConfirmation = true
                 } label: {
@@ -297,6 +303,9 @@ struct WorkspaceView: View {
             }
             .sheet(isPresented: $showingReminderSettings) {
                 ReminderSettingsView()
+            }
+            .sheet(isPresented: $showingCalendarSettings) {
+                CalendarSettingsView()
             }
     }
 

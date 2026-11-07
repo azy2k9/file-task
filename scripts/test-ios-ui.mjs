@@ -8,7 +8,7 @@ import { join, resolve } from "node:path";
 import { setEmulatorRunning } from "./emulator-control.mjs";
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
-const testName = "iOS UI acceptance: registration, cross-type Reminder preservation, save/reopen and browser read";
+const testName = "iOS UI acceptance: registration, cross-type Reminder preservation, calendar sync and browser read";
 let activeChild;
 let interruptedSignal;
 let interruptionPromise;
