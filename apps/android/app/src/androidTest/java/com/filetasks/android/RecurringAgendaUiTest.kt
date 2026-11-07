@@ -107,23 +107,30 @@ class RecurringAgendaUiTest {
         val firstTaskOccurrence = initialTaskRows.first()
         val laterTaskOccurrences = initialTaskRows.drop(1)
         editFirstOccurrence(firstTaskOccurrence)
-        waitFor("the first Occurrence edit to be saved without changing the series") {
-            val savedRows = items(api, token).filter { it.occurrenceDate in initialTaskRows.map { row -> row.occurrenceDate } }
-            val savedFirst = savedRows.singleOrNull { it.id == firstTaskOccurrence.id }
-            val savedLater = laterTaskOccurrences.mapNotNull { original -> savedRows.singleOrNull { it.id == original.id } }
-            savedFirst?.title == "Android UI First Task Only"
-                && savedFirst.scheduledDate == LocalDate.parse(requireNotNull(firstTaskOccurrence.scheduledDate)).plusDays(10).toString()
-                && savedFirst.scheduledTime == "14:30"
-                && savedFirst.recurrence == null
-                && savedFirst.reminders.firstOrNull()?.let { it.amount == 2 && it.unit == "hours" && it.time == "11:00" } == true
-                && savedLater.size == laterTaskOccurrences.size
-                && savedLater.zip(laterTaskOccurrences).all { (saved, original) ->
-                    saved.title == original.title
-                        && saved.scheduledDate == original.scheduledDate
-                        && saved.scheduledTime == original.scheduledTime
-                        && saved.recurrence == original.recurrence
-                        && saved.reminders == original.reminders
+        var observedRows = emptyList<WorkspaceItem>()
+        try {
+            waitFor("the first Occurrence edit to be saved without changing the series") {
+                observedRows = items(api, token).filter { it.id in initialTaskRows.map(WorkspaceItem::id) || it.title == "Android UI First Task Only" }
+                val savedRows = observedRows.filter { it.occurrenceDate in initialTaskRows.map { row -> row.occurrenceDate } }
+                val savedFirst = savedRows.singleOrNull { it.id == firstTaskOccurrence.id }
+                val savedLater = laterTaskOccurrences.mapNotNull { original -> savedRows.singleOrNull { it.id == original.id } }
+                savedFirst?.title == "Android UI First Task Only"
+                    && savedFirst.scheduledDate == LocalDate.parse(requireNotNull(firstTaskOccurrence.scheduledDate)).plusDays(10).toString()
+                    && savedFirst.scheduledTime == "14:30"
+                    && savedFirst.recurrence == null
+                    && savedFirst.reminders.firstOrNull()?.let { it.amount == 2 && it.unit == "hours" && it.time == "11:00" } == true
+                    && savedLater.size == laterTaskOccurrences.size
+                    && savedLater.zip(laterTaskOccurrences).all { (saved, original) ->
+                        saved.title == original.title
+                            && saved.scheduledDate == original.scheduledDate
+                            && saved.scheduledTime == original.scheduledTime
+                            && saved.recurrence == original.recurrence
+                            && saved.reminders == original.reminders
+                    }
                 }
+        } catch (failure: AssertionError) {
+            val values = observedRows.joinToString { "${it.id}:series=${it.seriesId},occurrence=${it.occurrenceDate},title=${it.title},date=${it.scheduledDate},time=${it.scheduledTime},rule=${it.recurrence},reminders=${it.reminders}" }
+            throw AssertionError("First Occurrence API rows after edit; expected id ${firstTaskOccurrence.id}: $values", failure)
         }
         val afterFirstOccurrenceEdit = items(api, token).filter { it.occurrenceDate in initialTaskRows.map { row -> row.occurrenceDate } }
         assertEquals(firstTaskOccurrence.occurrenceDate, afterFirstOccurrenceEdit.single { it.id == firstTaskOccurrence.id }.occurrenceDate)
