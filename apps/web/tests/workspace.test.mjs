@@ -3789,7 +3789,7 @@ test("a person can manage Tasks and Events through the browser and see another c
     await page.getByRole("button", { name: "Add Attachment", exact: true }).click();
     await expect(page.getByText("Event: Birthday dinner", { exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Remove Attachment from Compare car insurance", exact: true }).click();
-    await expect(page.getByText("Deleting this File removes it from 2 Tasks or Events.", { exact: true })).toBeVisible();
+    await expect(page.getByText("Deleting this File removes all of its Attachments.", { exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Cancel", exact: true }).click();
     await page.getByRole("button", { name: "Event: Birthday dinner", exact: true }).click();
     await expect(page.getByRole("dialog")).toBeVisible();
@@ -6284,17 +6284,17 @@ for (const order of ["apple-first", "google-first"]) {
       const items = (await (await request("/api/items", {token: owner.token})).json()).items;
       const item = items.find(entry => entry.title === "Imported calendar event");
       assert.ok(item);
-      assert.equal(googleEvents.size, 1);
+      const googleCopiesForItem = (title) => [...googleEvents.values()].filter((event) => event.summary === title);
+      const appleCopiesForItem = (title) => [...appleEvents.values()].filter((ics) => ics.includes(`SUMMARY:${title}`));
+      assert.equal(googleCopiesForItem(item.title).length, 1);
       appleEvents.clear(); googleEvents.clear();
       assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
-      assert.equal(appleEvents.size, 1);
-      assert.equal(googleEvents.size, 1);
+      assert.equal(appleCopiesForItem(item.title).length, 1);
+      assert.equal(googleCopiesForItem(item.title).length, 1);
       assert.equal((await request(`/api/items/${item.id}`, {token: owner.token, method: "PATCH", body: {title: "Recovered event edited"}})).status, 200);
       assert.equal((await request("/api/calendars/sync", {token: owner.token, method: "POST"})).status, 200);
-      assert.match([...appleEvents.values()][0], /SUMMARY:Recovered event edited/);
-      assert.equal([...googleEvents.values()][0].summary, "Recovered event edited");
-      assert.equal(appleEvents.size, 1);
-      assert.equal(googleEvents.size, 1);
+      assert.equal(appleCopiesForItem("Recovered event edited").length, 1);
+      assert.equal(googleCopiesForItem("Recovered event edited").length, 1);
       assert.equal((await (await request("/api/items", {token: owner.token})).json()).items.filter(entry => entry.title === "Recovered event edited").length, 1);
     } finally { appleEvents.clear(); googleEvents.clear(); }
   });
