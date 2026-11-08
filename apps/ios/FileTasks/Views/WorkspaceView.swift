@@ -396,7 +396,9 @@ struct WorkspaceView: View {
                 }
                 Button("Cancel", role: .cancel) { fileToDelete = nil }
             } message: {
-                if let file = fileToDelete, file.attachments.count > 1 {
+                if let file = fileToDelete, file.attachments.contains(where: { $0.scope == "series" || $0.scope == "following" }) {
+                    Text("Deleting this File removes it from all associated Tasks and Events, including recurring Occurrences.")
+                } else if let file = fileToDelete, file.attachments.count > 1 {
                     Text("This File is attached to \(file.attachments.count) Tasks or Events. Deleting it removes all of those Attachments.")
                 } else if let file = fileToDelete, let attachment = file.attachments.first {
                     Text("Deleting this File also removes its Attachment from “\(attachment.itemTitle)”.")
@@ -419,7 +421,9 @@ struct WorkspaceView: View {
                 }
                 Button("Cancel", role: .cancel) { attachmentToRemove = nil }
             } message: {
-                if let target = attachmentToRemove, target.file.attachments.count > 1 {
+                if let target = attachmentToRemove, target.file.attachments.contains(where: { $0.scope == "series" || $0.scope == "following" }) {
+                    Text("Remove this Attachment from “\(target.attachment.itemTitle)” only, or delete the File from all associated Tasks and Events, including recurring Occurrences.")
+                } else if let target = attachmentToRemove, target.file.attachments.count > 1 {
                     Text("Remove this Attachment from “\(target.attachment.itemTitle)” only, or delete the File and its Attachments from \(target.file.attachments.count) items.")
                 } else if let target = attachmentToRemove {
                     Text("Remove this Attachment from “\(target.attachment.itemTitle)” only, or delete the File.")
