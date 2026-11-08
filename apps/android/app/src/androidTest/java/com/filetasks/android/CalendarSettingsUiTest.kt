@@ -159,6 +159,9 @@ class CalendarSettingsUiTest {
         compose.onNodeWithText("Name").performTextInput("Imported Event notes")
         compose.onNodeWithText("Web link").performTextInput("https://example.com/imported-event-notes")
         compose.onNodeWithText("Add link").performClick()
+        waitFor("the new File's Attach action") {
+            compose.onAllNodes(hasText("Attach") and isEnabled()).fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithText("Attach").performClick()
         compose.onNodeWithText("Event: Android UI imported Apple Event").performClick()
         waitFor("the File attachment to the imported Event") {
