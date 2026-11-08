@@ -135,18 +135,18 @@ final class FileTasksReminderDefaultsUITests: XCTestCase {
 
         createRecurringItem(kind: "Event", title: "UI Runner Recurring Event")
         openItem("iOS UI date clearing Event")
-        let addDate = app.switches["Add date"]
-        scrollToHittable(addDate, toward: .down, message: "The seeded Event's date toggle should be visible.")
-        XCTAssertEqual(addDate.value as? String, "1", "The seeded Event should start with a date.")
+        let seededEventAddDate = app.switches["Add date"]
+        scrollToHittable(seededEventAddDate, toward: .down, message: "The seeded Event's date toggle should be visible.")
+        XCTAssertEqual(seededEventAddDate.value as? String, "1", "The seeded Event should start with a date.")
         // SwiftUI exposes the labelled Toggle row and a nested switch in
         // accessibility. Tapping the row can leave the switch unchanged.
-        let addDateSwitch = addDate.switches.firstMatch
+        let addDateSwitch = seededEventAddDate.switches.firstMatch
         if addDateSwitch.exists {
             addDateSwitch.tap()
         } else {
-            addDate.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+            seededEventAddDate.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
         }
-        XCTAssertEqual(addDate.value as? String, "0", "The Event date should be cleared in the native editor.")
+        XCTAssertEqual(seededEventAddDate.value as? String, "0", "The Event date should be cleared in the native editor.")
         saveCurrentItem()
         let retainedUndatedEvent = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "iOS UI date clearing Event")).firstMatch
         XCTAssertTrue(retainedUndatedEvent.waitForExistence(timeout: 15),

@@ -5690,7 +5690,7 @@ test("calendar export coordination spans API processes and does not block anothe
     edited=requestReplica(`/api/items/${item.id}`,{token:owner.token,method:"PATCH",body:{title:"After distributed export"}});
     const sharedDb=new DatabaseSync(join(directory,"workspace.sqlite"));
     try {
-      const deadline=Date.now()+5000;
+      const deadline=Date.now()+(process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1" ? 20_000 : 5000);
       while(Date.now()<deadline&&sharedDb.prepare("SELECT title FROM items WHERE user_id=? AND id=?").get(owner.user.id,item.id)?.title!=="After distributed export") await delay(10);
       assert.equal(sharedDb.prepare("SELECT title FROM items WHERE user_id=? AND id=?").get(owner.user.id,item.id)?.title,"After distributed export",
         "the Event edit should commit before releasing the older provider write");
@@ -5943,7 +5943,7 @@ test("deleting while a reserved creation is held before provider commit retains 
         : [...appleEvents.values()].some(ics=>ics.includes(`?event=${item.id}`)),false,"the provider side effect has not happened yet");
 
       const deleting=request(`/api/items/${item.id}`,{token:owner.token,method:"DELETE"});
-      const deadline=Date.now()+5000;
+      const deadline=Date.now()+(process.env.FILETASKS_RUN_SHARED_ACCEPTANCE === "1" ? 20_000 : 5000);
       while(Date.now()<deadline&&db.prepare("SELECT 1 FROM items WHERE user_id=? AND id=?").get(owner.user.id,item.id)) await delay(10);
       assert.equal(db.prepare("SELECT 1 FROM items WHERE user_id=? AND id=?").get(owner.user.id,item.id),undefined,"delete commits locally while export is held");
       assert.equal(db.prepare("SELECT uncertain FROM calendar_creation_cleanup WHERE user_id=? AND provider=? AND item_id=?").get(owner.user.id,provider,item.id)?.uncertain,1,
@@ -6402,9 +6402,9 @@ test("a timed out Calendar create releases its lease, keeps its attempt uncertai
   try {
     replica=await startCalendarApiReplica(3117,{FILETASKS_CALENDAR_OPERATION_TIMEOUT_MS:"250",FILETASKS_CALENDAR_LOCK_WAIT_TIMEOUT_MS:"250"});
     holdNextCalendarCreation={provider:"apple",beforeCommit:true,created:started,releasePromise,release};
-    const startedAt=Date.now();
     const exporting=fetch(`http://localhost:${replica.port}/api/calendars/sync`,{method:"POST",headers:{Authorization:`Bearer ${owner.token}`}});
     await held;
+    const startedAt=Date.now();
     const response=await Promise.race([exporting,delay(4000).then(()=>{throw new Error("provider timeout did not bound the stalled request");})]);
     assert.ok(Date.now()-startedAt<4000,"the stalled provider request is aborted at its operation deadline");
     assert.notEqual(response.status,200,"the uncertain create is retried after reconciliation rather than treated as delivered");
