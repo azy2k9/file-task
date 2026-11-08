@@ -408,27 +408,54 @@ struct WorkspaceView: View {
                 get: { attachmentToRemove != nil }, set: { if !$0 { attachmentToRemove = nil } }
             ), titleVisibility: .visible) {
                 if let target = attachmentToRemove {
-                    if target.attachment.scope == "series" || target.attachment.scope == "following" {
+                    if attachmentHasRecurringSeries(target.attachment) {
                         Button("Remove from this Occurrence") { Task { await removeAttachment(target.attachment, from: target.file, scope: .occurrence) } }
                         Button("Remove this and following Occurrences") { Task { await removeAttachment(target.attachment, from: target.file, scope: .following) } }
+                        Button("Remove from whole series", role: .destructive) { Task { await removeAttachment(target.attachment, from: target.file, scope: .series) } }
                     } else {
                         Button("Remove Attachment") { Task { await removeAttachment(target.attachment, from: target.file, scope: .occurrence) } }
-                    }
-                    if target.attachment.scope == "series" {
-                        Button("Remove from whole series", role: .destructive) { Task { await removeAttachment(target.attachment, from: target.file, scope: .series) } }
                     }
                     Button("Delete File from Files section", role: .destructive) { Task { await deleteFile(target.file) } }
                 }
                 Button("Cancel", role: .cancel) { attachmentToRemove = nil }
             } message: {
-                if let target = attachmentToRemove, target.file.attachments.contains(where: { $0.scope == "series" || $0.scope == "following" }) {
-                    Text("Remove this Attachment from “\(target.attachment.itemTitle)” only, or delete the File from all associated Tasks and Events, including recurring Occurrences.")
-                } else if let target = attachmentToRemove, target.file.attachments.count > 1 {
-                    Text("Remove this Attachment from “\(target.attachment.itemTitle)” only, or delete the File and its Attachments from \(target.file.attachments.count) items.")
-                } else if let target = attachmentToRemove {
-                    Text("Remove this Attachment from “\(target.attachment.itemTitle)” only, or delete the File.")
+                if let target = attachmentToRemove {
+                    Text(attachmentRemovalMessage(for: target))
                 }
             }
+    }
+
+    private func attachmentHasRecurringSeries(_ attachment: FileAttachment) -> Bool {
+        let item = model.items.first(where: { $0.id == attachment.itemId })
+        return item?.seriesId != nil
+            || item?.recurrence != nil
+            || attachment.scope == "series"
+            || attachment.scope == "following"
+    }
+
+    private func attachmentRemovalMessage(for target: (file: WorkspaceFile, attachment: FileAttachment)) -> String {
+        let title = target.attachment.itemTitle
+        let attachmentCount = target.file.attachments.count
+        let hasRecurringAttachments = target.file.attachments.contains(where: { $0.scope == "series" || $0.scope == "following" })
+        let deletionImpact: String
+        if hasRecurringAttachments {
+            deletionImpact = "Deleting the File removes it from all associated Tasks and Events, including recurring Occurrences."
+        } else if attachmentCount > 1 {
+            deletionImpact = "Deleting the File also removes its Attachments from \(attachmentCount) items."
+        } else {
+            deletionImpact = "Deleting the File removes it from your Files section."
+        }
+
+        if attachmentHasRecurringSeries(target.attachment) {
+            return "Choose to remove the Attachment from “\(title)” only, from this and following Occurrences, or from the whole series. Removing the Attachment keeps the File in your Files section. \(deletionImpact)"
+        }
+        if hasRecurringAttachments {
+            return "Remove this Attachment from “\(title)” only, or delete the File from all associated Tasks and Events, including recurring Occurrences."
+        }
+        if attachmentCount > 1 {
+            return "Remove this Attachment from “\(title)” only, or delete the File and its Attachments from \(attachmentCount) items."
+        }
+        return "Remove this Attachment from “\(title)” only, or delete the File."
     }
 
     @ViewBuilder
