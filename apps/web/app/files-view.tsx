@@ -295,13 +295,18 @@ export default function FilesView({
                 </>}
               </>;
             })()}
-            {dialog.file.attachments.length > 0 && <p className="file-delete-warning">Deleting this File removes its {dialog.file.attachments.length} {dialog.file.attachments.length === 1 ? "Attachment" : "Attachments"} from all associated Tasks and Events.</p>}
+            {dialog.file.attachments.some((attachment) => attachment.scope !== "occurrence")
+              ? <p className="file-delete-warning">Deleting this File removes it from all associated Tasks and Events, including recurring Occurrences.</p>
+              : dialog.file.attachments.length > 0 && <p className="file-delete-warning">Deleting this File removes its {dialog.file.attachments.length} {dialog.file.attachments.length === 1 ? "Attachment" : "Attachments"} from all associated Tasks and Events.</p>}
             <div className="files-dialog-actions"><button className="button button-secondary" type="button" disabled={busy} onClick={() => setDialog(null)}>Cancel</button><button className="button button-secondary" type="button" disabled={busy} onClick={() => void removeAttachment(dialog.file, dialog.attachment)}>Remove Attachment</button><button className="button button-danger" type="button" disabled={busy} onClick={() => void deleteFile(dialog.file)}>{busy ? "Deleting…" : "Delete File"}</button></div>
           </> : <>
             <p className="eyebrow">FILES SECTION</p><h2 id="files-dialog-title">Delete this File?</h2>
             <p><strong>{dialog.file.name}</strong> will be deleted from your Files section.</p>
-            {dialog.file.attachments.length > 1 && <p className="file-delete-warning">This File is attached to {dialog.file.attachments.length} Tasks or Events. Deleting it removes all of those Attachments.</p>}
-            {dialog.file.attachments.length === 1 && <p>This also removes its Attachment from “{dialog.file.attachments[0].itemTitle}”.</p>}
+            {dialog.file.attachments.some((attachment) => attachment.scope !== "occurrence")
+              ? <p className="file-delete-warning">Deleting this File removes it from all associated Tasks and Events, including recurring Occurrences.</p>
+              : dialog.file.attachments.length > 1
+                ? <p className="file-delete-warning">This File is attached to {dialog.file.attachments.length} Tasks or Events. Deleting it removes all of those Attachments.</p>
+                : dialog.file.attachments.length === 1 && <p>This also removes its Attachment from “{dialog.file.attachments[0].itemTitle}”.</p>}
             <div className="files-dialog-actions"><button className="button button-secondary" type="button" disabled={busy} onClick={() => setDialog(null)}>Cancel</button><button className="button button-danger" type="button" disabled={busy} onClick={() => void deleteFile(dialog.file)}>{busy ? "Deleting…" : "Delete File"}</button></div>
           </>}
           {error && <p className="files-dialog-error" role="alert">{error}</p>}

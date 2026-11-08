@@ -153,6 +153,7 @@ function occurrenceDates(startValue: string, rule: RecurrenceRule, leadDays = 0,
     }
     while (cursor <= maxDate && dates.length < (rule.end.type === "count" ? rule.end.count : 10_000)) {
       cursor.setUTCDate(cursor.getUTCDate() + 1);
+      if (cursor > maxDate) break;
       const weeks = Math.floor((cursor.getTime() - start.getTime()) / 604_800_000);
       if (weeks % rule.interval === 0 && weekdays.includes(cursor.getUTCDay()) && cursor > start) dates.push(formatDate(cursor));
     }
