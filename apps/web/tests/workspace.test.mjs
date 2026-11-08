@@ -3554,6 +3554,59 @@ test("a stale Google sync cannot overwrite a newer edited recurring Occurrence",
   }
 });
 
+test("recurrence intervals and inclusive end dates apply to Tasks and Events", async () => {
+  const owner = await account();
+  const cases = [
+    { start: "2026-11-02", rule: { interval: 2, unit: "days", end: { type: "count", count: 3 } }, dates: ["2026-11-02", "2026-11-04", "2026-11-06"] },
+    // The next selected Monday is exactly one day after the inclusive end.
+    { start: "2026-11-02", rule: { interval: 2, unit: "weeks", weekdays: [1, 3], end: { type: "date", date: "2026-11-15" } }, dates: ["2026-11-02", "2026-11-04"] },
+    { start: "2026-11-02", rule: { interval: 2, unit: "weeks", weekdays: [1, 3], end: { type: "date", date: "2026-11-16" } }, dates: ["2026-11-02", "2026-11-04", "2026-11-16"] },
+    { start: "2026-01-31", rule: { interval: 2, unit: "months", end: { type: "count", count: 3 } }, dates: ["2026-01-31", "2026-03-31", "2026-05-31"] },
+    { start: "2022-02-28", rule: { interval: 2, unit: "years", end: { type: "count", count: 3 } }, dates: ["2022-02-28", "2024-02-28", "2026-02-28"] },
+  ];
+  for (const kind of ["task", "event"]) {
+    for (const { start, rule, dates } of cases) {
+      const response = await request("/api/items", { token: owner.token, method: "POST", body: {
+        kind, title: `${kind} every ${rule.interval} ${rule.unit}`, scheduledDate: start, recurrence: rule, reminders: [],
+      } });
+      assert.equal(response.status, 201);
+      const root = (await response.json()).item;
+      const items = (await (await request("/api/items", { token: owner.token })).json()).items
+        .filter(({ seriesId }) => seriesId === root.id);
+      assert.deepEqual(items.map(({ scheduledDate }) => scheduledDate).sort(), dates, `${kind}: ${JSON.stringify(rule)}`);
+      assert.equal(new Set(items.map(({ id }) => id)).size, dates.length);
+    }
+  }
+});
+
+test("late Task completion keeps overdue and upcoming Occurrences on their original schedule", async () => {
+  const previousClock = new Date(testClock);
+  try {
+    await setTestClock("2026-11-10T12:00:00Z");
+    const owner = await account();
+    const response = await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "task", title: "Independent daily Task", scheduledDate: "2026-11-02",
+      recurrence: { interval: 2, unit: "days", end: { type: "count", count: 6 } }, reminders: [],
+    } });
+    assert.equal(response.status, 201);
+    const root = (await response.json()).item;
+    const readSeries = async () => (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ seriesId }) => seriesId === root.id).sort((a, b) => a.occurrenceDate.localeCompare(b.occurrenceDate));
+    const before = await readSeries();
+    assert.deepEqual(before.map(({ scheduledDate }) => scheduledDate), ["2026-11-02", "2026-11-04", "2026-11-06", "2026-11-08", "2026-11-10", "2026-11-12"]);
+    assert.ok(before.every(({ completed }) => !completed));
+    const completed = await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: { completed: true } });
+    assert.equal(completed.status, 200);
+    await advanceTestClock(86_400_000);
+    const after = await readSeries();
+    assert.deepEqual(after.map(({ id, scheduledDate, occurrenceDate }) => ({ id, scheduledDate, occurrenceDate })),
+      before.map(({ id, scheduledDate, occurrenceDate }) => ({ id, scheduledDate, occurrenceDate })));
+    assert.deepEqual(after.map(({ completed }) => completed), [true, false, false, false, false, false]);
+  } finally {
+    await setTestClock(previousClock);
+  }
+});
+
 test("recurring items create independent Occurrences and honor occurrence and series edit scopes", async () => {
   const owner = await account();
   const created = await request("/api/items", { token: owner.token, method: "POST", body: {
