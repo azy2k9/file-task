@@ -1935,6 +1935,66 @@ test("uploaded Files transfer through the fake object store and open from anothe
   assert.equal(storageObjects.size, 0);
 });
 
+test("same-name uploads remain independent Files with their own Attachments across clients", async () => {
+  const owner = await account();
+  const task = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "task", title: "Renew the policy",
+  } })).json()).item;
+  const event = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "Policy appointment",
+  } })).json()).item;
+
+  const linked = (await (await request("/api/files", { token: owner.token, method: "POST", body: {
+    name: "Policy details", url: "https://example.com/policy",
+  } })).json()).file;
+  const upload = async (content) => {
+    const bytes = Buffer.from(content);
+    const target = await request("/api/files/uploads", { token: owner.token, method: "POST", body: {
+      name: "policy.pdf", contentType: "application/pdf", sizeBytes: bytes.length,
+    } });
+    assert.equal(target.status, 201);
+    const { uploadId, uploadUrl } = await target.json();
+    assert.equal((await fetch(uploadUrl, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: bytes })).status, 200);
+    const completed = await request(`/api/files/${uploadId}/complete`, { token: owner.token, method: "POST" });
+    assert.equal(completed.status, 200);
+    return { file: (await completed.json()).file, bytes };
+  };
+
+  const older = await upload("original policy contents");
+  for (const item of [task, event]) {
+    assert.equal((await request(`/api/files/${older.file.id}/attachments`, { token: owner.token, method: "POST", body: { itemId: item.id } })).status, 201);
+  }
+  const newer = await upload("revised policy contents");
+  assert.notEqual(older.file.id, newer.file.id, "a later upload with the same name gets a new File identity");
+
+  const secondClient = await (await request("/api/auth/login", { method: "POST", body: {
+    email: owner.user.email, password: "correct-horse-battery",
+  } })).json();
+  const files = (await (await request("/api/files", { token: secondClient.token })).json()).files;
+  assert.deepEqual(new Set(files.map(({ id }) => id)), new Set([linked.id, older.file.id, newer.file.id]));
+  assert.deepEqual(files.find(({ id }) => id === older.file.id).attachments.map(({ itemId }) => itemId).sort(), [task.id, event.id].sort());
+  assert.deepEqual(files.find(({ id }) => id === newer.file.id).attachments, [], "the newer upload does not replace or inherit the older Attachments");
+
+  const opened = await request(`/api/files/${older.file.id}/open`, { token: secondClient.token });
+  const download = await fetch((await opened.json()).url);
+  assert.equal(download.status, 200);
+  assert.deepEqual(Buffer.from(await download.arrayBuffer()), older.bytes, "the existing File still opens with its original contents");
+  assert.equal((await request(`/api/files/${linked.id}/open`, { token: secondClient.token })).status, 200);
+
+  assert.equal((await request(`/api/files/${older.file.id}/attachments/${task.id}`, { token: owner.token, method: "DELETE" })).status, 204);
+  assert.deepEqual((await (await request(`/api/items/${task.id}`, { token: owner.token })).json()).item.files, []);
+  assert.deepEqual((await (await request(`/api/items/${event.id}`, { token: owner.token })).json()).item.files.map(({ id }) => id), [older.file.id]);
+  assert.ok((await (await request("/api/files", { token: owner.token })).json()).files.some(({ id }) => id === older.file.id),
+    "unlinking one Attachment leaves the File in the Files section");
+
+  assert.equal((await request(`/api/files/${older.file.id}`, { token: owner.token, method: "DELETE" })).status, 204);
+  assert.deepEqual((await (await request(`/api/items/${event.id}`, { token: owner.token })).json()).item.files, [],
+    "deleting the File removes its remaining Attachment");
+  assert.equal(storageObjects.size, 1, "only the newer, independent upload remains in object storage");
+  assert.equal((await request(`/api/files/${newer.file.id}`, { token: owner.token, method: "DELETE" })).status, 204);
+  assert.equal(storageObjects.size, 0);
+});
+
 test("Google OAuth requires the initiating browser transaction, session, and one-time state", async () => {
   const attacker = await account();
   const victim = await account();
@@ -4223,6 +4283,71 @@ test("the browser editor keeps a first Occurrence edit local to the series root"
     assert.equal(followingAfterLocalEdit.recurrence.unit, "weeks");
     assert.equal(followingAfterLocalEdit.reminders[0].amount, 1);
   } finally { await context.close(); await browser.close(); }
+});
+
+test("Files warn before deleting series and following Attachments", async () => {
+  const owner = await account();
+  const series = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "Weekly review", scheduledDate: "2026-10-20",
+    recurrence: { interval: 1, unit: "weeks", weekdays: [2], end: { type: "count", count: 4 } },
+  } })).json()).item;
+  const occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+    .filter(({ seriesId }) => seriesId === series.id)
+    .sort((left, right) => left.occurrenceDate.localeCompare(right.occurrenceDate));
+  assert.equal(occurrences.length, 4);
+
+  const seriesFile = (await (await request("/api/files", { token: owner.token, method: "POST", body: {
+    name: "Series agenda", url: "https://example.com/series-agenda",
+  } })).json()).file;
+  assert.equal((await request(`/api/files/${seriesFile.id}/attachments`, { token: owner.token, method: "POST", body: {
+    itemId: series.id, scope: "series",
+  } })).status, 201);
+
+  const followingFile = (await (await request("/api/files", { token: owner.token, method: "POST", body: {
+    name: "Later agendas", url: "https://example.com/later-agendas",
+  } })).json()).file;
+  assert.equal((await request(`/api/files/${followingFile.id}/attachments`, { token: owner.token, method: "POST", body: {
+    itemId: occurrences[1].id, scope: "following",
+  } })).status, 201);
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const page = await context.newPage();
+  try {
+    await page.goto(base);
+    await page.getByLabel("Email", { exact: true }).fill(owner.user.email);
+    await page.getByLabel("Password", { exact: true }).fill("correct-horse-battery");
+    await page.locator("form").getByRole("button", { name: "Sign in", exact: true }).click();
+    await page.getByRole("button", { name: "Files", exact: true }).click();
+
+    const recurringDeleteWarning = "Deleting this File removes it from all associated Tasks and Events, including recurring Occurrences.";
+    await page.getByRole("button", { name: `Delete File ${seriesFile.name}`, exact: true }).click();
+    const seriesDialog = page.getByRole("dialog");
+    await expect(seriesDialog.getByText(recurringDeleteWarning, { exact: true })).toBeVisible();
+    await seriesDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    assert.ok((await (await request("/api/files", { token: owner.token })).json()).files.some(({ id }) => id === seriesFile.id),
+      "cancelling leaves the File and its Attachments in place");
+
+    await page.getByRole("button", { name: `Delete File ${seriesFile.name}`, exact: true }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Delete File", exact: true }).click();
+    await expect(page.locator(`#file-${seriesFile.id}`)).toHaveCount(0);
+    let current = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ seriesId }) => seriesId === series.id);
+    assert.ok(current.every(({ files }) => files.every(({ id }) => id !== seriesFile.id)), "deleting a series File removes it from every Occurrence");
+    assert.deepEqual(current.map(({ files }) => files.length), [0, 1, 1, 1], "the independent following File stays attached");
+
+    await page.getByRole("button", { name: `Remove Attachment from ${occurrences[1].title}`, exact: true }).click();
+    const followingDialog = page.getByRole("dialog");
+    await expect(followingDialog.getByText(recurringDeleteWarning, { exact: true })).toBeVisible();
+    await followingDialog.getByRole("button", { name: "Delete File", exact: true }).click();
+    await expect(page.locator(`#file-${followingFile.id}`)).toHaveCount(0);
+    current = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ seriesId }) => seriesId === series.id);
+    assert.deepEqual(current.map(({ files }) => files.length), [0, 0, 0, 0], "deleting a following File removes it from all affected Occurrences");
+  } finally {
+    await context.close();
+    await browser.close();
+  }
 });
 
 test("a person can manage Tasks and Events through the browser and see another client's changes", async () => {
