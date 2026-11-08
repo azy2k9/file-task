@@ -186,8 +186,6 @@ class RecurringAgendaUiTest {
         assertEquals(2, afterSeries.count { it.title == "Android UI Following" })
         afterSeries.filter { it.title.startsWith("Android UI ") }.forEach { assertAgendaItem(it.id, it.title) }
 
-        clearEventDate(undatedEvent, api, token)
-        deleteEvent(eventToDelete, api, token)
     }
 
     private fun items(api: ApiClient, token: String): List<WorkspaceItem> = runBlocking { api.listItems(token) }

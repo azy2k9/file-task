@@ -39,7 +39,7 @@
 		B1000000000000000000000C /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B1000000000000000000000D /* FileTasks.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FileTasks.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B1000000000000000000000E /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
-		B1000000000000000000000F /* FileTasks-Personal.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "FileTasks-Personal.entitlements"; sourceTree = "<group>"; };
+		B10000000000000000000010 /* FileTasks-Personal.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "FileTasks-Personal.entitlements"; sourceTree = "<group>"; };
 		B20000000000000000000001 /* FileTasksUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FileTasksUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		B20000000000000000000002 /* FileTasksUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTasksUITests.swift; sourceTree = "<group>"; };
 		B20000000000000000000003 /* XCTest.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = XCTest.framework; path = Platforms/iPhoneSimulator.platform/Developer/Library/Frameworks/XCTest.framework; sourceTree = DEVELOPER_DIR; };
@@ -68,7 +68,7 @@
 			children = (
 				B10000000000000000000001 /* FileTasksApp.swift */,
 				B1000000000000000000000C /* Info.plist */,
-				B1000000000000000000000F /* FileTasks-Personal.entitlements */,
+				B10000000000000000000010 /* FileTasks-Personal.entitlements */,
 				D10000000000000000000004 /* Domain */,
 				D10000000000000000000005 /* Networking */,
 				D10000000000000000000006 /* Security */,
