@@ -7,6 +7,10 @@ final class AppModel: ObservableObject {
     @Published private(set) var user: AuthUser?
     @Published private(set) var items: [WorkspaceItem] = []
     @Published private(set) var files: [WorkspaceFile] = []
+    @Published private(set) var notifications: [ReminderNotification] = []
+    @Published private(set) var isLoadingNotifications = false
+    @Published private(set) var notificationsError: String?
+    private var notificationsRequestID = 0
     @Published private(set) var reminderSettings: ReminderSettings = .empty
     @Published private(set) var hasLoadedReminderSettingsForCurrentSession = false
     @Published private(set) var isLoadingReminderSettings = false
@@ -595,6 +599,42 @@ final class AppModel: ObservableObject {
         await refreshCalendarSyncDelivery(using: context)
     }
 
+    func refreshNotifications() async {
+        guard let context = try? currentContext() else { return }
+        notificationsRequestID += 1
+        let requestID = notificationsRequestID
+        isLoadingNotifications = true
+        notificationsError = nil
+        defer {
+            if isCurrent(context), notificationsRequestID == requestID { isLoadingNotifications = false }
+        }
+        do {
+            let result = try await APIClient(baseURL: context.baseURL).notifications(token: context.token)
+            guard isCurrent(context), notificationsRequestID == requestID else { return }
+            notifications = result
+        } catch {
+            guard isCurrent(context), notificationsRequestID == requestID else { return }
+            notificationsError = error.localizedDescription
+            handle(error, for: context)
+        }
+    }
+
+    func readNotification(_ notification: ReminderNotification) async throws {
+        let context = try currentContext()
+        do {
+            try await APIClient(baseURL: context.baseURL).markNotificationRead(id: notification.id, token: context.token)
+            guard isCurrent(context) else { return }
+            notificationsRequestID += 1
+            isLoadingNotifications = false
+            notifications.removeAll { $0.id == notification.id }
+        } catch {
+            guard isCurrent(context) else { return }
+            notificationsError = error.localizedDescription
+            handle(error, for: context)
+            throw error
+        }
+    }
+
     func refreshCalendarSyncDelivery() async {
         guard user != nil else { return }
         do {
@@ -719,6 +759,10 @@ final class AppModel: ObservableObject {
         self.user = user
         items = []
         files = []
+        notifications = []
+        notificationsError = nil
+        isLoadingNotifications = false
+        notificationsRequestID += 1
         reminderSettings = .empty
         hasLoadedReminderSettingsForCurrentSession = false
         isLoadingReminderSettings = false
@@ -787,6 +831,10 @@ final class AppModel: ObservableObject {
         user = nil
         items = []
         files = []
+        notifications = []
+        notificationsError = nil
+        isLoadingNotifications = false
+        notificationsRequestID += 1
         reminderSettings = .empty
         hasLoadedReminderSettingsForCurrentSession = false
         isLoadingReminderSettings = false

@@ -51,6 +51,7 @@ data class CalendarStatus(
 data class CalendarSyncResult(val synced: List<String>, val eventCount: Int, val syncLimitations: List<CalendarSyncLimitation>)
 
 data class ReminderRule(val delivery: String, val amount: Int, val unit: String, val time: String)
+data class ReminderNotification(val id: String, val itemId: String, val title: String, val scheduledAt: String)
 data class RecurrenceEnd(val type: String, val date: String? = null, val count: Int? = null)
 data class RecurrenceRule(val interval: Int, val unit: String, val weekdays: List<Int>?, val end: RecurrenceEnd)
 data class ReminderSettings(
@@ -145,6 +146,26 @@ class ApiClient(rawBaseUrl: String) {
     suspend fun listFiles(token: String): List<WorkspaceFile> = withContext(Dispatchers.IO) {
         val files = request("GET", "/api/files", token = token).getJSONArray("files")
         buildList(files.length()) { for (index in 0 until files.length()) add(parseFile(files.getJSONObject(index))) }
+    }
+
+    suspend fun listNotifications(token: String): List<ReminderNotification> = withContext(Dispatchers.IO) {
+        val notifications = request("GET", "/api/notifications", token = token).getJSONArray("notifications")
+        buildList(notifications.length()) {
+            for (index in 0 until notifications.length()) {
+                val notification = notifications.getJSONObject(index)
+                add(ReminderNotification(
+                    id = notification.optString("id"),
+                    itemId = notification.optString("itemId"),
+                    title = notification.optString("title"),
+                    scheduledAt = notification.optString("scheduledAt"),
+                ))
+            }
+        }
+    }
+
+    suspend fun markNotificationRead(token: String, id: String) = withContext(Dispatchers.IO) {
+        request("PATCH", "/api/notifications/${pathSegment(id)}", JSONObject(), token)
+        Unit
     }
 
     suspend fun reminderSettings(token: String): ReminderSettings = withContext(Dispatchers.IO) {
