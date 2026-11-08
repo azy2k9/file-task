@@ -1323,6 +1323,47 @@ test("a person can create a Task on one client and view it on another after sign
   assert.deepEqual((await listed.json()).items, [item]);
 });
 
+test("Task and Event changes stay shared across independent browser and native sessions", async () => {
+  const owner = await account();
+  const login = await request("/api/auth/login", { method: "POST", body: {
+    email: owner.user.email, password: "correct-horse-battery",
+  } });
+  assert.equal(login.status, 200);
+  const native = await login.json();
+  assert.notEqual(native.token, owner.token);
+  const web = { cookie: owner.cookie, headers: { Origin: base } };
+
+  for (const kind of ["task", "event"]) {
+    const created = await request("/api/items", { ...web, method: "POST", body: {
+      kind, title: `Shared ${kind}`, details: "Created in the browser",
+      scheduledDate: "2026-12-01", scheduledTime: "16:00",
+    } });
+    assert.equal(created.status, 201);
+    const { item } = await created.json();
+    const read = await request(`/api/items/${item.id}`, { token: native.token });
+    assert.equal(read.status, 200);
+    assert.deepEqual((await read.json()).item, item);
+
+    const edited = await request(`/api/items/${item.id}`, { token: native.token, method: "PATCH", body: {
+      title: `Edited ${kind}`, details: "Updated by another client",
+      scheduledDate: null, scheduledTime: null,
+      ...(kind === "task" ? { completed: true } : {}),
+    } });
+    assert.equal(edited.status, 200);
+    const updated = (await edited.json()).item;
+    assert.equal(updated.completed, kind === "task" ? true : null);
+    assert.equal(updated.scheduledDate, null);
+    assert.equal(updated.scheduledTime, null);
+    const listed = await request("/api/items", web);
+    assert.equal(listed.status, 200);
+    assert.deepEqual((await listed.json()).items, [updated]);
+
+    assert.equal((await request(`/api/items/${item.id}`, { ...web, method: "DELETE" })).status, 204);
+    assert.equal((await request(`/api/items/${item.id}`, { token: native.token })).status, 404);
+    assert.deepEqual((await (await request("/api/items", { token: native.token })).json()).items, []);
+  }
+});
+
 test("a person can edit, complete, reopen and delete a Task using their web session", async () => {
   const owner = await account();
   const options = { cookie: owner.cookie, headers: { Origin: base } };
