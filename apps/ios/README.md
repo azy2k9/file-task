@@ -104,3 +104,7 @@ Failed saves leave the editor fields in place so the person can retry. A failed 
 - The API URL is an origin without a path. Changing it clears the saved sign-in token and returns to the sign-in screen.
 - HTTP is intended only for local development. Do not use it with a production account or token.
 - Date and time values are wall-clock values in the device’s current calendar and time zone, matching the API contract; the client does not convert them to UTC.
+
+## In-app Notifications
+
+The workspace Notifications section lists due Notification Reminders without requiring push or email delivery. Refresh the inbox to load new Notifications, open the associated Task or Event, or mark a Notification read. Push and email remain optional in Reminder settings; Email is available in reminder rows only when email delivery is enabled.

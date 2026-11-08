@@ -60,6 +60,18 @@ struct APIClient {
         return response.files
     }
 
+    func notifications(token: String) async throws -> [ReminderNotification] {
+        let response: NotificationsResponse = try decode(
+            NotificationsResponse.self,
+            from: try await perform(path: ["api", "notifications"], method: "GET", token: token)
+        )
+        return response.notifications
+    }
+
+    func markNotificationRead(id: String, token: String) async throws {
+        _ = try await perform(path: ["api", "notifications", id], method: "PATCH", token: token)
+    }
+
     func reminderSettings(token: String) async throws -> ReminderSettings {
         let response: ReminderSettingsResponse = try decode(
             ReminderSettingsResponse.self,
@@ -384,3 +396,5 @@ enum APIClientError: LocalizedError, Equatable {
         }
     }
 }
+
+private struct NotificationsResponse: Decodable { let notifications: [ReminderNotification] }

@@ -129,7 +129,7 @@ class ApiClientAcceptanceTest {
         api.deleteItem(token, undatedEvent)
         assertFalse(api.listItems(token).any { it.id == rememberedEvent.id })
 
-        api.createItem(token, ItemFields(
+        val dueTask = api.createItem(token, ItemFields(
             kind = ItemKind.Task,
             title = "Native due push $namespace",
             details = "Delivery boundary check",
@@ -144,6 +144,11 @@ class ApiClientAcceptanceTest {
         val workerBody = worker.inputStream.bufferedReader().use { it.readText() }
         assertTrue("The Android workflow should deliver a due Reminder: $workerBody", workerBody.contains("\"sent\":1") || workerBody.contains("\"sent\":2"))
         worker.disconnect()
+
+        val notification = api.listNotifications(token).first { it.itemId == dueTask.id }
+        assertEquals(dueTask.title, notification.title)
+        api.markNotificationRead(token, notification.id)
+        assertFalse(api.listNotifications(token).any { it.id == notification.id })
 
         api.revokePushDevice(token, device)
         api.logout(token)

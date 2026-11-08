@@ -115,6 +115,13 @@ final class FileTasksAcceptanceTests: XCTestCase {
         let workerResult = try JSONDecoder().decode(ReminderWorkerResponse.self, from: workerData)
         XCTAssertGreaterThanOrEqual(workerResult.sent, 1)
 
+        let notifications = try await client.notifications(token: token)
+        let dueNotification = try XCTUnwrap(notifications.first { $0.itemId == dueTask.id })
+        XCTAssertEqual(dueNotification.title, dueTask.title)
+        try await client.markNotificationRead(id: dueNotification.id, token: token)
+        let unread = try await client.notifications(token: token)
+        XCTAssertFalse(unread.contains { $0.id == dueNotification.id })
+
         try await client.revokePushDevice(id: device.id, token: token)
         try await client.logout(token: token)
     }

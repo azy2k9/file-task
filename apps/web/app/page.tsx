@@ -566,7 +566,7 @@ function ReminderEditor({ reminders, emailEnabled, emailAvailable, disabled, onC
   return <div className="reminder-editor">
     {reminders.map((reminder, index) => <div className="reminder-row" key={index}>
       <select aria-label={`Reminder ${index + 1} delivery`} value={reminder.delivery} disabled={disabled} onChange={(event) => update(index, { delivery: event.target.value as ReminderRule["delivery"] })}>
-        <option value="notification">Notification</option>{emailEnabled && emailAvailable && <option value="email">Email</option>}
+        <option value="notification">Notification</option>{emailEnabled && emailAvailable ? <option value="email">Email</option> : reminder.delivery === "email" && <option value="email" disabled>Email (delivery disabled)</option>}
       </select>
       <label><span className="sr-only">Offset amount</span><input aria-label={`Reminder ${index + 1} offset`} type="number" min="0" value={reminder.amount} disabled={disabled} onChange={(event) => update(index, { amount: Math.max(0, Number(event.target.value) || 0) })} /></label>
       <select aria-label={`Reminder ${index + 1} offset unit`} value={reminder.unit} disabled={disabled} onChange={(event) => update(index, { unit: event.target.value as ReminderRule["unit"] })}>{["minutes", "hours", "days", "weeks", "months"].map((unit) => <option key={unit} value={unit}>{unit}</option>)}</select>
@@ -677,10 +677,12 @@ function ReminderSettingsDialog({ initial, accountId, onClose, onSave }: {
     <form onSubmit={save}>
       <div className="dialog-topline"><div><p className="eyebrow">YOUR ACCOUNT</p><h2 id="settings-dialog-title">Reminder settings</h2></div><button className="dialog-close icon-button" type="button" disabled={busy} aria-label="Close settings" onClick={onClose}>×</button></div>
       {error && <p className="form-error" role="alert">{error}</p>}
+      <p>In-app Notifications are always available. Push and email delivery are optional.</p>
       <div className="setting-toggles">
         <label><input type="checkbox" checked={settings.pushEnabled} disabled={busy || !browserPushAvailable} onChange={(event) => setSettings((current) => ({ ...current, pushEnabled: event.target.checked }))} /> Optional push delivery{!browserPushAvailable && " (not configured for this browser)"}</label>
         <label><input type="checkbox" checked={settings.emailEnabled} disabled={busy || !settings.emailAvailable} onChange={(event) => setSettings((current) => ({ ...current, emailEnabled: event.target.checked }))} /> Email delivery{!settings.emailAvailable && " (not configured)"}</label>
       </div>
+      {!settings.emailEnabled && [...settings.taskReminders, ...settings.eventReminders].some((rule) => rule.delivery === "email") && <p role="status">Remove Email Reminders from Task and Event defaults before saving with email delivery disabled.</p>}
       <div className="auth-switch setting-tabs" role="group" aria-label="Reminder default type"><button type="button" className={kind === "task" ? "auth-switch-active" : ""} aria-pressed={kind === "task"} onClick={() => setKind("task")}>Task defaults</button><button type="button" className={kind === "event" ? "auth-switch-active" : ""} aria-pressed={kind === "event"} onClick={() => setKind("event")}>Event defaults</button></div>
       <ReminderEditor reminders={reminders} emailEnabled={settings.emailEnabled} emailAvailable={settings.emailAvailable} disabled={busy} onChange={changeReminders} />
       <fieldset className="apply-defaults"><legend>When these defaults change</legend><label><input type="radio" name="apply-existing" checked={!applyToExisting} disabled={busy} onChange={() => setApplyToExisting(false)} /> Only new items</label><label><input type="radio" name="apply-existing" checked={applyToExisting} disabled={busy} onChange={() => setApplyToExisting(true)} /> Apply to existing items still using the old defaults</label></fieldset>
@@ -831,6 +833,8 @@ export default function Page() {
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [clientReady, setClientReady] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [reminderSettingsVersion, setReminderSettingsVersion] = useState<number | null>(null);
+  const [reminderSettingsError, setReminderSettingsError] = useState<string | null>(null);
   const [reminderSettings, setReminderSettings] = useState<ReminderSettings>({ taskReminders: [], eventReminders: [], pushEnabled: false, emailEnabled: false, pushAvailable: false, emailAvailable: false });
   const [notifications, setNotifications] = useState<InAppNotification[]>([]);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
@@ -942,13 +946,17 @@ export default function Page() {
   }
 
   async function loadReminderSettings(version: number) {
+    setReminderSettingsError(null);
     try {
       const response = await fetch("/api/settings/reminders", { credentials: "same-origin", cache: "no-store" });
-      if (response.ok && identityVersion.current === version) {
-        const result = await response.json() as { settings: ReminderSettings };
-        setReminderSettings(result.settings);
-      }
-    } catch { /* Account settings can be opened and retried later. */ }
+      if (!response.ok) throw new Error(await errorFromResponse(response, "Could not load Reminder defaults."));
+      const result = await response.json() as { settings: ReminderSettings };
+      if (identityVersion.current !== version) return;
+      setReminderSettings(result.settings);
+      setReminderSettingsVersion(version);
+    } catch (failure) {
+      if (identityVersion.current === version) setReminderSettingsError(failure instanceof Error ? failure.message : "Could not load Reminder defaults.");
+    }
   }
 
   async function loadNotifications(version: number) {
@@ -1149,6 +1157,7 @@ export default function Page() {
   }
 
   function openEditor(kind: ItemKind, item: WorkspaceItem | null = null) {
+    if (!item && reminderSettingsVersion !== identityVersion.current) return;
     rememberFocus();
     setEditorError(null);
     setDraft(item ? {
@@ -1437,7 +1446,7 @@ export default function Page() {
             <span className="account-label">SIGNED IN AS</span>
             <span className="account-email" title={account?.email}>{account?.email}</span>
           </div>
-          <button className="settings-button" type="button" disabled={isMutating} onClick={() => setSettingsOpen(true)} aria-label="Settings" title="Settings">⚙</button>
+          <button className="settings-button" type="button" disabled={isMutating || reminderSettingsVersion !== identityVersion.current} onClick={() => setSettingsOpen(true)} aria-label="Settings" title="Settings">⚙</button>
           <button
             className="signout-button"
             type="button"
@@ -1471,17 +1480,22 @@ export default function Page() {
                 className="button button-primary"
                 type="button"
                 ref={newTaskButtonRef}
-                disabled={isMutating}
+                disabled={isMutating || reminderSettingsVersion !== identityVersion.current}
                 aria-label="New Task"
                 onClick={() => openEditor("task")}
               >
                 <span className="plus-icon" aria-hidden="true">+</span> New Task
               </button>
-              <button className="button button-secondary" type="button" aria-label="New Event" disabled={isMutating} onClick={() => openEditor("event")}>
+              <button className="button button-secondary" type="button" aria-label="New Event" disabled={isMutating || reminderSettingsVersion !== identityVersion.current} onClick={() => openEditor("event")}>
                 <span className="plus-icon" aria-hidden="true">+</span> New Event
               </button>
             </div>}
           </header>
+
+          {reminderSettingsVersion !== identityVersion.current && <div className="notice" role="status">
+            <span>{reminderSettingsError ?? "Loading Reminder defaults…"}</span>
+            {reminderSettingsError && <button type="button" onClick={() => void loadReminderSettings(identityVersion.current)}>Retry Reminder defaults</button>}
+          </div>}
 
           {calendarDeliveryNotice && <div className="calendar-delivery-notice" role="status" aria-live="polite">{calendarDeliveryNotice}</div>}
 

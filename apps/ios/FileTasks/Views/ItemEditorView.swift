@@ -313,18 +313,26 @@ private struct ReminderListEditor: View {
     var body: some View {
         ForEach(Array(reminders.enumerated()), id: \.offset) { index, _ in
             VStack(alignment: .leading, spacing: 8) {
-                Picker("Delivery", selection: Binding(
-                    get: { reminders[index].delivery },
-                    set: { delivery in
-                        reminders[index].delivery = delivery
+                if !emailAvailable && reminders[index].delivery == .email {
+                    Text("Email (delivery disabled)")
+                    Button("Use Notification") {
+                        reminders[index].delivery = .notification
                         onUserEdit()
+                    }.buttonStyle(.borderless)
+                } else {
+                    Picker("Delivery", selection: Binding(
+                        get: { reminders[index].delivery },
+                        set: { delivery in
+                            reminders[index].delivery = delivery
+                            onUserEdit()
+                        }
+                    )) {
+                        Text("Notification").tag(ReminderDelivery.notification)
+                        if emailAvailable { Text("Email").tag(ReminderDelivery.email) }
                     }
-                )) {
-                    Text("Notification").tag(ReminderDelivery.notification)
-                    if emailAvailable || reminders[index].delivery == .email { Text("Email").tag(ReminderDelivery.email) }
+                    .accessibilityIdentifier("\(accessibilityIdentifierPrefix).delivery.\(index)")
+                    .accessibilityValue(reminders[index].delivery == .notification ? "Notification" : "Email")
                 }
-                .accessibilityIdentifier("\(accessibilityIdentifierPrefix).delivery.\(index)")
-                .accessibilityValue(reminders[index].delivery == .notification ? "Notification" : "Email")
                 HStack {
                     Stepper("\(reminders[index].amount)", value: Binding(
                         get: { reminders[index].amount },
@@ -386,6 +394,8 @@ struct ReminderSettingsView: View {
                     Section { Text(errorMessage).foregroundStyle(.red) }
                 }
                 Section("Delivery") {
+                    Text("In-app Notifications are always available. Push and email delivery are optional.")
+                        .font(.footnote).foregroundStyle(.secondary)
                     Toggle("Push delivery", isOn: $settings.pushEnabled)
                         .disabled(isSaving || !settings.pushAvailable)
                     if !settings.pushAvailable { Text("Push delivery is not configured on this server.").font(.footnote).foregroundStyle(.secondary) }
@@ -429,6 +439,9 @@ struct ReminderSettingsView: View {
                         accessibilityIdentifierPrefix: "reminderSettings.event",
                         onUserEdit: {}
                     )
+                }
+                if !settings.emailEnabled && (settings.taskReminders + settings.eventReminders).contains(where: { $0.delivery == .email }) {
+                    Section { Text("Remove Email Reminders from Task and Event defaults before saving with email delivery disabled.") }
                 }
                 Section("Existing items") {
                     Toggle("Apply defaults to items still using the old defaults", isOn: $applyToExisting)

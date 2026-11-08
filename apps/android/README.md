@@ -42,3 +42,7 @@ Install the Android SDK and platform tools, JDK 17, and the Playwright Chromium 
 - An item with no date is shown in the Undated section. A time can be saved only when a date is present.
 - Files section with external links, private R2 uploads, Attachments to multiple Tasks and Events, and separate Attachment/File deletion actions.
 - Changing the API URL clears the saved token and signs the client out, so a token is never silently sent to a different server.
+
+## In-app Notifications
+
+The workspace Notifications section lists due Notification Reminders without requiring push or email delivery. Refresh the inbox to load new Notifications, open the associated Task or Event, or mark a Notification read. Push and email remain optional in Reminder settings; Email is available in reminder rows only when email delivery is enabled.

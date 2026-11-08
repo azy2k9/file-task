@@ -35,11 +35,11 @@ export function itemReminderDefaults(userId: string, kind: "task" | "event") {
   return defaults.filter((rule) => rule.delivery !== "email" || settings.emailEnabled);
 }
 
-export function updateReminderSettings(userId: string, body: Record<string, unknown>) {
+function updateReminderSettingsInTransaction(userId: string, body: Record<string, unknown>) {
   const before = reminderSettings(userId);
   const allowed = ["taskReminders", "eventReminders", "pushEnabled", "emailEnabled", "applyToExisting"];
   if (Object.keys(body).some((key) => !allowed.includes(key))) throw new HttpError(400, "Unknown Reminder setting.");
-  const validate = (input: unknown, fallback: ReminderRule[]) => {
+  const validate = (input: unknown) => {
     if (!Array.isArray(input) || input.length > 20) throw new HttpError(400, "Add up to 20 Reminders.");
     return input.map((row) => {
       if (!row || typeof row !== "object") throw new HttpError(400, "Check the Reminder settings.");
@@ -54,8 +54,8 @@ export function updateReminderSettings(userId: string, body: Record<string, unkn
       return { delivery: rule.delivery as ReminderRule["delivery"], amount: Number(rule.amount), unit: rule.unit as ReminderRule["unit"], time: rule.time };
     });
   };
-  const taskReminders = body.taskReminders === undefined ? before.taskReminders : validate(body.taskReminders, before.taskReminders);
-  const eventReminders = body.eventReminders === undefined ? before.eventReminders : validate(body.eventReminders, before.eventReminders);
+  const taskReminders = body.taskReminders === undefined ? before.taskReminders : validate(body.taskReminders);
+  const eventReminders = body.eventReminders === undefined ? before.eventReminders : validate(body.eventReminders);
   const pushEnabled = body.pushEnabled === undefined ? before.pushEnabled : body.pushEnabled;
   const emailEnabled = body.emailEnabled === undefined ? before.emailEnabled : body.emailEnabled;
   if (typeof pushEnabled !== "boolean" || typeof emailEnabled !== "boolean") throw new HttpError(400, "Choose valid delivery settings.");
@@ -72,17 +72,31 @@ export function updateReminderSettings(userId: string, body: Record<string, unkn
     push_enabled=excluded.push_enabled,email_enabled=excluded.email_enabled`);
   write.run(userId, JSON.stringify(taskReminders), JSON.stringify(eventReminders), Number(pushEnabled), Number(emailEnabled));
   if (body.applyToExisting === true) {
-    const sync = db.prepare("UPDATE items SET reminders_json=? WHERE user_id=? AND kind=? AND uses_reminder_default=1");
-    const syncSeries = db.prepare(`UPDATE item_series_definitions SET reminders_json=? WHERE user_id=? AND series_root_id IN
-      (SELECT id FROM items WHERE user_id=? AND kind=? AND uses_reminder_default=1)`);
+    const sync = db.prepare(`UPDATE items SET reminders_json=? WHERE user_id=? AND kind=?
+      AND uses_reminder_default=1 AND reminders_json=?`);
+    const syncSeries = db.prepare(`UPDATE item_series_definitions SET reminders_json=? WHERE user_id=? AND reminders_json=? AND uses_reminder_default=1
+      AND series_root_id IN (SELECT id FROM items WHERE user_id=? AND kind=?)`);
     if (JSON.stringify(taskReminders) !== JSON.stringify(before.taskReminders)) {
-      sync.run(JSON.stringify(taskReminders), userId, "task");
-      syncSeries.run(JSON.stringify(taskReminders), userId, userId, "task");
+      sync.run(JSON.stringify(taskReminders), userId, "task", JSON.stringify(before.taskReminders));
+      syncSeries.run(JSON.stringify(taskReminders), userId, JSON.stringify(before.taskReminders), userId, "task");
     }
     if (JSON.stringify(eventReminders) !== JSON.stringify(before.eventReminders)) {
-      sync.run(JSON.stringify(eventReminders), userId, "event");
-      syncSeries.run(JSON.stringify(eventReminders), userId, userId, "event");
+      sync.run(JSON.stringify(eventReminders), userId, "event", JSON.stringify(before.eventReminders));
+      syncSeries.run(JSON.stringify(eventReminders), userId, JSON.stringify(before.eventReminders), userId, "event");
     }
   }
   return reminderSettings(userId);
+}
+
+export function updateReminderSettings(userId: string, body: Record<string, unknown>) {
+  const db = database();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const settings = updateReminderSettingsInTransaction(userId, body);
+    db.exec("COMMIT");
+    return settings;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 }

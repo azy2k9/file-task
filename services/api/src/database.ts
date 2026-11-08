@@ -325,11 +325,30 @@ export function database() {
     if (!itemColumns.has("occurrence_date")) db.exec("ALTER TABLE items ADD COLUMN occurrence_date TEXT");
     if (!itemColumns.has("uses_reminder_default")) db.exec("ALTER TABLE items ADD COLUMN uses_reminder_default INTEGER NOT NULL DEFAULT 1");
     if (!itemColumns.has("occurrence_recurrence_json")) db.exec("ALTER TABLE items ADD COLUMN occurrence_recurrence_json TEXT");
+    const seriesColumns = new Set(db.prepare("PRAGMA table_info(item_series_definitions)").all().map((column) => String(column.name)));
+    if (!seriesColumns.has("uses_reminder_default")) {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        // Another API process may have migrated while this one waited for the lock.
+        const migrated = db.prepare("PRAGMA table_info(item_series_definitions)").all()
+          .some((column) => column.name === "uses_reminder_default");
+        if (!migrated) db.exec(`ALTER TABLE item_series_definitions ADD COLUMN uses_reminder_default INTEGER NOT NULL DEFAULT 1;
+          UPDATE item_series_definitions AS d SET uses_reminder_default=COALESCE(
+            (SELECT i.uses_reminder_default FROM items i WHERE i.user_id=d.user_id AND i.id=d.series_root_id
+              AND i.reminders_json=d.reminders_json),
+            (SELECT MAX(i.uses_reminder_default) FROM items i WHERE i.user_id=d.user_id AND i.series_root_id=d.series_root_id
+              AND i.reminders_json=d.reminders_json),0)`);
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    }
     db.exec("CREATE INDEX IF NOT EXISTS items_series ON items(series_root_id, occurrence_date)");
     // The root row is also the first Occurrence. Capture its original generation
     // template before occurrence-local edits can change the root row.
-    db.exec(`INSERT OR IGNORE INTO item_series_definitions(user_id,series_root_id,scheduled_date,scheduled_time,title,details,recurrence_json,reminders_json)
-      SELECT user_id,id,scheduled_date,scheduled_time,title,details,recurrence_json,reminders_json FROM items
+    db.exec(`INSERT OR IGNORE INTO item_series_definitions(user_id,series_root_id,scheduled_date,scheduled_time,title,details,recurrence_json,reminders_json,uses_reminder_default)
+      SELECT user_id,id,scheduled_date,scheduled_time,title,details,recurrence_json,reminders_json,uses_reminder_default FROM items
       WHERE series_root_id=id AND recurrence_json IS NOT NULL AND scheduled_date IS NOT NULL`);
     const connectionColumns = new Set(db.prepare("PRAGMA table_info(calendar_connections)").all().map((column) => String(column.name)));
     if (!connectionColumns.has("expires_at")) db.exec("ALTER TABLE calendar_connections ADD COLUMN expires_at INTEGER");

@@ -317,3 +317,16 @@ enum AgendaDate {
         return formatter.string(from: date)
     }
 }
+
+struct ReminderNotification: Decodable, Identifiable, Equatable {
+    let id: String
+    let itemId: String
+    let title: String
+    let scheduledAt: String
+
+    var scheduledDate: Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.date(from: scheduledAt) ?? ISO8601DateFormatter().date(from: scheduledAt)
+    }
+}

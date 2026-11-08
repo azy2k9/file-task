@@ -208,7 +208,7 @@ function occurrenceDates(startValue: string, rule: RecurrenceRule, leadDays = 0,
 
 function ensureOccurrences(userId: string) {
   const db = database();
-  const roots = db.prepare(`SELECT d.*,i.id,i.kind,i.uses_reminder_default FROM item_series_definitions d JOIN items i
+  const roots = db.prepare(`SELECT d.*,i.id,i.kind FROM item_series_definitions d JOIN items i
     ON i.user_id=d.user_id AND i.id=d.series_root_id WHERE d.user_id=?`).all(userId);
   for (const row of roots) {
     const rule = json<RecurrenceRule | null>(row.recurrence_json, null);
@@ -216,7 +216,8 @@ function ensureOccurrences(userId: string) {
     // Repair generated Occurrences from before default-following state was
     // inherited. Only rows still matching the series definition are eligible;
     // rows with their own Reminder values remain customized.
-    if (Number(row.uses_reminder_default ?? 1) === 0) {
+    const followsDefault = Number(row.uses_reminder_default ?? 1);
+    if (followsDefault === 0) {
       db.prepare(`UPDATE items SET uses_reminder_default=0 WHERE user_id=? AND series_root_id=?
         AND uses_reminder_default=1 AND reminders_json=?`).run(userId, row.id, row.reminders_json ?? "[]");
     }
@@ -231,7 +232,7 @@ function ensureOccurrences(userId: string) {
         recurrence_json,reminders_json,series_root_id,occurrence_date,uses_reminder_default)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, userId, row.kind, row.title, row.details, date, row.scheduled_time,
         row.kind === "task" ? 0 : null, createdAt, createdAt, null, row.reminders_json ?? "[]", row.id, date,
-        row.uses_reminder_default ?? 1);
+        followsDefault);
       db.prepare(`INSERT OR IGNORE INTO calendar_import_split_blocks(user_id,item_id,provider)
         SELECT user_id,?,provider FROM calendar_import_split_blocks WHERE user_id=? AND item_id=?`).run(id,userId,row.id);
     }
@@ -239,16 +240,25 @@ function ensureOccurrences(userId: string) {
 }
 
 function saveSeriesDefinition(userId: string, rootId: string, item: Pick<WorkspaceItem,
-  "scheduledDate" | "scheduledTime" | "title" | "details" | "recurrence" | "reminders">) {
+  "scheduledDate" | "scheduledTime" | "title" | "details" | "recurrence" | "reminders">, usesReminderDefault?: number) {
   if (!item.recurrence || !item.scheduledDate) {
     database().prepare("DELETE FROM item_series_definitions WHERE user_id=? AND series_root_id=?").run(userId,rootId);
     return;
   }
-  database().prepare(`INSERT INTO item_series_definitions(user_id,series_root_id,scheduled_date,scheduled_time,title,details,recurrence_json,reminders_json)
-    VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(user_id,series_root_id) DO UPDATE SET scheduled_date=excluded.scheduled_date,
+  const db = database();
+  const previous = db.prepare("SELECT reminders_json,uses_reminder_default FROM item_series_definitions WHERE user_id=? AND series_root_id=?").get(userId,rootId);
+  const reminders = JSON.stringify(item.reminders);
+  const root = db.prepare("SELECT kind FROM items WHERE user_id=? AND id=?").get(userId,rootId);
+  // The first Occurrence can have local Reminders. Track the series template's
+  // provenance independently, and preserve it on unrelated schedule edits.
+  const followsDefault = usesReminderDefault ?? (previous?.reminders_json === reminders
+    ? Number(previous.uses_reminder_default)
+    : Number(reminders === JSON.stringify(itemReminderDefaults(userId, root?.kind as "task" | "event"))));
+  db.prepare(`INSERT INTO item_series_definitions(user_id,series_root_id,scheduled_date,scheduled_time,title,details,recurrence_json,reminders_json,uses_reminder_default)
+    VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,series_root_id) DO UPDATE SET scheduled_date=excluded.scheduled_date,
     scheduled_time=excluded.scheduled_time,title=excluded.title,details=excluded.details,recurrence_json=excluded.recurrence_json,
-    reminders_json=excluded.reminders_json`).run(userId,rootId,item.scheduledDate,item.scheduledTime,item.title,item.details,
-      JSON.stringify(item.recurrence),JSON.stringify(item.reminders));
+    reminders_json=excluded.reminders_json,uses_reminder_default=excluded.uses_reminder_default`).run(userId,rootId,item.scheduledDate,item.scheduledTime,item.title,item.details,
+      JSON.stringify(item.recurrence),reminders,followsDefault);
 }
 
 function withFiles(items: WorkspaceItem[], userId: string) {
@@ -597,7 +607,7 @@ function saveItemInTransaction(userId: string, body: Record<string, unknown>, id
       if (item.recurrence && splitAt !== null) {
         // Count from the original recurrence definition instead of materialized
         // rows: a previously deleted Occurrence still consumes COUNT.
-        const originalDefinition = db.prepare("SELECT scheduled_date,scheduled_time,title,details,recurrence_json,reminders_json FROM item_series_definitions WHERE user_id=? AND series_root_id=?").get(userId,series);
+        const originalDefinition = db.prepare("SELECT scheduled_date,scheduled_time,title,details,recurrence_json,reminders_json,uses_reminder_default FROM item_series_definitions WHERE user_id=? AND series_root_id=?").get(userId,series);
         const originalRule = json<RecurrenceRule | null>(originalDefinition?.recurrence_json, null);
         const originalStart = typeof originalDefinition?.scheduled_date === "string" ? String(originalDefinition.scheduled_date) : String(root?.scheduled_date ?? existing.scheduledDate);
         const earlierCount = originalRule
@@ -656,7 +666,9 @@ function saveItemInTransaction(userId: string, body: Record<string, unknown>, id
           recurrence:priorRule,reminders:json<ReminderRule[]>(originalDefinition.reminders_json,existing.reminders),
         });
         else db.prepare("DELETE FROM item_series_definitions WHERE user_id=? AND series_root_id=?").run(userId,series);
-        if (followingDates.length > 0) saveSeriesDefinition(userId,id,{...item,scheduledDate:followingDates[0],recurrence:splitRule});
+        if (followingDates.length > 0) saveSeriesDefinition(userId,id,{...item,scheduledDate:followingDates[0],recurrence:splitRule},
+          body.reminders === undefined || JSON.stringify(item.reminders) === originalDefinition?.reminders_json
+            ? Number(originalDefinition?.uses_reminder_default ?? 1) : undefined);
         db.prepare(`INSERT OR IGNORE INTO attachments(file_id,item_id,created_at,scope)
           SELECT file_id,?,created_at,'series' FROM attachments WHERE item_id=? AND scope='series'`).run(id,series);
         // Following Attachments whose active range crosses the split must be

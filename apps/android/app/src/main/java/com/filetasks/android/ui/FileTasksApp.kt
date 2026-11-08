@@ -75,6 +75,7 @@ import com.filetasks.android.data.ItemFields
 import com.filetasks.android.data.ItemKind
 import com.filetasks.android.data.FileAttachment
 import com.filetasks.android.data.PushDevice
+import com.filetasks.android.data.ReminderNotification
 import com.filetasks.android.data.RecurrenceEnd
 import com.filetasks.android.data.RecurrenceRule
 import com.filetasks.android.data.ReminderRule
@@ -117,7 +118,7 @@ private fun attachmentSourceFor(item: WorkspaceItem, file: WorkspaceFile, items:
 }
 
 private enum class ItemFilter { All, Tasks, Events }
-private enum class WorkspaceSection { Agenda, Files }
+private enum class WorkspaceSection { Agenda, Files, Notifications }
 
 @Composable
 fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, resumeCount: Int = 0) {
@@ -136,7 +137,9 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
         var user by remember { mutableStateOf<AccountUser?>(null) }
         var workspaceItems by remember { mutableStateOf(emptyList<WorkspaceItem>()) }
         var workspaceFiles by remember { mutableStateOf(emptyList<WorkspaceFile>()) }
+        var reminderNotifications by remember { mutableStateOf(emptyList<ReminderNotification>()) }
         var reminderSettings by remember { mutableStateOf(ReminderSettings.Empty) }
+        var reminderDefaultsLoaded by remember { mutableStateOf(false) }
         var calendarStatus by remember { mutableStateOf(CalendarStatus(emptyList(), emptyList(), emptyList())) }
         var pushDeviceId by remember { mutableStateOf<String?>(null) }
         var initialLoading by remember { mutableStateOf(true) }
@@ -264,7 +267,9 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                         user = null
                         workspaceItems = emptyList()
                         workspaceFiles = emptyList()
+                        reminderNotifications = emptyList()
                         reminderSettings = ReminderSettings.Empty
+                        reminderDefaultsLoaded = false
                         calendarStatus = CalendarStatus(emptyList(), emptyList(), emptyList())
                         showCalendarSettings = false
                     }
@@ -293,6 +298,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                     workspaceItems = api.listItems(savedToken)
                     workspaceFiles = api.listFiles(savedToken)
                     reminderSettings = api.reminderSettings(savedToken)
+                    reminderDefaultsLoaded = true
                     refreshCalendarDeliveryStatus(savedToken)
                 } catch (failure: Exception) {
                     if (failure is ApiException && failure.statusCode == 401) {
@@ -301,7 +307,9 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                         user = null
                         workspaceItems = emptyList()
                         workspaceFiles = emptyList()
+                        reminderNotifications = emptyList()
                         reminderSettings = ReminderSettings.Empty
+                        reminderDefaultsLoaded = false
                         calendarStatus = CalendarStatus(emptyList(), emptyList(), emptyList())
                         calendarSyncNotice = null
                         calendarNoticeVersion += 1
@@ -329,7 +337,9 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                         user = null
                         workspaceItems = emptyList()
                         workspaceFiles = emptyList()
+                        reminderNotifications = emptyList()
                         reminderSettings = ReminderSettings.Empty
+                        reminderDefaultsLoaded = false
                         calendarStatus = CalendarStatus(emptyList(), emptyList(), emptyList())
                         recoveryAvailable = false
                         calendarSyncNotice = null
@@ -373,6 +383,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                 workspaceItems = api.listItems(currentToken)
                 workspaceFiles = api.listFiles(currentToken)
                 reminderSettings = api.reminderSettings(currentToken)
+                reminderDefaultsLoaded = true
                 refreshCalendarDeliveryStatus(currentToken)
             }
         }
@@ -391,7 +402,9 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
             user = null
             workspaceItems = emptyList()
             workspaceFiles = emptyList()
+            reminderNotifications = emptyList()
             reminderSettings = ReminderSettings.Empty
+            reminderDefaultsLoaded = false
             calendarStatus = CalendarStatus(emptyList(), emptyList(), emptyList())
             calendarActionMessage = null
             showCalendarSettings = false
@@ -465,6 +478,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                         workspaceItems = api.listItems(newToken)
                         workspaceFiles = api.listFiles(newToken)
                         reminderSettings = api.reminderSettings(newToken)
+                        reminderDefaultsLoaded = true
                         refreshCalendarDeliveryStatus(newToken)
                     } catch (failure: Exception) {
                         if (failure is ApiException && failure.statusCode == 401) {
@@ -473,7 +487,9 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                             user = null
                             workspaceItems = emptyList()
                             workspaceFiles = emptyList()
+                            reminderNotifications = emptyList()
                             reminderSettings = ReminderSettings.Empty
+                            reminderDefaultsLoaded = false
                             calendarSyncNotice = null
                             calendarNoticeVersion += 1
                             authError = readableError(failure)
@@ -499,6 +515,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                     workspaceItems = api.listItems(currentToken)
                     workspaceFiles = api.listFiles(currentToken)
                     reminderSettings = api.reminderSettings(currentToken)
+                    reminderDefaultsLoaded = true
                     refreshCalendarDeliveryStatus(currentToken)
                     recoveryAvailable = false
                 } catch (failure: ApiException) {
@@ -508,13 +525,39 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                         user = null
                         workspaceItems = emptyList()
                         workspaceFiles = emptyList()
+                        reminderNotifications = emptyList()
                         reminderSettings = ReminderSettings.Empty
+                        reminderDefaultsLoaded = false
                         calendarSyncNotice = null
                         calendarNoticeVersion += 1
                         recoveryAvailable = false
                     }
                     throw failure
                 }
+            }
+        }
+
+        fun refreshNotifications() {
+            val currentToken = token ?: return
+            runAction {
+                reminderNotifications = ApiClient(apiBaseUrl).listNotifications(currentToken)
+            }
+        }
+
+        LaunchedEffect(token, apiBaseUrl) { reminderNotifications = emptyList() }
+
+        fun readNotification(notification: ReminderNotification, openItem: Boolean) {
+            val currentToken = token ?: return
+            runAction {
+                val api = ApiClient(apiBaseUrl)
+                val item = if (openItem) {
+                    workspaceItems = api.listItems(currentToken)
+                    workspaceItems.firstOrNull { it.id == notification.itemId }
+                        ?: throw IllegalStateException("This item is no longer available.")
+                } else null
+                api.markNotificationRead(currentToken, notification.id)
+                reminderNotifications = reminderNotifications.filterNot { it.id == notification.id }
+                if (item != null) editorTarget = EditorTarget(item)
             }
         }
 
@@ -618,18 +661,27 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                 user = user!!,
                 items = workspaceItems,
                 files = workspaceFiles,
+                notifications = reminderNotifications,
                 reminderSettings = reminderSettings,
+                reminderDefaultsLoaded = reminderDefaultsLoaded,
                 filter = itemFilter,
                 section = workspaceSection,
                 isBusy = working,
                 error = errorMessage,
                 calendarDeliveryNotice = calendarSyncNotice,
                 onFilterChange = { itemFilter = it.name },
-                onSectionChange = { workspaceSection = it.name },
-                onRefresh = ::refreshItems,
+                onSectionChange = {
+                    workspaceSection = it.name
+                    if (it == WorkspaceSection.Notifications) refreshNotifications()
+                },
+                onRefresh = {
+                    if (workspaceSection == WorkspaceSection.Notifications.name) refreshNotifications()
+                    else refreshItems()
+                },
+                onReadNotification = ::readNotification,
                 onSignOut = ::signOut,
                 onSettings = { showSettings = true },
-                onReminderSettings = { showReminderSettings = true },
+                onReminderSettings = { if (reminderDefaultsLoaded) showReminderSettings = true },
                 onCalendarSettings = {
                     showCalendarSettings = true
                     calendarActionMessage = null
@@ -638,7 +690,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                         calendarStatus = ApiClient(apiBaseUrl).calendarStatus(currentToken)
                     }
                 },
-                onCreate = { editorTarget = EditorTarget(null) },
+                onCreate = { if (reminderDefaultsLoaded) editorTarget = EditorTarget(null) },
                 onEdit = { editorTarget = EditorTarget(it) },
                 onDelete = { confirmDelete = it },
                 onUpload = { uploadLauncher.launch(arrayOf("*/*")) },
@@ -765,6 +817,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                                     workspaceItems = api.listItems(currentToken)
                                     workspaceFiles = api.listFiles(currentToken)
                                     reminderSettings = api.reminderSettings(currentToken)
+                                    reminderDefaultsLoaded = true
                                     if (item.kind == ItemKind.Event) refreshCalendarDeliveryStatus(currentToken, "deleted")
                                     confirmDelete = null
                                 }
@@ -894,7 +947,9 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                                 user = null
                                 workspaceItems = emptyList()
                                 workspaceFiles = emptyList()
+                                reminderNotifications = emptyList()
                                 reminderSettings = ReminderSettings.Empty
+                                reminderDefaultsLoaded = false
                                 recoveryAvailable = false
                                 errorMessage = "Server changed. Sign in to continue."
                             } finally {
@@ -1128,7 +1183,9 @@ private fun WorkspaceScreen(
     user: AccountUser,
     items: List<WorkspaceItem>,
     files: List<WorkspaceFile>,
+    notifications: List<ReminderNotification>,
     reminderSettings: ReminderSettings,
+    reminderDefaultsLoaded: Boolean,
     filter: String,
     section: String,
     isBusy: Boolean,
@@ -1137,6 +1194,7 @@ private fun WorkspaceScreen(
     onFilterChange: (ItemFilter) -> Unit,
     onSectionChange: (WorkspaceSection) -> Unit,
     onRefresh: () -> Unit,
+    onReadNotification: (ReminderNotification, Boolean) -> Unit,
     onSignOut: () -> Unit,
     onSettings: () -> Unit,
     onReminderSettings: () -> Unit,
@@ -1155,6 +1213,7 @@ private fun WorkspaceScreen(
 ) {
     val selectedSection = WorkspaceSection.valueOf(section)
     val showingFiles = selectedSection == WorkspaceSection.Files
+    val showingNotifications = selectedSection == WorkspaceSection.Notifications
     val selectedFilter = ItemFilter.valueOf(filter)
     val visibleItems = when (selectedFilter) {
         ItemFilter.All -> items
@@ -1176,8 +1235,8 @@ private fun WorkspaceScreen(
                 )
             } else {
                 ExtendedFloatingActionButton(
-                    text = { Text("Add item") }, icon = { Text("+", style = MaterialTheme.typography.titleLarge) },
-                    onClick = { if (!isBusy) onCreate() },
+                    text = { Text(if (reminderDefaultsLoaded) "Add item" else "Load Reminder defaults first") }, icon = { Text("+", style = MaterialTheme.typography.titleLarge) },
+                    onClick = { if (!isBusy && reminderDefaultsLoaded) onCreate() },
                     modifier = Modifier.testTag("agenda.add"),
                     containerColor = if (isBusy) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.primary,
                     contentColor = if (isBusy) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onPrimary,
@@ -1192,16 +1251,17 @@ private fun WorkspaceScreen(
                 Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
                     TextButton(onClick = onRefresh, enabled = !isBusy) { Text("Refresh") }
                     TextButton(onClick = onSettings, enabled = !isBusy) { Text("Server") }
-                    TextButton(onClick = onReminderSettings, enabled = !isBusy) { Text("Reminders") }
+                    TextButton(onClick = onReminderSettings, enabled = !isBusy && reminderDefaultsLoaded) { Text("Reminders") }
                     TextButton(onClick = onCalendarSettings, enabled = !isBusy) { Text("Calendars") }
                     TextButton(onClick = onSignOut, enabled = !isBusy) { Text("Sign out") }
                 }
                 Spacer(Modifier.height(12.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(selected = !showingFiles, onClick = { onSectionChange(WorkspaceSection.Agenda) }, label = { Text("Agenda · ${items.size}") })
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(selected = selectedSection == WorkspaceSection.Agenda, onClick = { onSectionChange(WorkspaceSection.Agenda) }, label = { Text("Agenda · ${items.size}") })
                     FilterChip(selected = showingFiles, onClick = { onSectionChange(WorkspaceSection.Files) }, label = { Text("Files · ${files.size}") })
+                    FilterChip(selected = showingNotifications, onClick = { onSectionChange(WorkspaceSection.Notifications) }, enabled = !isBusy, label = { Text("Notifications") })
                 }
-                if (!showingFiles) {
+                if (selectedSection == WorkspaceSection.Agenda) {
                     Spacer(Modifier.height(8.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     ItemFilter.entries.forEach { option ->
@@ -1219,6 +1279,9 @@ private fun WorkspaceScreen(
                         )
                     }
                     }
+                }
+                if (!reminderDefaultsLoaded && !isBusy) {
+                    Text("Refresh to load Reminder defaults before creating items or changing defaults.", style = MaterialTheme.typography.bodySmall)
                 }
                 if (isBusy) {
                     Spacer(Modifier.height(8.dp))
@@ -1244,7 +1307,36 @@ private fun WorkspaceScreen(
                 }
             }
 
-            if (showingFiles) {
+            if (showingNotifications) {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize().testTag("notifications.list"),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 16.dp, end = 16.dp, bottom = 104.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    item { Text("In-app Notifications are always available. Use Refresh to check for Reminders.") }
+                    if (notifications.isEmpty() && !isBusy && error == null) {
+                        item { Text("You’re all caught up. Notifications appear when a Reminder is due.") }
+                    }
+                    items(notifications, key = { it.id }) { notification ->
+                        Card(Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(12.dp)) {
+                                Text(notification.title, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    runCatching {
+                                        java.time.Instant.parse(notification.scheduledAt).atZone(java.time.ZoneId.systemDefault())
+                                            .format(java.time.format.DateTimeFormatter.ofLocalizedDateTime(java.time.format.FormatStyle.MEDIUM))
+                                    }.getOrDefault(notification.scheduledAt),
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                Row {
+                                    TextButton(enabled = !isBusy, onClick = { onReadNotification(notification, true) }) { Text("Open item") }
+                                    TextButton(enabled = !isBusy, onClick = { onReadNotification(notification, false) }) { Text("Mark read") }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (showingFiles) {
                 if (files.isEmpty()) {
                     Column(
                         modifier = Modifier.fillMaxSize().padding(32.dp),
@@ -1726,15 +1818,19 @@ private fun ReminderRuleEditor(
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         reminders.forEachIndexed { index, reminder ->
-            var amountText by remember(index) { mutableStateOf(reminder.amount.toString()) }
+            var amountText by remember(index, reminder.amount) { mutableStateOf(reminder.amount.toString()) }
             Text("Reminder ${index + 1}", style = MaterialTheme.typography.labelMedium)
             Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 FilterChip(selected = reminder.delivery == "notification", onClick = {
                     onChange(reminders.mapIndexed { row, value -> if (row == index) value.copy(delivery = "notification") else value })
                 }, enabled = enabled, label = { Text("Notification") })
-                FilterChip(selected = reminder.delivery == "email", onClick = {
-                    onChange(reminders.mapIndexed { row, value -> if (row == index) value.copy(delivery = "email") else value })
-                }, enabled = enabled && emailAvailable, label = { Text("Email") })
+                if (emailAvailable) {
+                    FilterChip(selected = reminder.delivery == "email", onClick = {
+                        onChange(reminders.mapIndexed { row, value -> if (row == index) value.copy(delivery = "email") else value })
+                    }, enabled = enabled, label = { Text("Email") })
+                } else if (reminder.delivery == "email") {
+                    Text("Email (delivery disabled)")
+                }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
@@ -1994,6 +2090,10 @@ private fun ReminderSettingsDialog(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = settings.emailEnabled, onCheckedChange = { settings = settings.copy(emailEnabled = it) }, enabled = !saving && !isBusy && settings.emailAvailable)
                     Text("Email delivery${if (settings.emailAvailable) "" else " (not configured)"}")
+                }
+                Text("In-app Notifications are always available. Push and email delivery are optional.")
+                if (!settings.emailEnabled && (settings.taskReminders + settings.eventReminders).any { it.delivery == "email" }) {
+                    Text("Remove Email Reminders from Task and Event defaults before saving with email delivery disabled.")
                 }
                 Text("Task defaults", style = MaterialTheme.typography.titleSmall)
                 ReminderRuleEditor(settings.taskReminders, settings.emailAvailable && settings.emailEnabled, !saving && !isBusy) {

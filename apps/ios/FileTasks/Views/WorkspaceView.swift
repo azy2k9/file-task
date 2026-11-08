@@ -21,6 +21,7 @@ private enum ItemFilter: String, CaseIterable, Identifiable {
 private enum WorkspaceSection: String, CaseIterable, Identifiable {
     case agenda = "Agenda"
     case files = "Files"
+    case notifications = "Notifications"
     var id: String { rawValue }
 }
 
@@ -52,6 +53,7 @@ struct WorkspaceView: View {
     @State private var fileToDelete: WorkspaceFile?
     @State private var attachmentToRemove: (file: WorkspaceFile, attachment: FileAttachment)?
     @State private var pendingPushItemId: String?
+    @State private var notificationActionError: String?
 
     private var filteredItems: [WorkspaceItem] {
         model.items.filter { filter.includes($0) }
@@ -129,8 +131,14 @@ struct WorkspaceView: View {
             workspaceSectionContent
         }
         .listStyle(.insetGrouped)
-        .refreshable { await model.refreshItems() }
-        .navigationTitle(section == .files ? "Files" : "Workspace")
+        .refreshable {
+            if section == .notifications { await model.refreshNotifications() }
+            else { await model.refreshItems() }
+        }
+        .task(id: section) {
+            if section == .notifications { await model.refreshNotifications() }
+        }
+        .navigationTitle(section == .agenda ? "Workspace" : section.rawValue)
     }
 
     private var sectionPicker: some View {
@@ -147,8 +155,52 @@ struct WorkspaceView: View {
     private var workspaceSectionContent: some View {
         if section == .files {
             filesContent
+        } else if section == .notifications {
+            notificationsContent
         } else {
             agendaContent
+        }
+    }
+
+    @ViewBuilder
+    private var notificationsContent: some View {
+        Section {
+            Text("In-app Notifications are always available. Pull down to refresh.")
+                .font(.footnote).foregroundStyle(.secondary)
+            if let error = notificationActionError { Text(error).foregroundStyle(.red) }
+            if model.isLoadingNotifications { ProgressView("Loading Notifications…") }
+            if let error = model.notificationsError {
+                Text(error).foregroundStyle(.red)
+                Button("Retry Notifications") { Task { await model.refreshNotifications() } }
+            } else if model.notifications.isEmpty && !model.isLoadingNotifications {
+                Text("You’re all caught up. Notifications appear when a Reminder is due.")
+            }
+            ForEach(model.notifications) { notification in
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(notification.title).font(.headline)
+                    if let date = notification.scheduledDate {
+                        Text(date.formatted(date: .abbreviated, time: .shortened)).font(.caption).foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Button("Open item") {
+                            Task {
+                                notificationActionError = nil
+                                await model.refreshItems()
+                                guard let item = model.items.first(where: { $0.id == notification.itemId }) else {
+                                    notificationActionError = "This item is no longer available. Refresh Notifications to update the inbox."
+                                    return
+                                }
+                                do {
+                                    try await model.readNotification(notification)
+                                    editingItem = item
+                                    showingEditor = true
+                                } catch { notificationActionError = error.localizedDescription }
+                            }
+                        }
+                        Button("Mark read") { Task { try? await model.readNotification(notification) } }
+                    }.buttonStyle(.borderless)
+                }
+            }
         }
     }
 
@@ -264,7 +316,7 @@ struct WorkspaceView: View {
                     showingReminderSettings = true
                 } label: {
                     Label("Reminder settings", systemImage: "bell")
-                }
+                }.disabled(!model.hasLoadedReminderSettingsForCurrentSession)
                 Button {
                     showingCalendarSettings = true
                 } label: {
@@ -282,7 +334,7 @@ struct WorkspaceView: View {
         }
         ToolbarItem(placement: .navigationBarTrailing) {
             Menu {
-                if section == .agenda {
+                if section != .files {
                     Button { beginCreating(.task) } label: { Label("New Task", systemImage: "checkmark.circle") }
                     Button { beginCreating(.event) } label: { Label("New Event", systemImage: "calendar.badge.plus") }
                 } else {

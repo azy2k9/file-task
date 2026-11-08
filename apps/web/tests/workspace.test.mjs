@@ -1523,7 +1523,7 @@ test("Reminder defaults are separate, prefill new items, and update only items s
   assert.equal((await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: { taskReminders: email } })).status, 400);
 });
 
-test("custom recurring Reminders survive default updates and future Occurrence generation", async () => {
+test("Reminder default changes preserve historical schedules and customized recurring Reminders", async () => {
   const owner = await account();
   const initialDefault = [{ delivery: "notification", amount: 1, unit: "days", time: "09:00" }];
   const intermediateDefault = [{ delivery: "notification", amount: 3, unit: "days", time: "09:00" }];
@@ -1545,8 +1545,8 @@ test("custom recurring Reminders survive default updates and future Occurrence g
   assert.ok(occurrences.length > 1, "the recurring series should have generated existing Occurrences");
   const existingOccurrenceIds = new Set(occurrences.map(({ id }) => id));
 
-  // Future-only changes affect new items, while current Tasks keep the default
-  // that was active when they were created.
+  // Future-only changes affect new items, while existing Tasks keep the
+  // default that was active when they were created.
   assert.equal((await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: {
     taskReminders: intermediateDefault, applyToExisting: false,
   } })).status, 200);
@@ -1568,7 +1568,7 @@ test("custom recurring Reminders survive default updates and future Occurrence g
     taskReminders: finalDefault, applyToExisting: true,
   } })).status, 200);
   assert.deepEqual((await (await request(`/api/items/${series.id}`, { token: owner.token })).json()).item.reminders, customized);
-  assert.deepEqual((await (await request(`/api/items/${defaultTask.id}`, { token: owner.token })).json()).item.reminders, finalDefault);
+  assert.deepEqual((await (await request(`/api/items/${defaultTask.id}`, { token: owner.token })).json()).item.reminders, initialDefault);
   assert.deepEqual((await (await request(`/api/items/${futureOnlyTask.id}`, { token: owner.token })).json()).item.reminders, finalDefault);
   occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
     .filter(({ seriesId }) => seriesId === series.id);
@@ -1586,6 +1586,60 @@ test("custom recurring Reminders survive default updates and future Occurrence g
   } finally { await setTestClock(previousClock); }
 });
 
+test("applying Reminder defaults updates only matching recurring schedules and preserves customized Occurrences", async () => {
+  const owner = await account();
+  const historicalDefault = [{ delivery: "notification", amount: 2, unit: "days", time: "09:00" }];
+  const currentDefault = [{ delivery: "notification", amount: 3, unit: "days", time: "10:00" }];
+  const nextDefault = [{ delivery: "notification", amount: 4, unit: "days", time: "11:00" }];
+  const occurrenceOverride = [{ delivery: "notification", amount: 1, unit: "hours", time: "08:00" }];
+  const recurrence = { interval: 1, unit: "weeks", weekdays: [2], end: { type: "never" } };
+  const createSeries = async (title) => (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "task", title, scheduledDate: "2026-10-20", recurrence,
+  } })).json()).item;
+  const listSeries = async (id) => (await (await request("/api/items", { token: owner.token })).json()).items
+    .filter(({ seriesId }) => seriesId === id);
+
+  assert.equal((await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: {
+    taskReminders: historicalDefault,
+  } })).status, 200);
+  const historicalSeries = await createSeries("Historical default series");
+  const historicalOccurrenceIds = new Set((await listSeries(historicalSeries.id)).map(({ id }) => id));
+
+  assert.equal((await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: {
+    taskReminders: currentDefault, applyToExisting: false,
+  } })).status, 200);
+  const currentSeries = await createSeries("Current default series");
+  const currentOccurrences = await listSeries(currentSeries.id);
+  const customizedOccurrence = currentOccurrences.find(({ id }) => id === currentSeries.id);
+  assert.ok(customizedOccurrence);
+  const customized = await request(`/api/items/${customizedOccurrence.id}`, { token: owner.token, method: "PATCH", body: {
+    reminders: occurrenceOverride, scope: "occurrence",
+  } });
+  assert.equal(customized.status, 200, await customized.clone().text());
+
+  assert.equal((await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: {
+    taskReminders: nextDefault, applyToExisting: true,
+  } })).status, 200);
+  const historicalAfter = await listSeries(historicalSeries.id);
+  assert.ok(historicalAfter.every(({ reminders }) => JSON.stringify(reminders) === JSON.stringify(historicalDefault)));
+  const currentAfter = await listSeries(currentSeries.id);
+  assert.ok(currentAfter.filter(({ id }) => id !== customizedOccurrence.id)
+    .every(({ reminders }) => JSON.stringify(reminders) === JSON.stringify(nextDefault)));
+  assert.deepEqual(currentAfter.find(({ id }) => id === customizedOccurrence.id).reminders, occurrenceOverride);
+
+  const previousClock = new Date(testClock);
+  try {
+    await setTestClock(previousClock.getTime() + 372 * 86_400_000);
+    const historicalGenerated = (await listSeries(historicalSeries.id)).filter(({ id }) => !historicalOccurrenceIds.has(id));
+    const currentGenerated = (await listSeries(currentSeries.id)).filter(({ id }) => id !== customizedOccurrence.id
+      && !currentOccurrences.some((old) => old.id === id));
+    assert.ok(historicalGenerated.length > 0, "the historical series should generate later Occurrences");
+    assert.ok(currentGenerated.length > 0, "the current series should generate later Occurrences");
+    assert.ok(historicalGenerated.every(({ reminders }) => JSON.stringify(reminders) === JSON.stringify(historicalDefault)));
+    assert.ok(currentGenerated.every(({ reminders }) => JSON.stringify(reminders) === JSON.stringify(nextDefault)));
+  } finally { await setTestClock(previousClock); }
+});
+
 test("due Notification Reminders appear in the in-app notification list and can be marked read", async () => {
   const owner = await account();
   const created = await request("/api/items", { token: owner.token, method: "POST", body: {
@@ -1598,6 +1652,10 @@ test("due Notification Reminders appear in the in-app notification list and can 
   assert.equal(response.status, 200);
   const notification = (await response.json()).notifications.find(({ itemId }) => itemId === item.id);
   assert.ok(notification);
+  const other = await account();
+  assert.deepEqual((await (await request("/api/notifications", { token: other.token })).json()).notifications, []);
+  assert.equal((await request(`/api/notifications/${notification.id}`, { token: other.token, method: "PATCH" })).status, 404);
+  assert.equal((await request(`/api/notifications/${notification.id}`, { method: "PATCH" })).status, 401);
   assert.equal((await request(`/api/notifications/${notification.id}`, { token: owner.token, method: "PATCH" })).status, 200);
   assert.equal((await (await request("/api/notifications", { token: owner.token })).json()).notifications.some(({ id }) => id === notification.id), false);
 });
@@ -7328,3 +7386,139 @@ for (const omitted of [false, true]) {
     } finally { omittedAppleReports.clear(); appleEvents.clear(); googleEvents.clear(); }
   });
 }
+
+test("browser Reminder settings share the item editor, prefill both types, and recover failed defaults", async () => {
+  const owner = await account();
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 1000 } });
+  const page = await context.newPage();
+  try {
+    await context.addCookies([{ name: "filetasks_session", value: owner.cookie.split("=")[1], url: base }]);
+    let failDefaults = true;
+    await page.route("**/api/settings/reminders", async (route) => {
+      if (route.request().method() === "GET" && failDefaults) {
+        await route.fulfill({ status: 503, json: { error: "Reminder defaults unavailable" } });
+      } else await route.continue();
+    });
+    await page.goto(base);
+    await expect(page.getByRole("button", { name: "Retry Reminder defaults", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "New Task", exact: true })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeDisabled();
+    failDefaults = false;
+    await page.getByRole("button", { name: "Retry Reminder defaults", exact: true }).click();
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    const settings = page.getByRole("dialog", { name: "Reminder settings", exact: true });
+    await expect(settings.getByText("In-app Notifications are always available.", { exact: false })).toBeVisible();
+    await settings.getByRole("button", { name: "+ Add Reminder", exact: true }).click();
+    assert.deepEqual(await settings.getByLabel("Reminder 1 delivery", { exact: true }).locator("option").allTextContents(), ["Notification"]);
+    await settings.getByLabel("Reminder 1 offset", { exact: true }).fill("2");
+    await settings.getByLabel("Reminder 1 offset unit", { exact: true }).selectOption("months");
+    await settings.getByLabel("Reminder 1 clock time", { exact: true }).fill("08:15");
+    await settings.getByRole("button", { name: "+ Add Reminder", exact: true }).click();
+    await settings.getByLabel("Reminder 2 offset unit", { exact: true }).selectOption("hours");
+    await settings.getByLabel("Reminder 2 offset", { exact: true }).fill("3");
+    await settings.getByRole("button", { name: "Event defaults", exact: true }).click();
+    await settings.getByLabel("Email delivery", { exact: true }).check();
+    await settings.getByRole("button", { name: "+ Add Reminder", exact: true }).click();
+    await settings.getByLabel("Reminder 1 delivery", { exact: true }).selectOption("email");
+    await settings.getByLabel("Reminder 1 offset unit", { exact: true }).selectOption("weeks");
+    await settings.getByRole("button", { name: "Save settings", exact: true }).click();
+    await expect(settings).not.toBeVisible();
+    await page.getByRole("button", { name: "New Task", exact: true }).click();
+    await expect(page.getByLabel("Reminder 1 offset", { exact: true })).toHaveValue("2");
+    await expect(page.getByLabel("Reminder 1 offset unit", { exact: true })).toHaveValue("months");
+    await expect(page.getByLabel("Reminder 1 clock time", { exact: true })).toHaveValue("08:15");
+    await expect(page.getByLabel("Reminder 2 offset", { exact: true })).toHaveValue("3");
+    await page.getByRole("button", { name: "Remove Reminder 1", exact: true }).click();
+    await page.getByLabel("Title", { exact: true }).fill("Customized reminder Task");
+    await page.getByRole("button", { name: "Save Task", exact: true }).click();
+    await page.getByRole("button", { name: "New Event", exact: true }).click();
+    await expect(page.getByLabel("Reminder 1 delivery", { exact: true })).toHaveValue("email");
+    await expect(page.getByLabel("Reminder 1 offset unit", { exact: true })).toHaveValue("weeks");
+    await page.getByRole("button", { name: "Cancel", exact: true }).click();
+    const saved = (await (await request("/api/settings/reminders", { token: owner.token })).json()).settings;
+    assert.equal(saved.taskReminders.length, 2, "item edits must not modify account defaults");
+    const task = (await (await request("/api/items", { token: owner.token })).json()).items.find(({ title }) => title === "Customized reminder Task");
+    assert.equal(task.reminders.length, 1);
+    assert.equal(task.reminders[0].unit, "hours");
+    const event = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "event", title: "Saved Email Event", scheduledDate: "2026-11-20",
+    } })).json()).item;
+    assert.equal((await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: {
+      eventReminders: [], emailEnabled: false,
+    } })).status, 200);
+    await page.goto(`${base}/?item=${event.id}`);
+    await expect(page.getByLabel("Reminder 1 delivery", { exact: true })).toHaveValue("email");
+    const emailOption = page.getByLabel("Reminder 1 delivery", { exact: true }).locator('option[value="email"]');
+    await expect(emailOption).toHaveText("Email (delivery disabled)");
+    await expect(emailOption).toBeDisabled();
+    await page.getByLabel("Title", { exact: true }).fill("Edited Email Event");
+    await page.getByRole("button", { name: "Save Event", exact: true }).click();
+    await expect(page.getByRole("dialog")).not.toBeVisible();
+    assert.deepEqual((await (await request(`/api/items/${event.id}`, { token: owner.token })).json()).item.reminders, saved.eventReminders);
+  } finally {
+    await context.close();
+    await browser.close();
+  }
+});
+
+
+test("custom series keep their provenance when later defaults happen to match", async () => {
+  const owner = await account();
+  const original = [{ delivery: "notification", amount: 1, unit: "days", time: "09:00" }];
+  const custom = [{ delivery: "notification", amount: 2, unit: "days", time: "10:00" }];
+  const next = [{ delivery: "notification", amount: 3, unit: "days", time: "11:00" }];
+  const configure = async (taskReminders, applyToExisting = false) => {
+    const response = await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: { taskReminders, applyToExisting } });
+    assert.equal(response.status, 200);
+  };
+  await configure(original);
+  const series = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "task", title: "Custom series coincides with later default", scheduledDate: "2026-10-20", reminders: custom,
+    recurrence: { interval: 1, unit: "weeks", weekdays: [2], end: { type: "never" } },
+  } })).json()).item;
+  await configure(custom);
+  await configure(next, true);
+  const previousClock = new Date(testClock);
+  try {
+    await setTestClock(previousClock.getTime() + 372 * 86_400_000);
+    const occurrences = (await (await request("/api/items", { token: owner.token })).json()).items.filter(({ seriesId }) => seriesId === series.id);
+    assert.ok(occurrences.some(({ scheduledDate }) => scheduledDate > "2027-10-20"));
+    assert.ok(occurrences.every(({ reminders }) => JSON.stringify(reminders) === JSON.stringify(custom)));
+  } finally { await setTestClock(previousClock); }
+});
+
+test("Reminder settings migrate series provenance and roll back all writes on failure", async () => {
+  const owner = await account();
+  const original = [{ delivery: "notification", amount: 1, unit: "days", time: "09:00" }];
+  const custom = [{ delivery: "notification", amount: 2, unit: "days", time: "10:00" }];
+  const next = [{ delivery: "notification", amount: 3, unit: "days", time: "11:00" }];
+  assert.equal((await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: { taskReminders: original } })).status, 200);
+  const create = async (title, reminders) => (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "task", title, scheduledDate: "2026-10-20", ...(reminders ? { reminders } : {}),
+    recurrence: { interval: 1, unit: "weeks", weekdays: [2], end: { type: "never" } },
+  } })).json()).item;
+  const follows = await create("Default series with local root");
+  const customized = await create("Custom series", custom);
+  assert.equal((await request(`/api/items/${follows.id}`, { token: owner.token, method: "PATCH", body: { reminders: custom, scope: "occurrence" } })).status, 200);
+  await stopServer();
+  let db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  db.exec("ALTER TABLE item_series_definitions DROP COLUMN uses_reminder_default");
+  db.close();
+  await startServer();
+  assert.equal((await request("/api/settings/reminders", { token: owner.token })).status, 200);
+  db = new DatabaseSync(join(directory, "workspace.sqlite"));
+  try {
+    const flags = db.prepare("SELECT series_root_id,uses_reminder_default FROM item_series_definitions WHERE user_id=?").all(owner.user.id);
+    assert.equal(flags.find(({ series_root_id }) => series_root_id === follows.id).uses_reminder_default, 1);
+    assert.equal(flags.find(({ series_root_id }) => series_root_id === customized.id).uses_reminder_default, 0);
+    db.exec("CREATE TRIGGER fail_reminder_template BEFORE UPDATE OF reminders_json ON item_series_definitions BEGIN SELECT RAISE(ABORT,'test rollback'); END");
+    assert.equal((await request("/api/settings/reminders", { token: owner.token, method: "PATCH", body: { taskReminders: next, applyToExisting: true } })).status, 500);
+    assert.deepEqual((await (await request("/api/settings/reminders", { token: owner.token })).json()).settings.taskReminders, original);
+    const unchanged = (await (await request("/api/items", { token: owner.token })).json()).items;
+    assert.ok(unchanged.filter(({ seriesId, id }) => seriesId === follows.id && id !== follows.id).every(({ reminders }) => JSON.stringify(reminders) === JSON.stringify(original)));
+  } finally {
+    db.exec("DROP TRIGGER IF EXISTS fail_reminder_template");
+    db.close();
+  }
+});
