@@ -224,18 +224,21 @@ export function removeAttachment(userId: string, fileId: string, itemId: string,
   if (!selected) throw new HttpError(404,"This Attachment could not be found.");
   if (scope === "following") {
     const rootId=String(selected.series_root_id ?? itemId);
-    const inherited=database().prepare("SELECT 1 FROM attachments WHERE file_id=? AND item_id=? AND scope='series'").get(fileId,rootId);
-    const inheritedFollowing=database().prepare(`SELECT 1 FROM following_attachments a JOIN items anchor ON anchor.id=a.item_id
-      WHERE a.file_id=? AND anchor.series_root_id=? AND anchor.occurrence_date<=? LIMIT 1`).get(fileId,rootId,selected.occurrence_date);
     const db=database();
-    const removed=db.prepare("DELETE FROM following_attachments WHERE file_id=? AND item_id=?").run(fileId,itemId);
-    if (!removed.changes && !inherited && !inheritedFollowing) throw new HttpError(404,"This Attachment could not be found.");
     inTransaction(() => {
-      // Removing a following range also removes local Occurrence restorations
-      // within it; otherwise those explicit rows would bypass this exclusion.
-      db.prepare(`DELETE FROM occurrence_attachments WHERE file_id=? AND item_id IN (
-        SELECT id FROM items WHERE user_id=? AND series_root_id=? AND occurrence_date>=?)`)
-        .run(fileId,userId,rootId,selected.occurrence_date);
+      const inherited=db.prepare("SELECT 1 FROM attachments WHERE file_id=? AND item_id=? AND scope='series'").get(fileId,rootId);
+      const inheritedFollowing=db.prepare(`SELECT 1 FROM following_attachments a JOIN items anchor ON anchor.id=a.item_id
+        WHERE a.file_id=? AND anchor.series_root_id=? AND anchor.occurrence_date<=? LIMIT 1`).get(fileId,rootId,selected.occurrence_date);
+      // Clear every explicit association in the selected range. Later following
+      // anchors and local restorations would otherwise bypass the exclusion.
+      const range=`SELECT id FROM items WHERE user_id=? AND (id=? OR (series_root_id=? AND occurrence_date>=?))`;
+      const params=[fileId,userId,itemId,rootId,selected.occurrence_date] as const;
+      const following=db.prepare(`DELETE FROM following_attachments WHERE file_id=? AND item_id IN (${range})`).run(...params);
+      const local=db.prepare(`DELETE FROM occurrence_attachments WHERE file_id=? AND item_id IN (${range})`).run(...params);
+      const legacy=db.prepare(`DELETE FROM attachments WHERE file_id=? AND scope='occurrence' AND item_id IN (${range})`).run(...params);
+      if (!following.changes && !local.changes && !legacy.changes && !inherited && !inheritedFollowing) {
+        throw new HttpError(404,"This Attachment could not be found.");
+      }
       if (inherited || inheritedFollowing) db.prepare("INSERT OR IGNORE INTO attachment_exclusions(file_id,item_id,scope) VALUES(?,?,'following')").run(fileId,itemId);
     });
     return;

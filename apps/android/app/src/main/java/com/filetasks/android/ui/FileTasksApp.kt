@@ -878,6 +878,7 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
         confirmRemoveAttachment?.let { (file, attachment) ->
             val attachmentItem = workspaceItems.firstOrNull { it.id == attachment.itemId }
             val isRecurringAttachment = attachmentItem?.seriesId != null || attachmentItem?.recurrence != null
+            val hasRecurringAssociations = file.attachments.any { it.scope == "series" || it.scope == "following" }
             AlertDialog(
                 onDismissRequest = { if (!working) confirmRemoveAttachment = null },
                 title = { Text("Remove this Attachment?") },
@@ -892,7 +893,8 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
                                 }
                             }
                         }
-                        if (file.attachments.size > 1) Text("Deleting this File removes it from ${file.attachments.size} Tasks or Events.", color = MaterialTheme.colorScheme.error)
+                        if (hasRecurringAssociations) Text("Deleting this File removes it from all associated Tasks and Events, including recurring Occurrences.", color = MaterialTheme.colorScheme.error)
+                        else if (file.attachments.size > 1) Text("Deleting this File removes it from ${file.attachments.size} Tasks or Events.", color = MaterialTheme.colorScheme.error)
                     }
                 },
                 confirmButton = { TextButton(enabled = !working, onClick = { removeAttachment(file, attachment, if (isRecurringAttachment || attachment.scope == "series" || attachment.scope == "following") attachmentRemovalScope else "occurrence") }) { Text("Remove Attachment") } },
@@ -906,11 +908,13 @@ fun FileTasksApp(context: Context, openItemRequest: Pair<String, Long>? = null, 
         }
 
         confirmDeleteFile?.let { file ->
+            val hasRecurringAssociations = file.attachments.any { it.scope == "series" || it.scope == "following" }
             AlertDialog(
                 onDismissRequest = { if (!working) confirmDeleteFile = null },
                 title = { Text("Delete this File?") },
                 text = {
-                    Text(if (file.attachments.size > 1) "This File is attached to ${file.attachments.size} Tasks or Events. Deleting it removes all of those Attachments."
+                    Text(if (hasRecurringAssociations) "Deleting this File removes it from all associated Tasks and Events, including recurring Occurrences."
+                    else if (file.attachments.size > 1) "This File is attached to ${file.attachments.size} Tasks or Events. Deleting it removes all of those Attachments."
                     else if (file.attachments.size == 1) "Deleting this File also removes its Attachment from “${file.attachments[0].itemTitle}”."
                     else "${file.name} will be deleted from your Files section.")
                 },

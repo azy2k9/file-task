@@ -1323,6 +1323,47 @@ test("a person can create a Task on one client and view it on another after sign
   assert.deepEqual((await listed.json()).items, [item]);
 });
 
+test("Task and Event changes stay shared across independent browser and native sessions", async () => {
+  const owner = await account();
+  const login = await request("/api/auth/login", { method: "POST", body: {
+    email: owner.user.email, password: "correct-horse-battery",
+  } });
+  assert.equal(login.status, 200);
+  const native = await login.json();
+  assert.notEqual(native.token, owner.token);
+  const web = { cookie: owner.cookie, headers: { Origin: base } };
+
+  for (const kind of ["task", "event"]) {
+    const created = await request("/api/items", { ...web, method: "POST", body: {
+      kind, title: `Shared ${kind}`, details: "Created in the browser",
+      scheduledDate: "2026-12-01", scheduledTime: "16:00",
+    } });
+    assert.equal(created.status, 201);
+    const { item } = await created.json();
+    const read = await request(`/api/items/${item.id}`, { token: native.token });
+    assert.equal(read.status, 200);
+    assert.deepEqual((await read.json()).item, item);
+
+    const edited = await request(`/api/items/${item.id}`, { token: native.token, method: "PATCH", body: {
+      title: `Edited ${kind}`, details: "Updated by another client",
+      scheduledDate: null, scheduledTime: null,
+      ...(kind === "task" ? { completed: true } : {}),
+    } });
+    assert.equal(edited.status, 200);
+    const updated = (await edited.json()).item;
+    assert.equal(updated.completed, kind === "task" ? true : null);
+    assert.equal(updated.scheduledDate, null);
+    assert.equal(updated.scheduledTime, null);
+    const listed = await request("/api/items", web);
+    assert.equal(listed.status, 200);
+    assert.deepEqual((await listed.json()).items, [updated]);
+
+    assert.equal((await request(`/api/items/${item.id}`, { ...web, method: "DELETE" })).status, 204);
+    assert.equal((await request(`/api/items/${item.id}`, { token: native.token })).status, 404);
+    assert.deepEqual((await (await request("/api/items", { token: native.token })).json()).items, []);
+  }
+});
+
 test("a person can edit, complete, reopen and delete a Task using their web session", async () => {
   const owner = await account();
   const options = { cookie: owner.cookie, headers: { Origin: base } };
@@ -1949,6 +1990,66 @@ test("uploaded Files transfer through the fake object store and open from anothe
   assert.equal(downloaded.status, 200);
   assert.deepEqual(Buffer.from(await downloaded.arrayBuffer()), bytes);
   assert.equal((await request(`/api/files/${file.id}`, { token: secondClient.token, method: "DELETE" })).status, 204);
+  assert.equal(storageObjects.size, 0);
+});
+
+test("same-name uploads remain independent Files with their own Attachments across clients", async () => {
+  const owner = await account();
+  const task = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "task", title: "Renew the policy",
+  } })).json()).item;
+  const event = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "Policy appointment",
+  } })).json()).item;
+
+  const linked = (await (await request("/api/files", { token: owner.token, method: "POST", body: {
+    name: "Policy details", url: "https://example.com/policy",
+  } })).json()).file;
+  const upload = async (content) => {
+    const bytes = Buffer.from(content);
+    const target = await request("/api/files/uploads", { token: owner.token, method: "POST", body: {
+      name: "policy.pdf", contentType: "application/pdf", sizeBytes: bytes.length,
+    } });
+    assert.equal(target.status, 201);
+    const { uploadId, uploadUrl } = await target.json();
+    assert.equal((await fetch(uploadUrl, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: bytes })).status, 200);
+    const completed = await request(`/api/files/${uploadId}/complete`, { token: owner.token, method: "POST" });
+    assert.equal(completed.status, 200);
+    return { file: (await completed.json()).file, bytes };
+  };
+
+  const older = await upload("original policy contents");
+  for (const item of [task, event]) {
+    assert.equal((await request(`/api/files/${older.file.id}/attachments`, { token: owner.token, method: "POST", body: { itemId: item.id } })).status, 201);
+  }
+  const newer = await upload("revised policy contents");
+  assert.notEqual(older.file.id, newer.file.id, "a later upload with the same name gets a new File identity");
+
+  const secondClient = await (await request("/api/auth/login", { method: "POST", body: {
+    email: owner.user.email, password: "correct-horse-battery",
+  } })).json();
+  const files = (await (await request("/api/files", { token: secondClient.token })).json()).files;
+  assert.deepEqual(new Set(files.map(({ id }) => id)), new Set([linked.id, older.file.id, newer.file.id]));
+  assert.deepEqual(files.find(({ id }) => id === older.file.id).attachments.map(({ itemId }) => itemId).sort(), [task.id, event.id].sort());
+  assert.deepEqual(files.find(({ id }) => id === newer.file.id).attachments, [], "the newer upload does not replace or inherit the older Attachments");
+
+  const opened = await request(`/api/files/${older.file.id}/open`, { token: secondClient.token });
+  const download = await fetch((await opened.json()).url);
+  assert.equal(download.status, 200);
+  assert.deepEqual(Buffer.from(await download.arrayBuffer()), older.bytes, "the existing File still opens with its original contents");
+  assert.equal((await request(`/api/files/${linked.id}/open`, { token: secondClient.token })).status, 200);
+
+  assert.equal((await request(`/api/files/${older.file.id}/attachments/${task.id}`, { token: owner.token, method: "DELETE" })).status, 204);
+  assert.deepEqual((await (await request(`/api/items/${task.id}`, { token: owner.token })).json()).item.files, []);
+  assert.deepEqual((await (await request(`/api/items/${event.id}`, { token: owner.token })).json()).item.files.map(({ id }) => id), [older.file.id]);
+  assert.ok((await (await request("/api/files", { token: owner.token })).json()).files.some(({ id }) => id === older.file.id),
+    "unlinking one Attachment leaves the File in the Files section");
+
+  assert.equal((await request(`/api/files/${older.file.id}`, { token: owner.token, method: "DELETE" })).status, 204);
+  assert.deepEqual((await (await request(`/api/items/${event.id}`, { token: owner.token })).json()).item.files, [],
+    "deleting the File removes its remaining Attachment");
+  assert.equal(storageObjects.size, 1, "only the newer, independent upload remains in object storage");
+  assert.equal((await request(`/api/files/${newer.file.id}`, { token: owner.token, method: "DELETE" })).status, 204);
   assert.equal(storageObjects.size, 0);
 });
 
@@ -3571,6 +3672,59 @@ test("a stale Google sync cannot overwrite a newer edited recurring Occurrence",
   }
 });
 
+test("recurrence intervals and inclusive end dates apply to Tasks and Events", async () => {
+  const owner = await account();
+  const cases = [
+    { start: "2026-11-02", rule: { interval: 2, unit: "days", end: { type: "count", count: 3 } }, dates: ["2026-11-02", "2026-11-04", "2026-11-06"] },
+    // The next selected Monday is exactly one day after the inclusive end.
+    { start: "2026-11-02", rule: { interval: 2, unit: "weeks", weekdays: [1, 3], end: { type: "date", date: "2026-11-15" } }, dates: ["2026-11-02", "2026-11-04"] },
+    { start: "2026-11-02", rule: { interval: 2, unit: "weeks", weekdays: [1, 3], end: { type: "date", date: "2026-11-16" } }, dates: ["2026-11-02", "2026-11-04", "2026-11-16"] },
+    { start: "2026-01-31", rule: { interval: 2, unit: "months", end: { type: "count", count: 3 } }, dates: ["2026-01-31", "2026-03-31", "2026-05-31"] },
+    { start: "2022-02-28", rule: { interval: 2, unit: "years", end: { type: "count", count: 3 } }, dates: ["2022-02-28", "2024-02-28", "2026-02-28"] },
+  ];
+  for (const kind of ["task", "event"]) {
+    for (const { start, rule, dates } of cases) {
+      const response = await request("/api/items", { token: owner.token, method: "POST", body: {
+        kind, title: `${kind} every ${rule.interval} ${rule.unit}`, scheduledDate: start, recurrence: rule, reminders: [],
+      } });
+      assert.equal(response.status, 201);
+      const root = (await response.json()).item;
+      const items = (await (await request("/api/items", { token: owner.token })).json()).items
+        .filter(({ seriesId }) => seriesId === root.id);
+      assert.deepEqual(items.map(({ scheduledDate }) => scheduledDate).sort(), dates, `${kind}: ${JSON.stringify(rule)}`);
+      assert.equal(new Set(items.map(({ id }) => id)).size, dates.length);
+    }
+  }
+});
+
+test("late Task completion keeps overdue and upcoming Occurrences on their original schedule", async () => {
+  const previousClock = new Date(testClock);
+  try {
+    await setTestClock("2026-11-10T12:00:00Z");
+    const owner = await account();
+    const response = await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind: "task", title: "Independent daily Task", scheduledDate: "2026-11-02",
+      recurrence: { interval: 2, unit: "days", end: { type: "count", count: 6 } }, reminders: [],
+    } });
+    assert.equal(response.status, 201);
+    const root = (await response.json()).item;
+    const readSeries = async () => (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ seriesId }) => seriesId === root.id).sort((a, b) => a.occurrenceDate.localeCompare(b.occurrenceDate));
+    const before = await readSeries();
+    assert.deepEqual(before.map(({ scheduledDate }) => scheduledDate), ["2026-11-02", "2026-11-04", "2026-11-06", "2026-11-08", "2026-11-10", "2026-11-12"]);
+    assert.ok(before.every(({ completed }) => !completed));
+    const completed = await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: { completed: true } });
+    assert.equal(completed.status, 200);
+    await advanceTestClock(86_400_000);
+    const after = await readSeries();
+    assert.deepEqual(after.map(({ id, scheduledDate, occurrenceDate }) => ({ id, scheduledDate, occurrenceDate })),
+      before.map(({ id, scheduledDate, occurrenceDate }) => ({ id, scheduledDate, occurrenceDate })));
+    assert.deepEqual(after.map(({ completed }) => completed), [true, false, false, false, false, false]);
+  } finally {
+    await setTestClock(previousClock);
+  }
+});
+
 test("recurring items create independent Occurrences and honor occurrence and series edit scopes", async () => {
   const owner = await account();
   const created = await request("/api/items", { token: owner.token, method: "POST", body: {
@@ -3614,6 +3768,69 @@ test("recurring items create independent Occurrences and honor occurrence and se
   assert.deepEqual(afterSeriesEdit.filter(({ seriesId }) => seriesId === root.id).map(({ scheduledDate }) => scheduledDate).sort(),
     ["2026-11-02", "2026-11-07", "2026-11-09", "2026-11-11"]);
   assert.equal(afterSeriesEdit.find(({ id }) => id === occurrenceId)?.completed, true);
+});
+
+test("issue 6: recurring Tasks and Events apply multiple Reminders at occurrence, following, and series scopes", async () => {
+  const owner = await account();
+  const initialReminders = [
+    { delivery: "notification", amount: 1, unit: "days", time: "09:00" },
+    { delivery: "notification", amount: 30, unit: "minutes", time: "08:30" },
+  ];
+  const localReminders = [
+    { delivery: "notification", amount: 2, unit: "hours", time: "07:15" },
+    { delivery: "notification", amount: 15, unit: "minutes", time: "07:30" },
+  ];
+  const seriesReminders = [
+    { delivery: "notification", amount: 3, unit: "days", time: "10:00" },
+    { delivery: "notification", amount: 45, unit: "minutes", time: "09:15" },
+  ];
+  const followingReminders = [
+    { delivery: "notification", amount: 4, unit: "days", time: "11:00" },
+    { delivery: "notification", amount: 1, unit: "hours", time: "10:00" },
+  ];
+
+  for (const kind of ["task", "event"]) {
+    const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind, title: `${kind} reminder scopes`, scheduledDate: "2026-11-01",
+      recurrence: { interval: 1, unit: "days", end: { type: "count", count: 5 } }, reminders: initialReminders,
+    } });
+    assert.equal(created.status, 201, await created.clone().text());
+    const root = (await created.json()).item;
+    const before = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ seriesId }) => seriesId === root.id).sort((a, b) => a.occurrenceDate.localeCompare(b.occurrenceDate));
+    assert.equal(before.length, 5);
+    assert.ok(before.every(({ reminders }) => JSON.stringify(reminders) === JSON.stringify(initialReminders)));
+
+    const local = await request(`/api/items/${before[1].id}`, { token: owner.token, method: "PATCH", body: {
+      reminders: localReminders, scope: "occurrence",
+    } });
+    assert.equal(local.status, 200, await local.clone().text());
+
+    const wholeSeries = await request(`/api/items/${root.id}`, { token: owner.token, method: "PATCH", body: {
+      reminders: seriesReminders, scope: "series",
+    } });
+    assert.equal(wholeSeries.status, 200, await wholeSeries.clone().text());
+    let current = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ id }) => before.some((item) => item.id === id));
+    let byId = new Map(current.map((item) => [item.id, item]));
+    assert.deepEqual(before.map(({ id }) => byId.get(id).reminders), [
+      seriesReminders, localReminders, seriesReminders, seriesReminders, seriesReminders,
+    ], `${kind} series scope updates the whole series and keeps the local Reminder override`);
+
+    const following = await request(`/api/items/${before[3].id}`, { token: owner.token, method: "PATCH", body: {
+      reminders: followingReminders, scope: "following",
+    } });
+    assert.equal(following.status, 200, await following.clone().text());
+    current = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ id }) => before.some((item) => item.id === id));
+    byId = new Map(current.map((item) => [item.id, item]));
+    assert.deepEqual(before.map(({ id }) => byId.get(id).reminders), [
+      seriesReminders, localReminders, seriesReminders, followingReminders, followingReminders,
+    ], `${kind} following scope begins at the selected Occurrence and keeps earlier values`);
+    assert.deepEqual(current.sort((a, b) => a.occurrenceDate.localeCompare(b.occurrenceDate)).map(({ seriesId }) => seriesId), [
+      root.id, root.id, root.id, before[3].id, before[3].id,
+    ], `${kind} following scope splits at the selected Occurrence`);
+  }
 });
 
 test("whole-series edits keep the original start after locally moving the first Occurrence", async () => {
@@ -3971,6 +4188,159 @@ test("a series Attachment is available from every Occurrence and can be removed 
   assert.deepEqual((await (await request(`/api/items/${occurrences[1].id}`, { token: owner.token })).json()).item.files, []);
 });
 
+test("issue 6: Task and Event Files inherit at series and occurrence scopes while same-name uploads stay independent", async () => {
+  const owner = await account();
+  for (const kind of ["task", "event"]) {
+    const created = await request("/api/items", { token: owner.token, method: "POST", body: {
+      kind, title: `${kind} files`, scheduledDate: "2026-11-01",
+      recurrence: { interval: 1, unit: "days", end: { type: "count", count: 4 } },
+    } });
+    assert.equal(created.status, 201, await created.clone().text());
+    const root = (await created.json()).item;
+    const occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ seriesId }) => seriesId === root.id).sort((a, b) => a.occurrenceDate.localeCompare(b.occurrenceDate));
+    assert.equal(occurrences.length, 4);
+
+    const sharedName = "Recurring packet.pdf";
+    const seriesFile = (await (await request("/api/files", { token: owner.token, method: "POST", body: {
+      name: sharedName, url: `https://example.com/${kind}-recurring-packet`,
+    } })).json()).file;
+    const localFile = (await (await request("/api/files", { token: owner.token, method: "POST", body: {
+      name: `${kind} Occurrence note.pdf`, url: `https://example.com/${kind}-occurrence-note`,
+    } })).json()).file;
+    assert.equal((await request(`/api/files/${seriesFile.id}/attachments`, { token: owner.token, method: "POST", body: {
+      itemId: root.id, scope: "series",
+    } })).status, 201);
+    assert.equal((await request(`/api/files/${localFile.id}/attachments`, { token: owner.token, method: "POST", body: {
+      itemId: occurrences[2].id, scope: "occurrence",
+    } })).status, 201);
+
+    let current = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ id }) => occurrences.some((item) => item.id === id));
+    const fileIds = (item) => item.files.map(({ id }) => id).sort();
+    const localIds = [seriesFile.id, localFile.id].sort();
+    assert.deepEqual(current.sort((a, b) => a.occurrenceDate.localeCompare(b.occurrenceDate)).map(fileIds), [
+      [seriesFile.id], [seriesFile.id], localIds, [seriesFile.id],
+    ].map((ids) => ids.sort()), `${kind} series Files inherit while an Occurrence File stays local`);
+
+    const bytes = Buffer.from(`${kind} replacement packet bytes`);
+    const uploadTargetResponse = await request("/api/files/uploads", { token: owner.token, method: "POST", body: {
+      name: sharedName, contentType: "application/pdf", sizeBytes: bytes.length,
+    } });
+    assert.equal(uploadTargetResponse.status, 201);
+    const uploadTarget = await uploadTargetResponse.json();
+    assert.equal((await fetch(uploadTarget.uploadUrl, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: bytes })).status, 200);
+    const completed = await request(`/api/files/${uploadTarget.uploadId}/complete`, { token: owner.token, method: "POST" });
+    assert.equal(completed.status, 200, await completed.clone().text());
+    const uploadedFile = (await completed.json()).file;
+    assert.equal(uploadedFile.name, seriesFile.name);
+    assert.notEqual(uploadedFile.id, seriesFile.id, "a completed upload with a matching name remains a distinct File");
+    assert.equal(uploadedFile.sourceType, "upload");
+
+    let files = (await (await request("/api/files", { token: owner.token })).json()).files;
+    assert.deepEqual(files.find(({ id }) => id === uploadedFile.id).attachments, [],
+      "completing the same-name upload must not change any existing Attachment");
+    assert.equal(files.find(({ id }) => id === seriesFile.id).attachments.some(({ itemId, scope }) => itemId === root.id && scope === "series"), true);
+    current = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ id }) => occurrences.some((item) => item.id === id));
+    assert.deepEqual(current.sort((a, b) => a.occurrenceDate.localeCompare(b.occurrenceDate)).map(fileIds), [
+      [seriesFile.id], [seriesFile.id], localIds, [seriesFile.id],
+    ].map((ids) => ids.sort()), `${kind} Occurrences still use the original Attachment before explicit unlink`);
+
+    assert.equal((await request(`/api/files/${seriesFile.id}/attachments/${root.id}?scope=series`, {
+      token: owner.token, method: "DELETE",
+    })).status, 204);
+    current = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ id }) => occurrences.some((item) => item.id === id));
+    assert.deepEqual(current.sort((a, b) => a.occurrenceDate.localeCompare(b.occurrenceDate)).map(fileIds), [
+      [], [], [localFile.id], [],
+    ].map((ids) => ids.sort()), `${kind} explicit unlink removes only the series Attachment`);
+
+    assert.equal((await request(`/api/files/${uploadedFile.id}/attachments`, { token: owner.token, method: "POST", body: {
+      itemId: root.id, scope: "series",
+    } })).status, 201);
+    current = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ id }) => occurrences.some((item) => item.id === id));
+    assert.deepEqual(current.sort((a, b) => a.occurrenceDate.localeCompare(b.occurrenceDate)).map(fileIds), [
+      [uploadedFile.id], [uploadedFile.id], [uploadedFile.id, localFile.id], [uploadedFile.id],
+    ].map((ids) => ids.sort()), `${kind} explicitly linking the new File applies it to the series and retains local Files`);
+    files = (await (await request("/api/files", { token: owner.token })).json()).files;
+    assert.deepEqual(files.find(({ id }) => id === seriesFile.id).attachments, []);
+    assert.equal(files.find(({ id }) => id === uploadedFile.id).attachments.some(({ itemId, scope }) => itemId === root.id && scope === "series"), true);
+  }
+});
+
+test("issue 6: following Attachment removal clears local and later anchors without touching prior or other-series links", async () => {
+  const owner = await account();
+  const primary = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "task", title: "Primary Attachment range", scheduledDate: "2026-12-01",
+    recurrence: { interval: 1, unit: "days", end: { type: "count", count: 5 } },
+  } })).json()).item;
+  const unrelated = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "Unrelated series", scheduledDate: "2027-01-01",
+    recurrence: { interval: 1, unit: "days", end: { type: "count", count: 3 } },
+  } })).json()).item;
+  const primaryOccurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+    .filter(({ seriesId }) => seriesId === primary.id).sort((a, b) => a.occurrenceDate.localeCompare(b.occurrenceDate));
+  const unrelatedOccurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+    .filter(({ seriesId }) => seriesId === unrelated.id).sort((a, b) => a.occurrenceDate.localeCompare(b.occurrenceDate));
+  assert.equal(primaryOccurrences.length, 5);
+  assert.equal(unrelatedOccurrences.length, 3);
+
+  const localFile = (await (await request("/api/files", { token: owner.token, method: "POST", body: {
+    name: "Local range.pdf", url: "https://example.com/local-range",
+  } })).json()).file;
+  const sharedFile = (await (await request("/api/files", { token: owner.token, method: "POST", body: {
+    name: "Shared ranges.pdf", url: "https://example.com/shared-ranges",
+  } })).json()).file;
+  const independentFile = (await (await request("/api/files", { token: owner.token, method: "POST", body: {
+    name: "Independent.pdf", url: "https://example.com/independent",
+  } })).json()).file;
+  for (const occurrence of primaryOccurrences) {
+    assert.equal((await request(`/api/files/${localFile.id}/attachments`, { token: owner.token, method: "POST", body: {
+      itemId: occurrence.id, scope: "occurrence",
+    } })).status, 201);
+  }
+  const removeLocalFollowing = await request(`/api/files/${localFile.id}/attachments/${primaryOccurrences[2].id}?scope=following`, {
+    token: owner.token, method: "DELETE",
+  });
+  assert.equal(removeLocalFollowing.status, 204, "a following removal can start from purely Occurrence-local Attachments");
+  let current = (await (await request("/api/items", { token: owner.token })).json()).items;
+  const afterLocalRemoval = primaryOccurrences.map(({ id }) => current.find((item) => item.id === id));
+  assert.deepEqual(afterLocalRemoval.map(({ files }) => files.some(({ id }) => id === localFile.id)), [true, true, false, false, false]);
+
+  assert.equal((await request(`/api/files/${sharedFile.id}/attachments`, { token: owner.token, method: "POST", body: {
+    itemId: primaryOccurrences[0].id, scope: "following",
+  } })).status, 201);
+  assert.equal((await request(`/api/files/${sharedFile.id}/attachments`, { token: owner.token, method: "POST", body: {
+    itemId: primaryOccurrences[3].id, scope: "following",
+  } })).status, 201, "a later following anchor can coexist with an earlier range");
+  assert.equal((await request(`/api/files/${sharedFile.id}/attachments`, { token: owner.token, method: "POST", body: {
+    itemId: unrelated.id, scope: "series",
+  } })).status, 201);
+
+  current = (await (await request("/api/items", { token: owner.token })).json()).items;
+  assert.ok(primaryOccurrences.every(({ id }) => current.find((item) => item.id === id).files.some(({ id }) => id === sharedFile.id)));
+  assert.ok(unrelatedOccurrences.every(({ id }) => current.find((item) => item.id === id).files.some(({ id }) => id === sharedFile.id)));
+  assert.equal((await request(`/api/files/${sharedFile.id}/attachments/${primaryOccurrences[1].id}?scope=following`, {
+    token: owner.token, method: "DELETE",
+  })).status, 204);
+
+  current = (await (await request("/api/items", { token: owner.token })).json()).items;
+  assert.deepEqual(primaryOccurrences.map(({ id }) => current.find((item) => item.id === id).files.some(({ id }) => id === sharedFile.id)),
+    [true, false, false, false, false], "removal preserves the prior Occurrence and clears the selected range including later anchors");
+  assert.ok(unrelatedOccurrences.every(({ id }) => current.find((item) => item.id === id).files.some(({ id }) => id === sharedFile.id)),
+    "removing one series range preserves the same File on an unrelated series");
+  const files = (await (await request("/api/files", { token: owner.token })).json()).files;
+  assert.equal(files.some(({ id }) => id === localFile.id), true);
+  assert.deepEqual(files.find(({ id }) => id === localFile.id).attachments.map(({ itemId }) => itemId).sort(),
+    primaryOccurrences.slice(0, 2).map(({ id }) => id).sort());
+  assert.equal(files.some(({ id }) => id === sharedFile.id), true, "removing Attachments leaves the independent File in the Files section");
+  assert.deepEqual(files.find(({ id }) => id === sharedFile.id).attachments.map(({ itemId }) => itemId).sort(),
+    [primaryOccurrences[0].id, unrelated.id].sort(), "the later following anchor is removed while the unrelated series link remains");
+  assert.deepEqual(files.find(({ id }) => id === independentFile.id).attachments, []);
+});
+
 test("removing a following Attachment from a later Occurrence preserves earlier Occurrences", async () => {
   const owner = await account();
   const created = await request("/api/items", { token: owner.token, method: "POST", body: {
@@ -4187,6 +4557,71 @@ test("the browser editor keeps a first Occurrence edit local to the series root"
     assert.equal(followingAfterLocalEdit.recurrence.unit, "weeks");
     assert.equal(followingAfterLocalEdit.reminders[0].amount, 1);
   } finally { await context.close(); await browser.close(); }
+});
+
+test("Files warn before deleting series and following Attachments", async () => {
+  const owner = await account();
+  const series = (await (await request("/api/items", { token: owner.token, method: "POST", body: {
+    kind: "event", title: "Weekly review", scheduledDate: "2026-10-20",
+    recurrence: { interval: 1, unit: "weeks", weekdays: [2], end: { type: "count", count: 4 } },
+  } })).json()).item;
+  const occurrences = (await (await request("/api/items", { token: owner.token })).json()).items
+    .filter(({ seriesId }) => seriesId === series.id)
+    .sort((left, right) => left.occurrenceDate.localeCompare(right.occurrenceDate));
+  assert.equal(occurrences.length, 4);
+
+  const seriesFile = (await (await request("/api/files", { token: owner.token, method: "POST", body: {
+    name: "Series agenda", url: "https://example.com/series-agenda",
+  } })).json()).file;
+  assert.equal((await request(`/api/files/${seriesFile.id}/attachments`, { token: owner.token, method: "POST", body: {
+    itemId: series.id, scope: "series",
+  } })).status, 201);
+
+  const followingFile = (await (await request("/api/files", { token: owner.token, method: "POST", body: {
+    name: "Later agendas", url: "https://example.com/later-agendas",
+  } })).json()).file;
+  assert.equal((await request(`/api/files/${followingFile.id}/attachments`, { token: owner.token, method: "POST", body: {
+    itemId: occurrences[1].id, scope: "following",
+  } })).status, 201);
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const page = await context.newPage();
+  try {
+    await page.goto(base);
+    await page.getByLabel("Email", { exact: true }).fill(owner.user.email);
+    await page.getByLabel("Password", { exact: true }).fill("correct-horse-battery");
+    await page.locator("form").getByRole("button", { name: "Sign in", exact: true }).click();
+    await page.getByRole("button", { name: "Files", exact: true }).click();
+
+    const recurringDeleteWarning = "Deleting this File removes it from all associated Tasks and Events, including recurring Occurrences.";
+    await page.getByRole("button", { name: `Delete File ${seriesFile.name}`, exact: true }).click();
+    const seriesDialog = page.getByRole("dialog");
+    await expect(seriesDialog.getByText(recurringDeleteWarning, { exact: true })).toBeVisible();
+    await seriesDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    assert.ok((await (await request("/api/files", { token: owner.token })).json()).files.some(({ id }) => id === seriesFile.id),
+      "cancelling leaves the File and its Attachments in place");
+
+    await page.getByRole("button", { name: `Delete File ${seriesFile.name}`, exact: true }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Delete File", exact: true }).click();
+    await expect(page.locator(`#file-${seriesFile.id}`)).toHaveCount(0);
+    let current = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ seriesId }) => seriesId === series.id);
+    assert.ok(current.every(({ files }) => files.every(({ id }) => id !== seriesFile.id)), "deleting a series File removes it from every Occurrence");
+    assert.deepEqual(current.map(({ files }) => files.length), [0, 1, 1, 1], "the independent following File stays attached");
+
+    await page.getByRole("button", { name: `Remove Attachment from ${occurrences[1].title}`, exact: true }).click();
+    const followingDialog = page.getByRole("dialog");
+    await expect(followingDialog.getByText(recurringDeleteWarning, { exact: true })).toBeVisible();
+    await followingDialog.getByRole("button", { name: "Delete File", exact: true }).click();
+    await expect(page.locator(`#file-${followingFile.id}`)).toHaveCount(0);
+    current = (await (await request("/api/items", { token: owner.token })).json()).items
+      .filter(({ seriesId }) => seriesId === series.id);
+    assert.deepEqual(current.map(({ files }) => files.length), [0, 0, 0, 0], "deleting a following File removes it from all affected Occurrences");
+  } finally {
+    await context.close();
+    await browser.close();
+  }
 });
 
 test("a person can manage Tasks and Events through the browser and see another client's changes", async () => {
